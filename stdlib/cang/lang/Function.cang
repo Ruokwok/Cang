@@ -1,0 +1,5 @@
+namespace cang/lang
+
+# Function - 函数对象类型
+# 编译器内建：Function<R, A, B> 表示接收 A、B 并返回 R 的函数值
+class Function

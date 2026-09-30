@@ -1,0 +1,32 @@
+namespace cang/lang
+
+# String - 字符串类
+# 编译器内置，无需 import
+class String(str s = '')
+
+# 字符串长度
+native func int length()
+
+# 是否以指定前缀开始
+native func bool startsWith(String prefix)
+
+# 是否以指定后缀结束
+native func bool endsWith(String suffix)
+
+# 查找子串位置，未找到返回 -1
+native func int indexOf(String substring)
+
+# 截取子串 [start, end)
+native func String substring(int start, int end)
+
+# 转为大写
+native func String toUpper()
+
+# 转为小写
+native func String toLower()
+
+# 去除首尾空白
+native func String trim()
+
+# 查找第一次出现的位置（忽略大小写）
+native func int indexOfIgnoreCase(String substring)

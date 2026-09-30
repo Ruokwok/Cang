@@ -1,0 +1,21 @@
+namespace cang/lang
+
+class System
+
+# 启动参数数组, args[0]为程序名, args[1]开始为用户参数.
+static final native String[] ARGS
+
+# 操作系统类型,例如:windows/linux/macos/freebsd
+static final native String OS_TYPE
+
+# 硬件架构,例如:i386,amd64,aarch64,mips,loongarch
+static final native String ARCH_TYPE
+
+# 立即退出程序
+static native func void exit(int status)
+
+# 读取环境变量
+static native func String getenv(String name)
+
+# 获取 Unix epoch 毫秒时间戳
+static native func long currentTimeMillis()

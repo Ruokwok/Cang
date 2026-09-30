@@ -1,0 +1,59 @@
+namespace cang/lang
+
+# Math - 数学工具
+# 编译器内置，无需 import
+class Math
+
+# 圆周率
+static native double PI
+
+# 自然对数底
+static native double E
+
+# 绝对值
+static native func int abs(int x)
+static native func long abs(long x)
+static native func float abs(float x)
+static native func double abs(double x)
+
+# 最大值
+static native func int max(int a, int b)
+static native func long max(long a, long b)
+static native func double max(double a, double b)
+
+# 最小值
+static native func int min(int a, int b)
+static native func long min(long a, long b)
+static native func double min(double a, double b)
+
+# 平方根
+static native func double sqrt(double x)
+
+# 幂运算
+static native func double pow(double base, double exp)
+
+# 向下取整
+static native func double floor(double x)
+
+# 向上取整
+static native func double ceil(double x)
+
+# 四舍五入
+static native func double round(double x)
+
+# 三角函数
+static native func double sin(double x)
+static native func double cos(double x)
+static native func double tan(double x)
+static native func double asin(double x)
+static native func double acos(double x)
+static native func double atan(double x)
+static native func double atan2(double y, double x)
+
+# 对数与指数
+static native func double log(double x)
+static native func double log10(double x)
+static native func double exp(double x)
+
+# 跨平台自包含伪随机数，固定种子，返回 [0, 1)
+static native func double random()

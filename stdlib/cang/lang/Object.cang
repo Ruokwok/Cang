@@ -1,0 +1,5 @@
+namespace cang/lang
+
+# Object - 所有类的根父类
+# 编译器内置，无需 import
+class Object

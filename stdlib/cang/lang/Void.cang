@@ -1,0 +1,4 @@
+namespace cang/lang
+
+# Void - 无返回值包装类型
+class Void

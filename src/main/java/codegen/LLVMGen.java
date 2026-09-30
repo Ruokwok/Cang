@@ -1,0 +1,4402 @@
+package codegen;
+
+import parser.AST.*;
+import parser.AST;
+
+import java.util.*;
+
+public class LLVMGen {
+
+    // ==================== Data structures ====================
+
+    static class LLVMValue {
+        String value;
+        String type;
+        String semanticType; // Cang type when LLVM types are shared, e.g. str/String -> i8*
+        LLVMValue(String value, String type) {
+            this(value, type, null);
+        }
+        LLVMValue(String value, String type, String semanticType) {
+            this.value = value;
+            this.type = type;
+            this.semanticType = semanticType;
+        }
+    }
+
+    static class ClassInfo {
+        String llvmName;
+        String fullName;
+        String simpleName;
+        String parentName; // simple name of parent class
+        int typeId; // unique type ID for runtime type checking
+        List<String> fieldNames = new ArrayList<>();
+        List<String> fieldTypes = new ArrayList<>();
+        Map<String, Integer> fieldIndices = new LinkedHashMap<>();
+        List<Parameter> ctorParams = new ArrayList<>();
+        List<FieldDecl> staticFields = new ArrayList<>(); // static fields (global)
+        List<AST> superArgs = new ArrayList<>(); // parent constructor args
+    }
+
+    static class FuncInfo {
+        String name;
+        String returnType;
+        List<String> paramTypes = new ArrayList<>();
+        List<String> paramNames = new ArrayList<>();
+        List<AST> paramDefaults = new ArrayList<>(); // null if no default
+        String className; // non-null for methods
+        boolean isConstructor;
+        boolean isStatic;
+        boolean isFinal;
+    }
+
+    static class LoopContext {
+        String breakLabel;
+        String continueLabel;
+    }
+
+    static class Scope {
+        Map<String, LLVMValue> vars = new LinkedHashMap<>();
+        Scope parent;
+
+        Scope(Scope parent) { this.parent = parent; }
+
+        LLVMValue lookup(String name) {
+            if (vars.containsKey(name)) return vars.get(name);
+            if (parent != null) return parent.lookup(name);
+            return null;
+        }
+
+        void define(String name, LLVMValue value) {
+            vars.put(name, value);
+        }
+    }
+
+    // ==================== State ====================
+
+    private final StringBuilder header = new StringBuilder();
+    private final StringBuilder body = new StringBuilder();
+    private final StringBuilder mainBody = new StringBuilder();
+
+    private int tmpCount = 0;
+    private int labelCount = 0;
+    private int strCount = 0;
+
+    private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
+    private final Map<String, FuncInfo> functions = new LinkedHashMap<>();
+    private final Map<String, String> stringLiterals = new LinkedHashMap<>(); // text 閳?global name
+    private final List<LoopContext> loopStack = new ArrayList<>();
+    private final Deque<String> exceptionHandlers = new ArrayDeque<>();
+
+    private Scope scope;
+    private String currentClassName;
+    private String currentFuncReturnType = "void";
+    private String currentNamespace = ""; // e.g. "cc/ruok/cang"
+    private final List<String> imports = new ArrayList<>();
+    private final Map<String, String> importedClasses = new HashMap<>(); // simpleName -> fullName
+    private final Map<String, String> arrayElemTypes = new HashMap<>(); // varName -> elem LLVM type
+    private final Map<String, String> arrayElemCangTypes = new HashMap<>(); // varName -> elem Cang type ("int", "Array<int>", ...)
+    private final Map<String, FieldDecl> staticFields = new HashMap<>(); // "ClassName.field" -> FieldDecl
+    private String sourceFile = "unknown";
+    private String targetPlatform = "windows";
+    private String targetArchitecture = "amd64";
+    private final java.util.Set<String> finalVars = new java.util.HashSet<>(); // final variable names
+    private final java.util.Set<String> freedVars = new java.util.HashSet<>();
+
+    // Function-level region allocations. Only allocations proven not to escape are released.
+    private final List<String> regionAllocations = new ArrayList<>();
+    private boolean regionActive;
+    private boolean regionStraightLine;
+
+    private void beginRegion() {
+        regionAllocations.clear();
+        regionActive = true;
+        regionStraightLine = true;
+    }
+
+    private void registerRegionAllocation(String ptr) {
+        if (regionActive) regionAllocations.add(ptr);
+    }
+
+    private void endRegionCleanup() {
+        // Automatic region freeing is disabled when explicit free is part of the language.
+        // Keep allocations alive until the user explicitly releases them or the process exits.
+        abandonRegion();
+    }
+
+    private void abandonRegion() {
+        // Explicit returns and escaping stores are conservatively left to process teardown.
+        regionAllocations.clear();
+        regionActive = false;
+        regionStraightLine = false;
+    }
+
+    private void markRegionControlFlow() {
+        regionStraightLine = false;
+    }
+
+    public void setSourceFile(String file) {
+        this.sourceFile = file;
+    }
+
+    public void setTargetPlatform(String target) {
+        this.targetPlatform = target == null ? "windows" : target.toLowerCase();
+    }
+
+    public void setTargetArchitecture(String architecture) {
+        if (architecture == null) return;
+        String value = architecture.toLowerCase();
+        if (value.equals("x86_64")) value = "amd64";
+        if (value.equals("arm64")) value = "aarch64";
+        this.targetArchitecture = value;
+    }
+
+    // ==================== Entry point ====================
+
+    /**
+     * Register built-in classes in cang.lang namespace.
+     * Object: base class for all classes.
+     * Stdout: standard output with static print() method.
+     */
+    private void registerBuiltinObject() {
+        // Object class
+        ClassInfo objInfo = new ClassInfo();
+        objInfo.llvmName = "%cang_lang_Object";
+        objInfo.fullName = "cang_lang_Object";
+        objInfo.simpleName = "Object";
+        objInfo.parentName = null;
+        objInfo.fieldNames.add("_dummy");
+        objInfo.fieldTypes.add("byte");
+        objInfo.fieldIndices.put("_dummy", 0);
+        classes.put("Object", objInfo);
+
+        FuncInfo ctorInfo = new FuncInfo();
+        ctorInfo.name = "cang_lang_Object.constructor";
+        ctorInfo.returnType = "void";
+        ctorInfo.className = "cang_lang_Object";
+        ctorInfo.isConstructor = true;
+        functions.put(ctorInfo.name, ctorInfo);
+
+        // Stdout class (static print method)
+        ClassInfo stdoutInfo = new ClassInfo();
+        stdoutInfo.llvmName = "%cang_lang_Stdout";
+        stdoutInfo.fullName = "cang_lang_Stdout";
+        stdoutInfo.simpleName = "Stdout";
+        stdoutInfo.parentName = "Object";
+        stdoutInfo.fieldNames.add("_dummy");
+        stdoutInfo.fieldTypes.add("byte");
+        stdoutInfo.fieldIndices.put("_dummy", 0);
+        classes.put("Stdout", stdoutInfo);
+
+        // Stdout.print is handled specially in generateMethodCall
+    }
+
+    public String generate(Program program) {
+        // Register built-in Object class (cang.lang.Object)
+        registerBuiltinObject();
+
+        // Pass 0: process namespace and imports
+        for (AST member : program.members) {
+            if (member instanceof NamespaceDecl) {
+                currentNamespace = ((NamespaceDecl) member).path;
+            } else if (member instanceof ImportDecl) {
+                String path = ((ImportDecl) member).path;
+                imports.add(path);
+                String[] parts = path.split("/");
+                String last = parts[parts.length - 1];
+                if (!last.isEmpty() && Character.isUpperCase(last.charAt(0))) {
+                    importedClasses.put(last, path);
+                }
+            }
+        }
+
+        List<ClassDecl> classDecls = new ArrayList<>();
+        List<AST> topLevelFuncs = new ArrayList<>();
+        List<AST> mainStatements = new ArrayList<>(); // top-level statements for main()
+        ClassDecl entryClass = null;
+
+        for (AST member : program.members) {
+            if (member instanceof ClassDecl) {
+                ClassDecl cd = (ClassDecl) member;
+                // Classes without explicit parent inherit from Object (but Object itself has no parent)
+                if (cd.superClass == null && !cd.name.equals("Object")) {
+                    cd.superClass = "Object";
+                }
+                boolean isEntry = cd.isEntryPoint && entryClass == null;
+                if (isEntry) {
+                    entryClass = cd;
+                }
+                // Move FuncDecl/FieldDecl to members; keep statements in topLevelBody for entry
+                for (AST stmt : new ArrayList<>(cd.topLevelBody)) {
+                    if (stmt instanceof FuncDecl || stmt instanceof FieldDecl) {
+                        cd.members.add(stmt);
+                        cd.topLevelBody.remove(stmt);
+                    } else if (!isEntry) {
+                        // Non-entry classes: statements go to global main
+                        mainStatements.add(stmt);
+                        cd.topLevelBody.remove(stmt);
+                    }
+                    // Entry class: statements stay in topLevelBody
+                }
+                classDecls.add(cd);
+                collectClass(cd);
+            } else if (member instanceof FuncDecl) {
+                collectFunction((FuncDecl) member, null);
+                topLevelFuncs.add(member);
+            } else if (member instanceof NamespaceDecl || member instanceof ImportDecl) {
+                // Skip namespace/import declarations
+                continue;
+            } else {
+                // Top-level statement outside class
+                mainStatements.add(member);
+            }
+        }
+
+        // Assign type IDs for runtime type checking (like operator)
+        assignTypeIds();
+
+        // Pass 2: generate code
+        emitHeader();
+
+        // Generate all classes
+        for (ClassDecl cd : classDecls) {
+            generateClass(cd);
+        }
+
+        // Generate standalone functions
+        for (AST func : topLevelFuncs) {
+            generateFunction((FuncDecl) func, null);
+        }
+
+        // Generate main: entry class body or auto-wrapped statements
+        if (entryClass != null) {
+            generateEntryPointMain(entryClass);
+        } else if (!mainStatements.isEmpty()) {
+            topLevelStmts.addAll(mainStatements);
+            generateAutoMain();
+        }
+
+        return header.toString() + "\n" + body.toString() + extraDefs.toString();
+    }
+
+    // Function objects: { code, receiver } pairs; thunks/lambdas/globals go here after main body.
+    private final StringBuilder extraDefs = new StringBuilder();
+    private int lambdaCount = 0;
+    private int thunkCount = 0;
+    private int fnrefCount = 0;
+    // Expected Function<...> signature while generating a value used as a Function argument.
+    private String expectedFunctionType = null;
+
+    private final List<AST> topLevelStmts = new ArrayList<>();
+
+    private void saveNodeForMain(AST node) {
+        topLevelStmts.add(node);
+    }
+
+    // ==================== Pass 1: Collection ====================
+
+    private void collectClass(ClassDecl decl) {
+        ClassInfo info = new ClassInfo();
+        String ns = (decl.namespace != null && !decl.namespace.isEmpty()) ? decl.namespace : currentNamespace;String fullName = ns.isEmpty() ? decl.name : ns.replace("/", "_") + "_" + decl.name;
+        info.llvmName = "%" + fullName;
+        info.fullName = fullName;
+        info.simpleName = decl.name;
+        info.ctorParams = decl.ctorParams;
+        info.parentName = decl.superClass;
+        info.superArgs = decl.superArgs;
+        int idx = 1; // Index 0 is type ID, start fields at 1
+
+        // Add parent fields first (inheritance layout)
+        if (info.parentName != null) {
+            ClassInfo parentInfo = classes.get(info.parentName);
+            if (parentInfo != null) {
+                for (int i = 0; i < parentInfo.fieldNames.size(); i++) {
+                    info.fieldNames.add(parentInfo.fieldNames.get(i));
+                    info.fieldTypes.add(parentInfo.fieldTypes.get(i));
+                    info.fieldIndices.put(parentInfo.fieldNames.get(i), idx++);
+                }
+            }
+        }
+
+        // Add fields from constructor params (implicit fields)
+        for (Parameter p : decl.ctorParams) {
+            info.fieldNames.add(p.name);
+            info.fieldTypes.add(p.type);
+            info.fieldIndices.put(p.name, idx++);
+        }
+
+        // Add explicit fields from class body (only instance fields go in struct)
+        for (AST member : decl.members) {
+            if (member instanceof FieldDecl) {
+                FieldDecl f = (FieldDecl) member;
+                if (f.isStatic) {
+                    // Static field: store separately
+                    info.staticFields.add(f);
+                } else {
+                    info.fieldNames.add(f.name);
+                    info.fieldTypes.add(f.type);
+                    info.fieldIndices.put(f.name, idx++);
+                }
+            }
+        }
+        classes.put(decl.name, info);
+        classes.put(fullName, info);
+
+        // Register implicit constructor if there are ctor params OR has parent
+        if (!decl.ctorParams.isEmpty() || decl.superClass != null) {
+            FuncInfo ctorInfo = new FuncInfo();
+            ctorInfo.name = fullName + ".constructor";
+            ctorInfo.returnType = "void";
+            ctorInfo.className = fullName;
+            ctorInfo.isConstructor = true;
+            for (Parameter p : decl.ctorParams) {
+                ctorInfo.paramTypes.add(p.type);
+                ctorInfo.paramNames.add(p.name);
+                ctorInfo.paramDefaults.add(p.defaultValue);
+            }
+            functions.put(ctorInfo.name, ctorInfo);
+        }
+
+        // Register methods and static fields
+        for (AST member : decl.members) {
+            if (member instanceof FuncDecl) {
+                collectFunction((FuncDecl) member, fullName);
+            } else if (member instanceof ConstructorDecl) {
+                collectConstructor((ConstructorDecl) member, fullName);
+            } else if (member instanceof FieldDecl && ((FieldDecl) member).isStatic) {
+                // Register static field as global
+                FieldDecl f = (FieldDecl) member;
+                staticFields.put(fullName + "." + f.name, f);
+            }
+        }
+
+        // Check final method override: child cannot override parent's final method
+        if (decl.superClass != null) {
+            for (AST member : decl.members) {
+                if (member instanceof FuncDecl) {
+                    FuncDecl fd = (FuncDecl) member;
+                    // Walk up parent chain
+                    String parentName = decl.superClass;
+                    while (parentName != null) {
+                        String parentFuncName = classes.containsKey(parentName) ?
+                            classes.get(parentName).fullName + "." + fd.name :
+                            parentName + "." + fd.name;
+                        FuncInfo parentFi = functions.get(parentFuncName);
+                        if (parentFi != null && parentFi.isFinal) {
+                            throw new RuntimeException(
+                                "Cannot override final method '" + fd.name + "' from '" +
+                                decl.superClass + "' (at line " + fd.line + ")");
+                        }
+                        ClassInfo parentCi = classes.get(parentName);
+                        String nextParent = parentCi != null ? parentCi.parentName : null;
+                        // Prevent infinite loop if class is its own parent (e.g. Object)
+                        if (nextParent != null && nextParent.equals(parentName)) {
+                            nextParent = null;
+                        }
+                        parentName = nextParent;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Assign unique type IDs to all classes for runtime type checking (like operator).
+     * Object gets ID 0, other classes get 1, 2, 3, ...
+     */
+    private void assignTypeIds() {
+        int nextId = 1; // Object = 0
+        java.util.Set<String> assigned = new java.util.HashSet<>();
+        // Object gets 0
+        ClassInfo obj = classes.get("Object");
+        if (obj != null) {
+            obj.typeId = 0;
+            assigned.add(obj.fullName);
+        }
+        // Assign IDs to other classes
+        for (Map.Entry<String, ClassInfo> entry : classes.entrySet()) {
+            ClassInfo ci = entry.getValue();
+            if (assigned.contains(ci.fullName)) continue;
+            ci.typeId = nextId++;
+            assigned.add(ci.fullName);
+        }
+    }
+
+    /**
+     * Check if child class is a subclass of parent class (including equality).
+     */
+    private boolean isSubclass(String childName, String parentName) {
+        if (childName.equals(parentName)) return true;
+        ClassInfo child = classes.get(childName);
+        while (child != null && child.parentName != null) {
+            if (child.parentName.equals(parentName)) return true;
+            child = classes.get(child.parentName);
+        }
+        return false;
+    }
+
+    /**
+     * Check if currentClass is same as targetClass OR a parent of targetClass.
+     * Used for private access: _ fields accessible only within declaring class.
+     */
+    private boolean isSameOrParentClass(String currentClass, String targetClass) {
+        if (currentClass == null) return false;
+        if (currentClass.equals(targetClass)) return true;
+        // currentClass is a parent of targetClass (target extends current)
+        return isSubclass(targetClass, currentClass);
+    }
+
+    /**
+     * Check if a method is overridden in any subclass of the given class.
+     * Returns true if polymorphic dispatch is needed.
+     */
+    private boolean isMethodOverridden(ClassInfo ci, String methodName) {
+        // Check if any subclass of ci defines the same method
+        for (ClassInfo other : classes.values()) {
+            if (other == ci) continue;
+            // other must be a subclass of ci
+            if (!isSubclass(other.simpleName, ci.simpleName)) continue;
+            // other must define the method
+            String funcName = other.fullName + "." + methodName;
+            if (functions.containsKey(funcName)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Generate dynamic dispatch based on object's runtime typeId.
+     * Loads typeId, then for each possible subclass, checks and calls the correct method.
+     */
+    private LLVMValue generateDynamicDispatch(LLVMValue objVal, MethodCallExpr node,
+                                               FuncInfo staticFi, String staticClassName) {
+        // Load typeId from object (first field)
+        String typePtr = "%disp.tid.ptr." + tmpCount++;
+        body.append("  ").append(typePtr).append(" = bitcast ").append(objVal.type)
+             .append(" ").append(objVal.value).append(" to i32*\n");
+        String typeId = "%disp.tid." + tmpCount++;
+        body.append("  ").append(typeId).append(" = load i32, i32* ").append(typePtr).append("\n");
+
+        // Determine return type
+        boolean isVoid = staticFi.returnType.equals("void");
+        String retType = toLLVMType(staticFi.returnType);
+        String phiName = "%disp.ret." + tmpCount++;
+
+        if (isVoid) {
+            // For void, generate if-else chain
+            generateVoidDispatch(typeId, objVal, node, staticFi, staticClassName);
+            return new LLVMValue("void", "void");
+        }
+
+        // Allocate slot for return value
+        String phiSlot = phiName + ".slot";
+        body.append("  ").append(phiSlot).append(" = alloca ").append(retType).append("\n");
+
+        // For non-void, use phi node
+        int id = labelCount++;
+        String endLabel = "disp.end." + id;
+
+        // Collect all classes that could be the runtime type
+        java.util.List<ClassInfo> possibleTypes = new ArrayList<>();
+        ClassInfo staticClass = classes.get(staticClassName);
+        possibleTypes.add(staticClass);
+        String staticSimpleName = staticClass != null ? staticClass.simpleName : staticClassName;
+        for (ClassInfo ci : classes.values()) {
+            if (ci == staticClass) continue;
+            if (isSubclass(ci.simpleName, staticSimpleName)) {
+                possibleTypes.add(ci);
+            }
+        }
+        for (ClassInfo ci : possibleTypes) {
+            String fn = ci.fullName + "." + node.method;
+        }
+
+        // Generate branch for each possible type
+        for (int i = 0; i < possibleTypes.size(); i++) {
+            ClassInfo ci = possibleTypes.get(i);
+            String funcName = ci.fullName + "." + node.method;
+            if (!functions.containsKey(funcName)) continue;
+
+            String callLabel = "disp.call." + id + "." + i;
+            String checkLabel = "disp.check." + id + "." + i;
+            String nextLabel = (i + 1 < possibleTypes.size()) ? "disp.check." + id + "." + (i + 1) : endLabel;
+
+            // Emit check label (except first which is inline)
+            if (i > 0) {
+                body.append(checkLabel).append(":\n");
+            }
+
+            // Check typeId matches this class
+            String cmp = "%disp.cmp." + tmpCount++;
+            body.append("  ").append(cmp).append(" = icmp eq i32 ").append(typeId)
+                 .append(", ").append(ci.typeId).append("\n");
+            body.append("  br i1 ").append(cmp).append(", label %").append(callLabel)
+                 .append(", label %").append(nextLabel).append("\n\n");
+
+            // Call label
+            body.append(callLabel).append(":\n");
+            StringBuilder args = new StringBuilder();
+            args.append(objVal.type).append(" ").append(objVal.value);
+            for (AST arg : node.args) {
+                LLVMValue argVal = generateExpr(arg);
+                String paramType = staticFi.paramTypes.get(node.args.indexOf(arg));
+                args.append(", ").append(toLLVMType(paramType)).append(" ")
+                    .append(castValue(argVal, toLLVMType(paramType)));
+            }
+            String result = "%disp.val." + tmpCount++;
+            body.append("  ").append(result).append(" = call ").append(retType)
+                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+            body.append("  store ").append(retType).append(" ").append(result)
+                 .append(", ").append(retType).append("* ").append(phiSlot).append("\n");
+            body.append("  br label %").append(endLabel).append("\n\n");
+        }
+
+        body.append(endLabel).append(":\n");
+        String loaded = "%disp.loaded." + tmpCount++;
+        body.append("  ").append(loaded).append(" = load ").append(retType)
+             .append(", ").append(retType).append("* ").append(phiName).append(".slot\n");
+        return new LLVMValue(loaded, retType);
+    }
+
+    private void generateVoidDispatch(String typeId, LLVMValue objVal, MethodCallExpr node,
+                                       FuncInfo staticFi, String staticClassName) {
+        // For void return, simpler if-else chain
+        int id = labelCount++;
+        String endLabel = "disp.end." + id;
+
+        java.util.List<ClassInfo> possibleTypes = new ArrayList<>();
+        possibleTypes.add(classes.get(staticClassName));
+        for (ClassInfo ci : classes.values()) {
+            if (ci != classes.get(staticClassName) && isSubclass(ci.simpleName, staticClassName)) {
+                possibleTypes.add(ci);
+            }
+        }
+
+        // Allocate slot for return (not needed for void, but for consistency)
+        // Actually for void we don't need it
+
+        String currentCheck = null;
+        for (int i = 0; i < possibleTypes.size(); i++) {
+            ClassInfo ci = possibleTypes.get(i);
+            String funcName = ci.fullName + "." + node.method;
+            if (!functions.containsKey(funcName)) continue;
+
+            String callLabel = "disp.call." + id + "." + i;
+
+            // Check typeId
+            String cmp = "%disp.vcmp." + tmpCount++;
+            body.append("  ").append(cmp).append(" = icmp eq i32 ").append(typeId)
+                 .append(", ").append(ci.typeId).append("\n");
+
+            String nextLabel = (i + 1 < possibleTypes.size()) ? "disp.next." + id + "." + (i + 1) : endLabel;
+            body.append("  br i1 ").append(cmp).append(", label %").append(callLabel)
+                 .append(", label %").append(nextLabel).append("\n\n");
+
+            // Call
+            body.append(callLabel).append(":\n");
+            StringBuilder args = new StringBuilder();
+            args.append(objVal.type).append(" ").append(objVal.value);
+            for (AST arg : node.args) {
+                LLVMValue argVal = generateExpr(arg);
+                String paramType = staticFi.paramTypes.get(node.args.indexOf(arg));
+                args.append(", ").append(toLLVMType(paramType)).append(" ")
+                    .append(castValue(argVal, toLLVMType(paramType)));
+            }
+            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            body.append("  br label %").append(endLabel).append("\n\n");
+
+            // Next label
+            if (i + 1 < possibleTypes.size()) {
+                body.append("disp.next.").append(id).append(".").append(i + 1).append(":\n");
+            }
+        }
+
+        body.append(endLabel).append(":\n");
+    }
+
+    private void collectFunction(FuncDecl decl, String className) {
+        String funcName = (className != null ? className + "." : "") + decl.name;
+        if (functions.containsKey(funcName)) {
+            String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
+            String srcLine = readSourceLine(file, decl.line);
+            throw new util.CompileError(
+                "Duplicate function: '" + decl.name + "' is already defined (methods cannot be overloaded)",
+                file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
+                srcLine, decl.name.length());
+        }
+        FuncInfo info = new FuncInfo();
+        info.name = funcName;
+        info.returnType = decl.returnType;
+        info.className = className;
+        info.isStatic = decl.isStatic;
+        info.isFinal = decl.isFinal;
+        for (Parameter p : decl.params) {
+            info.paramTypes.add(p.type);
+            info.paramNames.add(p.name);
+            info.paramDefaults.add(p.defaultValue);
+        }
+        functions.put(info.name, info);
+    }
+
+    /** Read a source line from file for error reporting; returns "" if unavailable. */
+    private String readSourceLine(String file, int line) {
+        try {
+            String[] lines = java.nio.file.Files.readString(java.nio.file.Path.of(file)).split("\n", -1);
+            return line >= 1 && line <= lines.length ? lines[line - 1].replace("\r", "") : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private void collectConstructor(ConstructorDecl decl, String fullName) {
+        FuncInfo info = new FuncInfo();
+        info.name = fullName + ".constructor";
+        info.returnType = "void";
+        info.className = fullName;
+        info.isConstructor = true;
+        for (Parameter p : decl.params) {
+            info.paramTypes.add(p.type);
+            info.paramNames.add(p.name);
+            info.paramDefaults.add(p.defaultValue);
+        }
+        functions.put(info.name, info);
+    }
+
+    // ==================== Header ====================
+
+    private void emitHeader() {
+        header.append("; Generated by Cang compiler\n\n");
+
+        // External declarations
+        header.append("declare i8* @malloc(i64)\n");
+        header.append("declare void @free(i8*)\n");
+        header.append("declare i32 @printf(i8*, ...)\n");
+        header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
+        header.append("declare i64 @strlen(i8*)\n");
+        header.append("declare i32 @strcmp(i8*, i8*)\n");
+        header.append("declare i32 @atoi(i8*)\n");
+        header.append("declare i32 @sscanf(i8*, i8*, ...)\n");
+        header.append("declare double @atof(i8*)\n");
+        header.append("@math.seed = global i64 1\n");
+        header.append("declare double @llvm.fabs.f64(double)\n");
+        header.append("declare float @llvm.fabs.f32(float)\n");
+        header.append("declare double @llvm.sqrt.f64(double)\n");
+        header.append("declare double @llvm.pow.f64(double, double)\n");
+        header.append("declare double @llvm.floor.f64(double)\n");
+        header.append("declare double @llvm.ceil.f64(double)\n");
+        header.append("declare double @llvm.round.f64(double)\n");
+        header.append("declare double @llvm.sin.f64(double)\n");
+        header.append("declare double @llvm.cos.f64(double)\n");
+        header.append("declare double @llvm.tan.f64(double)\n");
+        header.append("declare double @llvm.asin.f64(double)\n");
+        header.append("declare double @llvm.acos.f64(double)\n");
+        header.append("declare double @llvm.atan.f64(double)\n");
+        header.append("declare double @llvm.atan2.f64(double, double)\n");
+        header.append("declare double @llvm.log.f64(double)\n");
+        header.append("declare double @llvm.log10.f64(double)\n");
+        header.append("declare double @llvm.exp.f64(double)\n");
+        header.append("declare void @exit(i32)\n");
+        header.append("@cang.current.error = global i8* null\n");
+        header.append("declare void @cang_throw(i8*)\n");
+        header.append("declare i8* @getenv(i8*)\n");
+        header.append("declare i64 @time(i64*)\n");
+        header.append("declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)\n");
+        header.append("declare void @llvm.memset.p0i8.p0i8.i64(i8*, i8, i64, i1)\n\n");
+
+        // Runtime stack trace support
+        header.append("@.str.errprefix = private constant [11 x i8] c\"error: %s\\0A\\00\"\n");
+        header.append("@.str.stack_entry = private unnamed_addr constant [17 x i8] c\"  at %s (%s:%d)\\0A\\00\"\n");
+        header.append("@.str.null = private constant [6 x i8] c\"null\\0A\\00\"\n");
+        header.append("@.str.null.p = private constant [5 x i8] c\"null\\00\"\n");
+        header.append("@.stack_depth = global i32 0\n");
+        header.append("@system.args = global i8* null\n\n");
+
+        // Runtime error function (for future use)
+        header.append("define void @cang_error(i8* %msg, i8* %file, i32 %line) {\n");
+        header.append("entry:\n");
+        header.append("  %fmt1 = getelementptr [11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0\n");
+        header.append("  call i32 (i8*, ...) @printf(i8* %fmt1, i8* %msg)\n");
+        header.append("  %fmt2 = getelementptr [17 x i8], [17 x i8]* @.str.stack_entry, i32 0, i32 0\n");
+        header.append("  call i32 (i8*, ...) @printf(i8* %fmt2, i8* %file, i32 %line)\n");
+        header.append("  call void @exit(i32 1)\n");
+        header.append("  unreachable\n");
+        header.append("}\n\n");
+
+        // Struct types (deduplicate - same ClassInfo may be registered under multiple keys)
+        java.util.Set<String> emitted = new java.util.HashSet<>();
+        for (Map.Entry<String, ClassInfo> entry : classes.entrySet()) {
+            ClassInfo ci = entry.getValue();
+            if (emitted.contains(ci.llvmName)) continue;
+            emitted.add(ci.llvmName);
+            header.append(ci.llvmName).append(" = type { ");
+
+            // Type ID field first (for runtime type checking / like operator)
+            header.append("i32");
+
+            // All fields (parent fields already included in ci.fieldTypes by collectClass)
+            for (int i = 0; i < ci.fieldTypes.size(); i++) {
+                header.append(", ");
+                header.append(toLLVMType(ci.fieldTypes.get(i)));
+            }
+            header.append(" }\n");
+        }
+        header.append("\n");
+
+        // Function object: { code pointer, receiver/environment }
+        header.append("%CangFunction = type { i8*, i8* }\n\n");
+
+        // Object constructor (no-op)
+        header.append("define void @cang_lang_Object.constructor(%cang_lang_Object* %this) {\n");
+        header.append("entry:\n");
+        header.append("  ret void\n");
+        header.append("}\n\n");
+
+        // String constants for printf format
+        emitFmtConstants();
+
+        header.append("\n");
+    }
+
+    private void emitFmtConstants() {
+        // println format: %type + newline (0A) + null (00)
+        addFmtConstant("int", "%d\\0A\\00", 4);
+        addFmtConstant("long", "%lld\\0A\\00", 6);
+        addFmtConstant("float", "%f\\0A\\00", 4);
+        addFmtConstant("double", "%f\\0A\\00", 4);
+        addFmtConstant("bool", "%d\\0A\\00", 4);
+        addFmtConstant("String", "%s\\0A\\00", 4);
+        addFmtConstant("byte", "%d\\0A\\00", 4);
+
+        // print format (no newline): %type + null (00)
+        addFmtConstantNoNL("int", "%d\\00", 3);
+        addFmtConstantNoNL("long", "%lld\\00", 5);
+        addFmtConstantNoNL("float", "%f\\00", 3);
+        addFmtConstantNoNL("double", "%f\\00", 3);
+        addFmtConstantNoNL("bool", "%d\\00", 3);
+        addFmtConstantNoNL("String", "%s\\00", 3);
+        addFmtConstantNoNL("byte", "%d\\00", 3);
+
+        // Format strings for toString (no newline)
+        header.append("@.fmt.tostr.int = private unnamed_addr constant [3 x i8] c\"%d\\00\"\n");
+        header.append("@.fmt.tostr.long = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
+        header.append("@.fmt.tostr.double = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
+        header.append("@.str.empty = private unnamed_addr constant [1 x i8] c\"\\00\"\n");
+
+        // Static fields as global variables
+        for (Map.Entry<String, FieldDecl> entry : staticFields.entrySet()) {
+            FieldDecl f = entry.getValue();
+            String globalName = "@static." + entry.getKey().replace(".", "_");
+            String llvmType = toLLVMType(f.type);
+
+            if (f.init instanceof StringLit) {
+                // String literal: emit string constant and reference it
+                StringLit sl = (StringLit) f.init;
+                String strKey = sl.value;
+                if (!stringLiterals.containsKey(strKey)) {
+                    String strName = "@.str.stat." + stringLiterals.size();
+                    int byteCount = sl.value.length() + 1;
+                    StringBuilder escaped = new StringBuilder();
+                    for (char c : sl.value.toCharArray()) {
+                        if (c == '\\') escaped.append("\\5C");
+                        else if (c == '\n') escaped.append("\\0A");
+                        else if (c == '\t') escaped.append("\\09");
+                        else if (c == '"') escaped.append("\\22");
+                        else if (c >= 32 && c < 127) escaped.append(c);
+                        else escaped.append(String.format("\\%02X", (int) c));
+                    }
+                    header.append(strName).append(" = private unnamed_addr constant [").append(byteCount)
+                          .append(" x i8] c\"").append(escaped).append("\\00\"\n");
+                    stringLiterals.put(strKey, strName);
+                }
+                String strName = stringLiterals.get(strKey);
+                header.append(globalName).append(" = global i8* getelementptr ([")
+                      .append(sl.value.length() + 1).append(" x i8], [")
+                      .append(sl.value.length() + 1).append(" x i8]* ")
+                      .append(strName).append(", i32 0, i32 0)\n");
+            } else {
+                // Numeric/bool literal or default
+                String defaultVal = defaultValueForType(f.type);
+                header.append(globalName).append(" = global ").append(llvmType).append(" ").append(defaultVal).append("\n");
+            }
+        }
+        header.append("\n");
+    }
+
+    private final Map<String, String> fmtConstants = new LinkedHashMap<>();
+    private final Map<String, String> fmtConstantsNoNL = new LinkedHashMap<>();
+
+    private void addFmtConstant(String cangType, String format, int byteCount) {
+        String name = "@.fmt." + cangType;
+        fmtConstants.put(cangType, name);
+        header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+              .append(" x i8] c\"").append(format).append("\"\n");
+    }
+
+    private void addFmtConstantNoNL(String cangType, String format, int byteCount) {
+        String name = "@.fmt." + cangType + ".print";
+        fmtConstantsNoNL.put(cangType, name);
+        header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+              .append(" x i8] c\"").append(format).append("\"\n");
+    }
+
+    // ==================== Class generation ====================
+
+    private void generateClass(ClassDecl decl) {
+        ClassInfo ci = classes.get(decl.name);
+        String fullName = ci.fullName;
+        currentClassName = fullName;
+
+        // Generate implicit constructor if has params OR has parent (to call parent ctor)
+        if (!decl.ctorParams.isEmpty() || ci.parentName != null) {
+            generateImplicitCtor(decl, ci, fullName);
+        }
+
+        for (AST member : decl.members) {
+            if (member instanceof FuncDecl) {
+                generateFunction((FuncDecl) member, fullName);
+            } else if (member instanceof ConstructorDecl) {
+                generateConstructor((ConstructorDecl) member, fullName);
+            }
+        }
+
+        currentClassName = null;
+    }
+
+    /**
+     * Generate implicit constructor: assigns params to fields
+     */
+    private void generateImplicitCtor(ClassDecl decl, ClassInfo ci, String fullName) {
+        body.append("define void @").append(fullName).append(".constructor(");
+        body.append("%").append(fullName).append("* %this");
+        for (Parameter p : decl.ctorParams) {
+            body.append(", ").append(toLLVMType(p.type)).append(" %").append(p.name);
+        }
+        body.append(") {\n");
+        body.append("entry:\n");
+
+        scope = new Scope(null);
+        beginRegion();
+        scope.define("this", new LLVMValue("%this", "%" + fullName + "*"));
+        currentFuncReturnType = "void";
+
+        // Store parameters to alloca (so they can be referenced by superArgs)
+        for (Parameter p : decl.ctorParams) {
+            String pType = toLLVMType(p.type);
+            String allocaName = "%p." + p.name;
+            body.append("  ").append(allocaName).append(" = alloca ").append(pType).append("\n");
+            body.append("  store ").append(pType).append(" %").append(p.name)
+                 .append(", ").append(pType).append("* ").append(allocaName).append("\n");
+            scope.define(p.name, new LLVMValue(allocaName, pType,
+                semanticKindOf(p.type)));
+            if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
+                trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
+            }
+        }
+
+        // Call parent constructor if inheriting (this sets parent's type ID first)
+        if (ci.parentName != null) {
+            ClassInfo parentInfo = classes.get(ci.parentName);
+            if (parentInfo != null) {
+                String parentCtor = parentInfo.fullName + ".constructor";
+                if (functions.containsKey(parentCtor)) {
+                    // Bitcast this to parent type
+                    String parentThis = "%parent.this." + tmpCount++;
+                    body.append("  ").append(parentThis).append(" = bitcast %")
+                         .append(fullName).append("* %this to %")
+                         .append(parentInfo.fullName).append("*\n");
+                    // Call parent constructor with superArgs
+                    StringBuilder args = new StringBuilder();
+                    args.append("%").append(parentInfo.fullName).append("* ").append(parentThis);
+                    List<AST> superArgs = ci.superArgs;
+                    for (int i = 0; i < superArgs.size(); i++) {
+                        LLVMValue argVal = generateExpr(superArgs.get(i));
+                        args.append(", ").append(argVal.type).append(" ").append(argVal.value);
+                    }
+                    body.append("  call void @").append(parentCtor).append("(").append(args).append(")\n");
+                }
+            }
+        }
+
+        // Set type ID AFTER parent constructor (so child's ID overwrites parent's)
+        String typePtr = "%typeid." + fullName;
+        body.append("  ").append(typePtr).append(" = getelementptr %")
+             .append(fullName).append(", %").append(fullName).append("* %this, i32 0, i32 0\n");
+        body.append("  store i32 ").append(ci.typeId).append(", i32* ").append(typePtr).append("\n");
+
+        // Store each param to corresponding field (after type ID + parent fields)
+        int parentFieldCount = 0;
+        if (ci.parentName != null) {
+            ClassInfo parentInfo = classes.get(ci.parentName);
+            if (parentInfo != null) parentFieldCount = parentInfo.fieldNames.size();
+        }
+        for (int i = 0; i < decl.ctorParams.size(); i++) {
+            Parameter p = decl.ctorParams.get(i);
+            int fieldIdx = 1 + parentFieldCount + i; // +1 for type ID
+            String pType = toLLVMType(p.type);
+            // Load from alloca
+            String loaded = "%pval." + p.name + "." + tmpCount++;
+            body.append("  ").append(loaded).append(" = load ").append(pType)
+                 .append(", ").append(pType).append("* %p.").append(p.name).append("\n");
+            // Store to field
+            body.append("  %f").append(p.name).append(" = getelementptr ")
+                .append(ci.llvmName).append(", ").append(ci.llvmName)
+                .append("* %this, i32 0, i32 ").append(fieldIdx).append("\n");
+            body.append("  store ").append(pType).append(" ").append(loaded)
+                .append(", ").append(pType).append("* %f").append(p.name).append("\n");
+        }
+
+        endRegionCleanup();
+        body.append("  ret void\n");
+        body.append("}\n\n");
+        scope = null;
+    }
+
+    private void generateConstructor(ConstructorDecl decl, String fullName) {
+        String funcName = fullName + ".constructor";
+        ClassInfo ci = classes.get(decl.className);
+
+        body.append("define void @").append(funcName).append("(");
+        body.append("%").append(fullName).append("* %this");
+        for (int i = 0; i < decl.params.size(); i++) {
+            Parameter p = decl.params.get(i);
+            body.append(", ").append(toLLVMType(p.type)).append(" %").append(p.name);
+        }
+        body.append(") {\n");
+        body.append("entry:\n");
+
+        scope = new Scope(null);
+        beginRegion();
+        // Define 'this'
+        scope.define("this", new LLVMValue("%this", "%" + fullName + "*"));
+        currentFuncReturnType = "void";
+
+        // Define parameters
+        for (Parameter p : decl.params) {
+            String allocaName = "%p." + p.name;
+            String pLLVMType = toLLVMType(p.type);
+            body.append("  ").append(allocaName).append(" = alloca ").append(pLLVMType).append("\n");
+            body.append("  store ").append(pLLVMType).append(" %").append(p.name)
+                 .append(", ").append(pLLVMType).append("* ").append(allocaName).append("\n");
+            scope.define(p.name, new LLVMValue(allocaName, pLLVMType,
+                semanticKindOf(p.type)));
+            if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
+                trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
+            }
+        }
+
+        // Initialize fields to default values
+        if (ci != null) {
+            for (int i = 0; i < ci.fieldNames.size(); i++) {
+                String fieldType = ci.fieldTypes.get(i);
+                String defaultVal = defaultValueForType(fieldType);
+                String ptr = "%f." + ci.fieldNames.get(i);
+                body.append("  ").append(ptr).append(" = getelementptr ").append(ci.llvmName)
+                     .append(", ").append(ci.llvmName).append("* %this, i32 0, i32 ").append(i).append("\n");
+                body.append("  store ").append(toLLVMType(fieldType)).append(" ").append(defaultVal)
+                     .append(", ").append(toLLVMType(fieldType)).append("* ").append(ptr).append("\n");
+            }
+        }
+
+        // Generate body
+        generateBlockBody((Block) decl.body);
+
+        endRegionCleanup();
+        // Ensure return
+        if (!body.toString().endsWith("  ret void\n")) {
+            body.append("  ret void\n");
+        }
+        body.append("}\n\n");
+
+        scope = null;
+    }
+
+    // ==================== Function generation ====================
+
+    private void generateFunction(FuncDecl decl, String className) {
+        // Set source file for error reporting
+        String prevSourceFile = this.sourceFile;
+        
+        // Native methods have no body - skip generation
+        if (decl.isNative) {
+            this.sourceFile = prevSourceFile;
+            return;
+        }
+
+        if (!decl.sourceFile.isEmpty()) this.sourceFile = decl.sourceFile;
+
+        String funcName = (className != null ? className + "." : "") + decl.name;
+        FuncInfo fi = functions.get(funcName);
+
+        body.append("define ").append(toLLVMType(decl.returnType)).append(" @").append(funcName).append("(");
+
+        // Parameters
+        boolean first = true;
+        if (className != null && !decl.isStatic) {
+            body.append("%").append(className).append("* %this");
+            first = false;
+        }
+        for (int i = 0; i < decl.params.size(); i++) {
+            Parameter p = decl.params.get(i);
+            if (!first) body.append(", ");
+            body.append(toLLVMType(p.type)).append(" %").append(p.name);
+            first = false;
+        }
+        body.append(") {\n");
+        body.append("entry:\n");
+
+        // Setup scope
+        scope = new Scope(null);
+        tmpCount = 0;
+        currentFuncReturnType = decl.returnType;
+
+        if (className != null && !decl.isStatic) {
+            scope.define("this", new LLVMValue("%this", "%" + className + "*"));
+        }
+
+        // Allocate parameters
+        for (Parameter p : decl.params) {
+            String allocaName = "%p." + p.name;
+            String pLLVMType = toLLVMType(p.type);
+            body.append("  ").append(allocaName).append(" = alloca ").append(pLLVMType).append("\n");
+            body.append("  store ").append(pLLVMType).append(" %").append(p.name)
+                 .append(", ").append(pLLVMType).append("* ").append(allocaName).append("\n");
+            scope.define(p.name, new LLVMValue(allocaName, pLLVMType,
+                semanticKindOf(p.type)));
+            if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
+                trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
+            }
+        }
+
+        // Generate body
+        int bodyStart = body.length();
+        generateBlockBody((Block) decl.body);
+
+        endRegionCleanup();
+        // Ensure terminator
+        String recent = body.substring(bodyStart).trim();
+        boolean hasTerminator = recent.contains("\n  ret ") ||
+            recent.startsWith("ret ") ||
+            recent.startsWith("\nret ");
+        if (!hasTerminator) {
+            if (decl.returnType.equals("void")) {
+                body.append("  ret void\n");
+            } else {
+                // Non-void function must have explicit return
+                String srcFile = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
+                String srcLine = "";
+                try {
+                    if (!srcFile.isEmpty()) {
+                        String[] fileLines = java.nio.file.Files.readString(java.nio.file.Path.of(srcFile)).split("\n", -1);
+                        if (decl.line > 0 && decl.line <= fileLines.length) {
+                            srcLine = fileLines[decl.line - 1];
+                        }
+                    }
+                } catch (Exception ignored) {}
+                throw new util.CompileError(
+                    "Function '" + decl.name + "' must return a value of type '" + decl.returnType + "'",
+                    srcFile, decl.line, 1, srcLine, decl.name.length());
+            }
+        }
+
+        body.append("}\n\n");
+        scope = null;
+        this.sourceFile = prevSourceFile;
+    }
+
+    // ==================== Statement generation ====================
+
+    private void generateBlockBody(Block block) {
+        for (AST stmt : block.statements) {
+            generateStmt(stmt);
+        }
+    }
+
+    private void generateStmt(AST node) {
+        if (node instanceof Block) {
+            Scope prev = scope;
+            scope = new Scope(prev);
+            generateBlockBody((Block) node);
+            scope = prev;
+        } else if (node instanceof VarDecl) {
+            generateVarDecl((VarDecl) node);
+        } else if (node instanceof IfStmt) {
+            markRegionControlFlow();
+            generateIf((IfStmt) node);
+        } else if (node instanceof SwitchStmt) {
+            markRegionControlFlow();
+            generateSwitch((SwitchStmt) node);
+        } else if (node instanceof WhileStmt) {
+            markRegionControlFlow();
+            generateWhile((WhileStmt) node);
+        } else if (node instanceof ForStmt) {
+            markRegionControlFlow();
+            generateFor((ForStmt) node);
+        } else if (node instanceof ForEachStmt) {
+            markRegionControlFlow();
+            generateForEach((ForEachStmt) node);
+        } else if (node instanceof ReturnStmt) {
+            generateReturn((ReturnStmt) node);
+        } else if (node instanceof ThrowStmt) {
+            generateThrow((ThrowStmt) node);
+        } else if (node instanceof TryStmt) {
+            generateTry((TryStmt) node);
+        } else if (node instanceof BreakStmt) {
+            if (!loopStack.isEmpty()) {
+                body.append("  br label %").append(loopStack.get(loopStack.size() - 1).breakLabel).append("\n");
+            }
+        } else if (node instanceof ContinueStmt) {
+            if (!loopStack.isEmpty()) {
+                body.append("  br label %").append(loopStack.get(loopStack.size() - 1).continueLabel).append("\n");
+            }
+        } else if (node instanceof FreeStmt) {
+            generateFree((FreeStmt) node);
+        } else if (node instanceof ExprStmt) {
+            generateExpr(((ExprStmt) node).expr);
+        } else if (node instanceof VarDecl) {
+            generateVarDecl((VarDecl) node);
+        }
+    }
+
+    private void generateThrow(ThrowStmt stmt) {
+        LLVMValue value = generateExpr(stmt.value);
+        if (!(value.type.endsWith("*") && value.type.startsWith("%"))) {
+            throw new RuntimeException("throw requires Error or an Error subclass (at line " + stmt.line + ")");
+        }
+        String raw = "%throw.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = bitcast ").append(value.type).append(" ").append(value.value).append(" to i8*\n");
+        body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
+        if (exceptionHandlers.isEmpty()) {
+            emitUncaughtError(stmt.line);
+        } else {
+            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+            // Statements after throw are dead code but must still form a valid LLVM block.
+            body.append("throw.dead.").append(labelCount++).append(":\n");
+        }
+    }
+
+    /**
+     * Emit an uncaught-exception path: print message (when Error is known) and exit.
+     * Followed by a fresh label so subsequent dead statements stay well-formed.
+     */
+    private void emitUncaughtError(int line) {
+        String uncaught = "uncaught." + labelCount++;
+        body.append("  br label %").append(uncaught).append("\n");
+        body.append(uncaught).append(":\n");
+        String message = ensureStringConstant("@.str.uncaught", "uncaught exception\\0A\\00", 20);
+        String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+        ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+        // Prefer the thrown Error.message when the Error class layout is known.
+        ClassInfo errorInfo = classes.get("Error");
+        String msgValue = message;
+        if (errorInfo != null) {
+            Integer fieldIdx = errorInfo.fieldIndices.get("message");
+            if (fieldIdx != null) {
+                String caught = "%uncaught.raw." + tmpCount++;
+                String typed = "%uncaught.err." + tmpCount++;
+                String fieldPtr = "%uncaught.msg.ptr." + tmpCount++;
+                String loaded = "%uncaught.msg." + tmpCount++;
+                String chosen = "%uncaught.msg.use." + tmpCount++;
+                body.append("  ").append(caught).append(" = load i8*, i8** @cang.current.error\n");
+                body.append("  ").append(typed).append(" = bitcast i8* ").append(caught).append(" to ").append(errorInfo.llvmName).append("*\n");
+                body.append("  ").append(fieldPtr).append(" = getelementptr ").append(errorInfo.llvmName)
+                     .append(", ").append(errorInfo.llvmName).append("* ").append(typed)
+                     .append(", i32 0, i32 ").append(fieldIdx).append("\n");
+                body.append("  ").append(loaded).append(" = load i8*, i8** ").append(fieldPtr).append("\n");
+                String hasMsg = "%uncaught.hasmsg." + tmpCount++;
+                body.append("  ").append(hasMsg).append(" = icmp ne i8* ").append(loaded).append(", null\n");
+                body.append("  ").append(chosen).append(" = select i1 ").append(hasMsg)
+                     .append(", i8* ").append(loaded).append(", i8* ").append(message).append("\n");
+                msgValue = chosen;
+            }
+        }
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0), i8* ")
+             .append(msgValue).append(")\n");
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* @.str.locfmt, i32 0, i32 0), i8* ")
+             .append(fileName).append(", i32 ").append(line).append(")\n");
+        body.append("  call void @exit(i32 1)\n");
+        body.append("  unreachable\n");
+        body.append("throw.dead.").append(labelCount++).append(":\n");
+    }
+
+    private void generateTry(TryStmt stmt) {
+        if (stmt.catches.size() > 1) {
+            throw new RuntimeException("Multiple catch clauses are not supported yet (at line " + stmt.line + ")");
+        }
+        int id = labelCount++;
+        String handler = "try.handler." + id;
+        String after = "try.after." + id;
+        boolean hasCatch = !stmt.catches.isEmpty();
+        boolean hasFinally = stmt.finallyBlock != null;
+        // finally-only try must run finally and then propagate: track which path entered it.
+        boolean needPending = !hasCatch && hasFinally;
+        String pending = "%try.pending." + id;
+
+        // Validate catch types: must be Error or an Error subclass.
+        for (CatchClause c : stmt.catches) {
+            if (c.type.equals("Error")) {
+                if (classes.get("Error") == null) {
+                    throw new RuntimeException("catch (Error ...) requires 'import cang/lang/Error' (at line " + c.line + ")");
+                }
+                continue;
+            }
+            ClassInfo ci = classes.get(c.type);
+            if (ci == null) {
+                throw new RuntimeException("Unknown catch type: " + c.type + " (at line " + c.line + ")");
+            }
+            if (!isErrorSubclass(ci)) {
+                throw new RuntimeException("catch type must be Error or an Error subclass: " + c.type
+                    + " (at line " + c.line + ")");
+            }
+        }
+
+        if (needPending) {
+            body.append("  ").append(pending).append(" = alloca i32\n");
+            body.append("  store i32 0, i32* ").append(pending).append("\n");
+        }
+
+        exceptionHandlers.push(handler);
+        int tryStart = body.length();
+        generateStmt(stmt.tryBlock);
+        exceptionHandlers.pop();
+        if (needPending && !tailTerminated(tryStart)) {
+            body.append("  store i32 0, i32* ").append(pending).append("\n");
+        }
+        emitBranchIfNeeded(after, tryStart);
+        body.append(handler).append(":\n");
+
+        if (hasCatch) {
+            CatchClause c = stmt.catches.get(0);
+            ClassInfo errorInfo = classes.get(c.type);
+            String errorType = errorInfo.llvmName + "*";
+            String caught = "%catch.value." + tmpCount++;
+            body.append("  ").append(caught).append(" = load i8*, i8** @cang.current.error\n");
+            String typed = "%catch.typed." + tmpCount++;
+            body.append("  ").append(typed).append(" = bitcast i8* ").append(caught).append(" to ").append(errorType).append("\n");
+            String typedSlot = "%catch.typed.slot." + tmpCount++;
+            body.append("  ").append(typedSlot).append(" = alloca ").append(errorType).append("\n");
+            body.append("  store ").append(errorType).append(" ").append(typed).append(", ").append(errorType).append("* ").append(typedSlot).append("\n");
+            scope.define(c.name, new LLVMValue(typedSlot, errorType, c.type));
+            int catchStart = body.length();
+            generateStmt(c.body);
+            emitBranchIfNeeded(after, catchStart);
+        } else {
+            // finally-only: mark this path so the shared finally block propagates afterwards.
+            body.append("  store i32 1, i32* ").append(pending).append("\n");
+            body.append("  br label %").append(after).append("\n");
+        }
+        body.append(after).append(":\n");
+        if (hasFinally) generateStmt(stmt.finallyBlock);
+
+        if (needPending) {
+            int finallyEnd = body.length();
+            String loaded = "%try.pending.load." + tmpCount++;
+            String isRethrow = "%try.pending.rethrow." + tmpCount++;
+            String rethrow = "try.rethrow." + id;
+            String continueLabel = "try.continue." + id;
+            // Alloca/loads only after the finally block; the block may already be terminated.
+            if (tailTerminated(finallyEnd)) {
+                // Finally returned/threw: no continuation code is reachable here.
+                return;
+            }
+            body.append("  ").append(loaded).append(" = load i32, i32* ").append(pending).append("\n");
+            body.append("  ").append(isRethrow).append(" = icmp eq i32 ").append(loaded).append(", 1\n");
+            body.append("  br i1 ").append(isRethrow).append(", label %").append(rethrow)
+                 .append(", label %").append(continueLabel).append("\n\n");
+            body.append(rethrow).append(":\n");
+            if (!exceptionHandlers.isEmpty()) {
+                body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+            } else {
+                emitUncaughtError(stmt.line);
+                // emitUncaughtError ends with an empty dead-code label; terminate it
+                // so the shared continue label is not preceded by an empty block.
+                body.append("  br label %").append(continueLabel).append("\n");
+            }
+            body.append(continueLabel).append(":\n");
+        }
+    }
+
+    /** True when the text generated since offset already ends with a terminator instruction. */
+    private boolean tailTerminated(int sinceOffset) {
+        String trimmed = body.substring(sinceOffset).trim();
+        int lastBreak = trimmed.lastIndexOf('\n');
+        String lastLine = (lastBreak >= 0 ? trimmed.substring(lastBreak + 1) : trimmed).trim();
+        return lastLine.startsWith("ret ") || lastLine.startsWith("br ") || lastLine.equals("unreachable");
+    }
+
+    /** True when a class derives (transitively) from cang/lang/Error. */
+    private boolean isErrorSubclass(ClassInfo ci) {
+        int guard = 0;
+        while (ci != null && guard++ < 64) {
+            if (ci.simpleName.equals("Error") || ci.fullName.equals("cang_lang_Error")) return true;
+            ci = ci.parentName != null ? classes.get(ci.parentName) : null;
+        }
+        return false;
+    }
+
+    private void generateFree(FreeStmt stmt) {
+        for (String name : stmt.names) {
+            if (freedVars.contains(name)) {
+                throw new RuntimeException("Variable '" + name + "' has already been freed (at line " + stmt.line + ")");
+            }
+            LLVMValue ptr = scope.lookup(name);
+            if (ptr == null) {
+                throw new RuntimeException("Undefined variable: " + name + " (at line " + stmt.line + ")");
+            }
+            if (ptr.type.equals("i8*") || (ptr.type.startsWith("%") && ptr.type.endsWith("*"))) {
+                // i8* String/str values may point into read-only string constants; require explicit heap objects only.
+                if (ptr.semanticType != null && (ptr.semanticType.equals("String") || ptr.semanticType.equals("str"))) {
+                    throw new RuntimeException("Cannot free String/str value; only heap objects and arrays can be freed (at line " + stmt.line + ")");
+                }
+                String value = "%free." + tmpCount++;
+                body.append("  ").append(value).append(" = load ").append(ptr.type)
+                     .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+                String freeValue = value;
+                if (!ptr.type.equals("i8*")) {
+                    freeValue = "%free.cast." + tmpCount++;
+                    body.append("  ").append(freeValue).append(" = bitcast ").append(ptr.type).append(" ").append(value).append(" to i8*\n");
+                }
+                body.append("  call void @free(i8* ").append(freeValue).append(")\n");
+                body.append("  store ").append(ptr.type).append(" null, ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+            }
+            freedVars.add(name);
+        }
+    }
+
+    private void generateVarDecl(VarDecl decl) {
+        String cangType = decl.type;
+        String llvmType;
+
+        if (decl.isFinal) {
+            finalVars.add(decl.name);
+        }
+
+        if (cangType.equals("var")) {
+            // Type inference: evaluate init first, then infer type
+            if (decl.init == null) {
+                throw new RuntimeException("var requires initializer at line " + decl.line);
+            }
+            // null cannot be type-inferred
+            if (decl.init instanceof NullLit) {
+                throw new RuntimeException("Cannot infer type from null, use explicit type (at line " + decl.line + ")");
+            }
+            // Array literal: infer element type from first element, check the rest
+            if (decl.init instanceof ArrayLit) {
+                ArrayLit lit = (ArrayLit) decl.init;
+                if (lit.elements.isEmpty()) {
+                    throw new RuntimeException(
+                        "Cannot infer element type from empty array literal, use explicit type e.g. int[] arr = [] (at line "
+                        + decl.line + ")");
+                }
+                LLVMValue arrVal = generateArrayLit(lit, null, null);
+                if (lastArrayElemType != null) {
+                    arrayElemTypes.put(decl.name, lastArrayElemType);
+                }
+                if (lastArrayElemCangType != null) {
+                    arrayElemCangTypes.put(decl.name, lastArrayElemCangType);
+                }
+                String ptrName = "%v." + decl.name;
+                body.append("  ").append(ptrName).append(" = alloca i8*\n");
+                scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + lastArrayElemCangType + ">"));
+                body.append("  store i8* ").append(arrVal.value).append(", i8** ").append(ptrName).append("\n");
+                return;
+            }
+            LLVMValue val = generateExpr(decl.init);
+            llvmType = val.type;
+            String ptrName = "%v." + decl.name;
+            body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
+            scope.define(decl.name, new LLVMValue(ptrName, llvmType, val.semanticType));
+            body.append("  store ").append(llvmType).append(" ").append(val.value)
+                 .append(", ").append(llvmType).append("* ").append(ptrName).append("\n");
+            // Array aliasing (var b = a): carry element type tracking over
+            if (decl.init instanceof Identifier) {
+                String elem = arrayElemCangTypes.get(((Identifier) decl.init).name);
+                if (elem != null) {
+                    trackArrayVar(decl.name, elem);
+                }
+            }
+            return;
+        }
+
+        // Internal array type representation: T[N] / T[] are normalized to Array<T>
+        if (cangType.startsWith("Array<") && cangType.endsWith(">")) {
+            String elemCangType = cangType.substring(6, cangType.length() - 1);
+            String expectedLLVMType = toLLVMType(elemCangType);
+            trackArrayVar(decl.name, elemCangType);
+
+            LLVMValue arrVal = null;
+            if (decl.arraySize >= 0) {
+                // Fixed size: T[N]
+                if (decl.init == null) {
+                    arrVal = generateFixedArray(decl.arraySize, expectedLLVMType);
+                } else if (decl.init instanceof ArrayLit) {
+                    ArrayLit lit = (ArrayLit) decl.init;
+                    if (lit.elements.isEmpty()) {
+                        arrVal = generateFixedArray(decl.arraySize, expectedLLVMType);
+                    } else {
+                        if (lit.elements.size() != decl.arraySize) {
+                            throw new RuntimeException(
+                                "Array size mismatch: expected " + decl.arraySize + " elements but found "
+                                + lit.elements.size() + " (at line " + decl.line + ")");
+                        }
+                        arrVal = generateArrayLit(lit, expectedLLVMType, elemCangType);
+                    }
+                } else {
+                    throw new RuntimeException(
+                        "Fixed-size array must be initialized with an array literal of exactly "
+                        + decl.arraySize + " elements (at line " + decl.line + ")");
+                }
+            } else if (decl.init instanceof ArrayLit) {
+                // Length inferred from literal: T[] = [...]
+                arrVal = generateArrayLit((ArrayLit) decl.init, expectedLLVMType, elemCangType);
+            } else if (decl.init == null) {
+                throw new RuntimeException(
+                    "Array '" + decl.name + "' requires an initializer to infer length (at line " + decl.line + ")");
+            }
+
+            if (arrVal != null) {
+                String ptrName = "%v." + decl.name;
+                body.append("  ").append(ptrName).append(" = alloca i8*\n");
+                scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + elemCangType + ">"));
+                body.append("  store i8* ").append(arrVal.value).append(", i8** ").append(ptrName).append("\n");
+                return;
+            }
+            // Non-literal initializer (e.g. array aliasing): fall through to common path
+        }
+
+        llvmType = toLLVMType(cangType);
+        String ptrName = "%v." + decl.name;
+
+        body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
+        scope.define(decl.name, new LLVMValue(ptrName, llvmType, semanticKindOf(cangType)));
+
+        if (decl.init != null) {
+            String savedExpected = expectedFunctionType;
+            expectedFunctionType = isFunctionType(cangType) ? cangType : null;
+            LLVMValue val;
+            try {
+                val = generateExpr(decl.init);
+            } finally {
+                expectedFunctionType = savedExpected;
+            }
+            if ((cangType.equals("str") || cangType.equals("String")) &&
+                val.semanticType != null && !cangType.equals(val.semanticType)) {
+                throw new RuntimeException("Cannot assign " + val.semanticType + " to " + cangType + " without an explicit conversion (at line " + decl.line + ")");
+            }
+            if (isFunctionType(cangType)) {
+                checkFunctionValue(val, cangType, decl.line);
+            }
+            body.append("  store ").append(llvmType).append(" ").append(castValue(val, llvmType))
+                 .append(", ").append(llvmType).append("* ").append(ptrName).append("\n");
+            // Array aliasing (e.g. Array<int> b = a): carry element type tracking over
+            if (decl.init instanceof Identifier) {
+                String elem = arrayElemCangTypes.get(((Identifier) decl.init).name);
+                if (elem != null) {
+                    trackArrayVar(decl.name, elem);
+                }
+            }
+        }
+    }
+
+    /**
+     * Generate a zero-filled fixed-size array: [i64 length][n * elemType], all elements 0/null.
+     */
+    private LLVMValue generateFixedArray(int n, String elemType) {
+        int elemBits = llvmTypeBits(elemType);
+        if (elemBits <= 0) elemBits = 64; // pointers default to 8 bytes
+        long elemBytes = (elemBits + 7) / 8;
+        long totalSize = 8L + (long) n * elemBytes;
+        long dataSize = (long) n * elemBytes;
+
+        String ptr = "%arr.fix." + tmpCount++;
+        body.append("  ").append(ptr).append(" = call i8* @malloc(i64 ").append(totalSize).append(")\n");
+        registerRegionAllocation(ptr);
+        body.append("  store i64 ").append(n).append(", i64* ").append(ptr).append("\n");
+
+        String dataPtr = "%arr.fixdata." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr i8, i8* ").append(ptr).append(", i64 8\n");
+        body.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(dataPtr)
+             .append(", i8 0, i64 ").append(dataSize).append(", i1 false)\n");
+        return new LLVMValue(ptr, "i8*");
+    }
+
+    /**
+     * Check if two LLVM types are compatible (can convert).
+     */
+    private boolean typesCompatible(String from, String to) {
+        if (from.equals(to)) return true;
+        // int can convert to long, float, double
+        if (from.equals("i32") && (to.equals("i64") || to.equals("float") || to.equals("double"))) return true;
+        // long can convert to double
+        if (from.equals("i64") && (to.equals("double"))) return true;
+        // float can convert to double
+        if (from.equals("float") && to.equals("double")) return true;
+        // bool can convert to int
+        if (from.equals("i1") && (to.equals("i32") || to.equals("i64"))) return true;
+        return false;
+    }
+
+    private void generateIf(IfStmt stmt) {
+        int id = labelCount++;
+        String thenLabel = "if.then." + id;
+        String elseLabel = "if.else." + id;
+        String endLabel = "if.end." + id;
+
+        LLVMValue cond = generateExpr(stmt.condition);
+        String condVar = ensureI1(cond);
+
+        if (stmt.elseBlock != null) {
+            body.append("  br i1 ").append(condVar).append(", label %").append(thenLabel)
+                 .append(", label %").append(elseLabel).append("\n\n");
+        } else {
+            body.append("  br i1 ").append(condVar).append(", label %").append(thenLabel)
+                 .append(", label %").append(endLabel).append("\n\n");
+        }
+
+        // Then block
+        body.append(thenLabel).append(":\n");
+        int thenStart = body.length();
+        generateStmt(stmt.thenBlock);
+        emitBranchIfNeeded(endLabel, thenStart);
+        body.append("\n");
+
+        // Else block
+        if (stmt.elseBlock != null) {
+            body.append(elseLabel).append(":\n");
+            int elseStart = body.length();
+            generateStmt(stmt.elseBlock);
+            emitBranchIfNeeded(endLabel, elseStart);
+            body.append("\n");
+        }
+
+        // End label
+        body.append(endLabel).append(":\n");
+    }
+
+    /**
+     * Generate switch statement as if/else-if chain.
+     */
+    private void generateSwitch(SwitchStmt stmt) {
+        int id = labelCount++;
+        String endLabel = "switch.end." + id;
+
+        // Evaluate subject once
+        LLVMValue subject = generateExpr(stmt.subject);
+
+        // Jump to first check
+        if (stmt.cases.size() > 0) {
+            body.append("  br label %switch.check.").append(id).append(".0\n\n");
+        } else if (stmt.defaultBody != null) {
+            body.append("  br label %switch.default.").append(id).append("\n\n");
+        } else {
+            body.append("  br label %").append(endLabel).append("\n\n");
+        }
+
+        // Generate check chain
+        int n = stmt.cases.size();
+        for (int i = 0; i < n; i++) {
+            SwitchCase sc = stmt.cases.get(i);
+            String checkLabel = "switch.check." + id + "." + i;
+            String caseLabel = "switch.case." + id + "." + i;
+
+            // Emit check label
+            body.append(checkLabel).append(":\n");
+
+            // Compare subject with case value
+            LLVMValue caseVal = generateExpr(sc.value);
+            LLVMValue cmp = generateComparison(subject, "==", caseVal, stmt.line);
+            String cmpVar = ensureI1(cmp);
+
+            // Determine else target
+            String elseTarget;
+            if (i < n - 1) {
+                elseTarget = "switch.check." + id + "." + (i + 1);
+            } else if (stmt.defaultBody != null) {
+                elseTarget = "switch.default." + id;
+            } else {
+                elseTarget = endLabel;
+            }
+
+            body.append("  br i1 ").append(cmpVar).append(", label %").append(caseLabel)
+                 .append(", label %").append(elseTarget).append("\n\n");
+
+            // Case body
+            body.append(caseLabel).append(":\n");
+            int caseStart = body.length();
+            for (AST s : sc.body) {
+                generateStmt(s);
+            }
+            emitBranchIfNeeded(endLabel, caseStart);
+            body.append("\n");
+        }
+
+        // Default body
+        if (stmt.defaultBody != null) {
+            body.append("switch.default.").append(id).append(":\n");
+            int defStart = body.length();
+            for (AST s : stmt.defaultBody) {
+                generateStmt(s);
+            }
+            emitBranchIfNeeded(endLabel, defStart);
+            body.append("\n");
+        }
+
+        // End label
+        body.append(endLabel).append(":\n");
+    }
+
+    private void emitBranchIfNeeded(String targetLabel, int sinceOffset) {
+        String recent = body.substring(sinceOffset).trim();
+        boolean hasTerminator = recent.contains("\n  ret ") ||
+            recent.startsWith("ret ") ||
+            recent.startsWith("\nret ") ||
+            recent.endsWith("\n  br label %" + targetLabel);
+        if (!hasTerminator) {
+            body.append("  br label %").append(targetLabel).append("\n");
+        }
+    }
+
+    private void generateWhile(WhileStmt stmt) {
+        int id = labelCount++;
+        String condLabel = "while.cond." + id;
+        String bodyLabel = "while.body." + id;
+        String endLabel = "while.end." + id;
+
+        loopStack.add(new LoopContext());
+        loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = condLabel;
+
+        body.append("  br label %").append(condLabel).append("\n\n");
+
+        body.append(condLabel).append(":\n");
+        LLVMValue cond = generateExpr(stmt.condition);
+        String condVar = ensureI1(cond);
+        body.append("  br i1 ").append(condVar).append(", label %").append(bodyLabel)
+             .append(", label %").append(endLabel).append("\n\n");
+
+        body.append(bodyLabel).append(":\n");
+        int whileBodyStart = body.length();
+        generateStmt(stmt.body);
+        emitBranchIfNeeded(condLabel, whileBodyStart);
+        body.append("\n");
+
+        body.append(endLabel).append(":\n");
+
+        loopStack.remove(loopStack.size() - 1);
+    }
+
+    private void generateFor(ForStmt stmt) {
+        int id = labelCount++;
+        String condLabel = "for.cond." + id;
+        String bodyLabel = "for.body." + id;
+        String updateLabel = "for.update." + id;
+        String endLabel = "for.end." + id;
+
+        loopStack.add(new LoopContext());
+        loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = updateLabel;
+
+        // Init
+        if (stmt.init != null) {
+            if (stmt.init instanceof VarDecl) {
+                generateVarDecl((VarDecl) stmt.init);
+            } else {
+                generateExpr(stmt.init);
+            }
+        }
+
+        body.append("  br label %").append(condLabel).append("\n\n");
+
+        // Condition
+        body.append(condLabel).append(":\n");
+        if (stmt.condition != null) {
+            LLVMValue cond = generateExpr(stmt.condition);
+            String condVar = ensureI1(cond);
+            body.append("  br i1 ").append(condVar).append(", label %").append(bodyLabel)
+                 .append(", label %").append(endLabel).append("\n\n");
+        } else {
+            body.append("  br label %").append(bodyLabel).append("\n\n");
+        }
+
+        // Body
+        body.append(bodyLabel).append(":\n");
+        int forBodyStart = body.length();
+        generateStmt(stmt.body);
+        emitBranchIfNeeded(updateLabel, forBodyStart);
+        body.append("\n");
+
+        // Update
+        body.append(updateLabel).append(":\n");
+        if (stmt.update != null) {
+            generateExpr(stmt.update);
+        }
+        body.append("  br label %").append(condLabel).append("\n\n");
+
+        // End
+        body.append(endLabel).append(":\n");
+
+        loopStack.remove(loopStack.size() - 1);
+    }
+
+    /**
+     * Generate for-each: for(var i : arr)
+     * Equivalent to: for(int idx=0; idx<len; idx++) { var i = arr[idx]; ... }
+     */
+    private void generateForEach(ForEachStmt stmt) {
+        int id = labelCount++;
+        String condLabel = "foreach.cond." + id;
+        String bodyLabel = "foreach.body." + id;
+        String updateLabel = "foreach.update." + id;
+        String endLabel = "foreach.end." + id;
+
+        loopStack.add(new LoopContext());
+        loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = updateLabel;
+
+        // Evaluate iterable (get array pointer)
+        LLVMValue arrVal = generateExpr(stmt.iterable);
+
+        // Load array length
+        String lenVar = "%foreach.len." + tmpCount++;
+        body.append("  ").append(lenVar).append(" = load i64, i64* ").append(arrVal.value).append("\n");
+
+        // Initialize index
+        String idxVar = "%v.foreach.idx." + id;
+        body.append("  ").append(idxVar).append(" = alloca i64\n");
+        body.append("  store i64 0, i64* ").append(idxVar).append("\n");
+
+        // Allocate loop variable (id suffix: same var name in two loops must not collide in LLVM)
+        String varPtr = "%v." + stmt.varName + "." + id;
+        String varLLVMType;
+        if (stmt.varType.equals("var")) {
+            // Infer from iterable element type (Cang-level first, LLVM tracking as fallback)
+            String iterableElemCang = elemCangOf(stmt.iterable);
+            if (iterableElemCang != null) {
+                varLLVMType = toLLVMType(iterableElemCang);
+            } else {
+                String tracked = null;
+                if (stmt.iterable instanceof Identifier) {
+                    tracked = arrayElemTypes.get(((Identifier) stmt.iterable).name);
+                } else if (isSystemArgs(stmt.iterable)) {
+                    tracked = "i8*"; // ARGS elements are char*
+                }
+                varLLVMType = tracked != null ? tracked : "i32";
+            }
+        } else {
+            varLLVMType = toLLVMType(stmt.varType);
+        }
+        body.append("  ").append(varPtr).append(" = alloca ").append(varLLVMType).append("\n");
+
+        // Determine element type from tracked info
+        String elemType = varLLVMType;
+
+        // Jump to condition
+        body.append("  br label %").append(condLabel).append("\n\n");
+
+        // Condition: idx < len
+        body.append(condLabel).append(":\n");
+        String curIdx = "%foreach.cidx." + tmpCount++;
+        body.append("  ").append(curIdx).append(" = load i64, i64* ").append(idxVar).append("\n");
+        String cmp = "%foreach.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp slt i64 ").append(curIdx).append(", ").append(lenVar).append("\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(bodyLabel)
+             .append(", label %").append(endLabel).append("\n\n");
+
+        // Body
+        body.append(bodyLabel).append(":\n");
+        // Load element: skip 8-byte header + idx * elemSize
+        String dataPtr = "%foreach.data." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr i8, i8* ").append(arrVal.value).append(", i64 8\n");
+        String typedPtr = "%foreach.typed." + tmpCount++;
+        body.append("  ").append(typedPtr).append(" = bitcast i8* ").append(dataPtr).append(" to ").append(elemType).append("*\n");
+        String elemPtr = "%foreach.elem." + tmpCount++;
+        body.append("  ").append(elemPtr).append(" = getelementptr ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(curIdx).append("\n");
+        String elemVal = "%foreach.val." + tmpCount++;
+        body.append("  ").append(elemVal).append(" = load ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(elemPtr).append("\n");
+        // Store to loop variable
+        body.append("  store ").append(varLLVMType).append(" ").append(elemVal)
+             .append(", ").append(varLLVMType).append("* ").append(varPtr).append("\n");
+        // Define loop variable in scope
+        scope.define(stmt.varName, new LLVMValue(varPtr, varLLVMType));
+        // Register element type tracking so loopVar[j] resolves correctly
+        if (stmt.varType.startsWith("Array<") && stmt.varType.endsWith(">")) {
+            trackArrayVar(stmt.varName, stmt.varType.substring(6, stmt.varType.length() - 1));
+        } else if (stmt.varType.equals("var")) {
+            String iterableElemCang = elemCangOf(stmt.iterable);
+            String inner = innerElemCang(iterableElemCang);
+            if (inner != null) {
+                trackArrayVar(stmt.varName, inner);
+            }
+        }
+
+        int bodyStart = body.length();
+        generateStmt(stmt.body);
+        emitBranchIfNeeded(updateLabel, bodyStart);
+        body.append("\n");
+
+        // Update: idx++
+        body.append(updateLabel).append(":\n");
+        String nextIdx = "%foreach.next." + tmpCount++;
+        body.append("  ").append(nextIdx).append(" = add i64 ").append(curIdx).append(", 1\n");
+        body.append("  store i64 ").append(nextIdx).append(", i64* ").append(idxVar).append("\n");
+        body.append("  br label %").append(condLabel).append("\n\n");
+
+        // End
+        body.append(endLabel).append(":\n");
+
+        loopStack.remove(loopStack.size() - 1);
+    }
+
+    private void generateReturn(ReturnStmt stmt) {
+        abandonRegion();
+        String retType = findCurrentReturnType();
+
+        if (stmt.value != null) {
+            String savedExpected = expectedFunctionType;
+            expectedFunctionType = isFunctionType(retType) ? retType : null;
+            LLVMValue val;
+            try {
+                val = generateExpr(stmt.value);
+            } finally {
+                expectedFunctionType = savedExpected;
+            }
+
+            // Type check: return value must match declared return type
+            if (isFunctionType(retType)) {
+                checkFunctionValue(val, retType, stmt.line);
+            } else if (!retType.equals("void")) {
+                String expectedLLVM = toLLVMType(retType);
+                if (!typesCompatible(val.type, expectedLLVM)) {
+                    String actualCang = cangTypeFromLLVM(val.type);
+                    throw new RuntimeException(
+                        "Return type mismatch: expected '" + retType +
+                        "' but found '" + actualCang + "' (at line " + stmt.line + ")");
+                }
+            }
+
+            body.append("  ret ").append(toLLVMType(retType)).append(" ")
+                 .append(castValue(val, toLLVMType(retType))).append("\n");
+        } else {
+            // return; with no value 鈥?only valid for void functions
+            if (!retType.equals("void")) {
+                throw new RuntimeException(
+                    "Function must return a value of type '" + retType + "' (at line " + stmt.line + ")");
+            }
+            body.append("  ret void\n");
+        }
+    }
+
+    private String findCurrentReturnType() {
+        return currentFuncReturnType;
+    }
+
+    // ==================== Expression generation ====================
+
+    private LLVMValue generateExpr(AST node) {
+        if (node instanceof IntLit) {
+            String val = ((IntLit) node).text;
+            if (val.startsWith("0x") || val.startsWith("0X")) {
+                return new LLVMValue(String.valueOf(Long.parseLong(val.substring(2), 16)), "i32");
+            }
+            if (val.startsWith("0b") || val.startsWith("0B")) {
+                return new LLVMValue(String.valueOf(Long.parseLong(val.substring(2), 2)), "i32");
+            }
+            return new LLVMValue(val, "i32");
+        }
+        if (node instanceof LongLit) {
+            return new LLVMValue(((LongLit) node).text, "i64");
+        }
+        if (node instanceof FloatLit) {
+            // Convert float literal to double for LLVM (float is promoted in printf)
+            String text = ((FloatLit) node).text;
+            return new LLVMValue(text, "float");
+        }
+        if (node instanceof DoubleLit) {
+            return new LLVMValue(((DoubleLit) node).text, "double");
+        }
+        if (node instanceof BoolLit) {
+            return new LLVMValue(((BoolLit) node).value ? "1" : "0", "i1");
+        }
+        if (node instanceof StringLit) {
+            LLVMValue value = generateStringLit((StringLit) node);
+            value.semanticType = "String";
+            return value;
+        }
+        if (node instanceof StrLit) {
+            LLVMValue value = generateStringLit(new StringLit(((StrLit) node).value, node.line));
+            value.semanticType = "str";
+            return value;
+        }
+        if (node instanceof NullLit) {
+            return new LLVMValue("null", "i8*");
+        }
+        if (node instanceof ThisExpr) {
+            LLVMValue thisVal = scope.lookup("this");
+            return new LLVMValue(thisVal.value, thisVal.type);
+        }
+        if (node instanceof Identifier) {
+            return generateIdentifier((Identifier) node);
+        }
+        if (node instanceof FunctionRefExpr) {
+            return generateFunctionRef((FunctionRefExpr) node);
+        }
+        if (node instanceof LambdaExpr) {
+            return generateLambda((LambdaExpr) node);
+        }
+        if (node instanceof BinaryExpr) {
+            return generateBinary((BinaryExpr) node);
+        }
+        if (node instanceof UnaryExpr) {
+            return generateUnary((UnaryExpr) node);
+        }
+        if (node instanceof AssignExpr) {
+            return generateAssign((AssignExpr) node);
+        }
+        if (node instanceof TernaryExpr) {
+            return generateTernary((TernaryExpr) node);
+        }
+        if (node instanceof LikeExpr) {
+            return generateLike((LikeExpr) node);
+        }
+        if (node instanceof TypeCastExpr) {
+            return generateTypeCast((TypeCastExpr) node);
+        }
+        if (node instanceof MethodCallExpr) {
+            return generateMethodCall((MethodCallExpr) node);
+        }
+        if (node instanceof FieldAccessExpr) {
+            return generateFieldAccess((FieldAccessExpr) node);
+        }
+        if (node instanceof NewExpr) {
+            return generateNew((NewExpr) node);
+        }
+        if (node instanceof ArrayLit) {
+            return generateArrayLit((ArrayLit) node);
+        }
+        if (node instanceof ArrayAccessExpr) {
+            return generateArrayAccess((ArrayAccessExpr) node);
+        }
+
+        throw new RuntimeException("Unknown expression type: " + node.getClass().getSimpleName());
+    }
+
+    private LLVMValue generateStringLit(StringLit node) {
+        String text = node.value;
+        String key = text;
+        if (!stringLiterals.containsKey(key)) {
+            String name = "@.str." + strCount++;
+            int byteCount = text.length() + 1; // +1 for null terminator
+            // Build escaped string
+            StringBuilder escaped = new StringBuilder();
+            for (char c : text.toCharArray()) {
+                if (c == '\\') escaped.append("\\5C");
+                else if (c == '\n') escaped.append("\\0A");
+                else if (c == '\t') escaped.append("\\09");
+                else if (c == '\0') escaped.append("\\00");
+                else if (c == '"') escaped.append("\\22");
+                else if (c >= 32 && c < 127) escaped.append(c);
+                else escaped.append(String.format("\\%02X", (int) c));
+            }
+            header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+                  .append(" x i8] c\"").append(escaped).append("\\00\"\n");
+            stringLiterals.put(key, name);
+        }
+        String globalName = stringLiterals.get(key);
+        String ptr = "%str." + tmpCount++;
+        body.append("  ").append(ptr).append(" = getelementptr [")
+            .append(text.length() + 1).append(" x i8], [")
+            .append(text.length() + 1).append(" x i8]* ")
+            .append(globalName).append(", i32 0, i32 0\n");
+        return new LLVMValue(ptr, "i8*");
+    }
+
+    /**
+     * Generate a no-capture lambda as a standalone LLVM function plus a Function pair value.
+     * The expected Function<Void, T> signature provides the untyped lambda parameter's type.
+     */
+    private LLVMValue generateLambda(LambdaExpr node) {
+        String expected = expectedFunctionType;
+        if (expected == null || !isFunctionType(expected)) {
+            throw new RuntimeException("Cannot infer lambda type; use it where Function<...> is expected (at line "
+                + node.line + ")");
+        }
+        String[] parts = functionTypeParts(expected);
+        if (parts.length != 2) {
+            throw new RuntimeException("Lambda must match Function<Void, T> with exactly one parameter: expected "
+                + expected + " (at line " + node.line + ")");
+        }
+        if (!parts[0].equals("void") && !parts[0].equals("Void")) {
+            throw new RuntimeException("Lambdas return void, but expected " + expected + " (at line " + node.line + ")");
+        }
+        validateLambdaNoCapture(node.body, node.parameter, node.line);
+
+        String paramCang = parts[1];
+        String paramLLVM = toLLVMType(paramCang);
+        String fnName = "@cang.lambda." + lambdaCount++;
+        String codeType = "void (i8*, " + paramLLVM + ")*";
+
+        Scope savedScope = scope;
+        String savedReturn = currentFuncReturnType;
+        List<LoopContext> savedLoops = new ArrayList<>(loopStack);
+        loopStack.clear();
+        // A lambda is a separate LLVM function; enclosing handlers cannot be branched to.
+        Deque<String> savedHandlers = new ArrayDeque<>(exceptionHandlers);
+        exceptionHandlers.clear();
+        scope = new Scope(null);
+        currentFuncReturnType = "void";
+
+        int pid = tmpCount++;
+        String argName = "%lparg." + pid;
+        String allocaName = "%lp." + pid;
+        int start = body.length();
+        body.append("define void ").append(fnName).append("(i8* %env, ")
+             .append(paramLLVM).append(" ").append(argName).append(") {\nentry:\n");
+        body.append("  ").append(allocaName).append(" = alloca ").append(paramLLVM).append("\n");
+        body.append("  store ").append(paramLLVM).append(" ").append(argName)
+             .append(", ").append(paramLLVM).append("* ").append(allocaName).append("\n");
+        scope.define(node.parameter, new LLVMValue(allocaName, paramLLVM, paramCang));
+
+        generateBlockBody((Block) node.body);
+
+        String trimmed = body.substring(start).trim();
+        int lastBreak = trimmed.lastIndexOf('\n');
+        String lastLine = (lastBreak >= 0 ? trimmed.substring(lastBreak + 1) : trimmed).trim();
+        boolean terminated = lastLine.startsWith("ret ") || lastLine.startsWith("br ") || lastLine.equals("unreachable");
+        if (!terminated) body.append("  ret void\n");
+        body.append("}\n\n");
+        int end = body.length();
+        extraDefs.append(body, start, end);
+        body.delete(start, end);
+
+        scope = savedScope;
+        currentFuncReturnType = savedReturn;
+        loopStack.clear();
+        loopStack.addAll(savedLoops);
+        exceptionHandlers.clear();
+        exceptionHandlers.addAll(savedHandlers);
+
+        String code = "%fn.code." + tmpCount++;
+        body.append("  ").append(code).append(" = bitcast ").append(codeType).append(" ")
+             .append(fnName).append(" to i8*\n");
+        String v0 = "%fn.v0." + tmpCount++;
+        body.append("  ").append(v0).append(" = insertvalue %CangFunction undef, i8* ").append(code).append(", 0\n");
+        String v1 = "%fn.v1." + tmpCount++;
+        body.append("  ").append(v1).append(" = insertvalue %CangFunction ").append(v0)
+             .append(", i8* null, 1\n");
+        return new LLVMValue(v1, "%CangFunction", expected);
+    }
+
+    /** Walk a lambda body and reject any reference to an outer variable (no-capture mode). */
+    private void validateLambdaNoCapture(AST node, String parameter, int line) {
+        java.util.Set<String> bound = new java.util.HashSet<>();
+        bound.add(parameter);
+        validateLambdaCapture(node, bound, line);
+    }
+
+    private void validateLambdaCapture(AST node, java.util.Set<String> bound, int line) {
+        if (node == null) return;
+        if (node instanceof LambdaExpr) {
+            java.util.Set<String> inner = new java.util.HashSet<>(bound);
+            inner.add(((LambdaExpr) node).parameter);
+            validateLambdaCapture(((LambdaExpr) node).body, inner, line);
+            return;
+        }
+        if (node instanceof Identifier) {
+            String name = ((Identifier) node).name;
+            if (!bound.contains(name) && scope.lookup(name) != null) {
+                throw new RuntimeException("Lambda cannot capture external variable '" + name + "' (at line " + line + ")");
+            }
+            return;
+        }
+        if (node instanceof ThisExpr) {
+            if (scope.lookup("this") != null) {
+                throw new RuntimeException("Lambda cannot capture 'this'; use this::method instead (at line " + line + ")");
+            }
+            return;
+        }
+        for (java.lang.reflect.Field field : node.getClass().getFields()) {
+            Object value;
+            try {
+                value = field.get(node);
+            } catch (Exception e) {
+                continue;
+            }
+            if (value instanceof AST) {
+                validateLambdaCapture((AST) value, bound, line);
+            } else if (value instanceof List) {
+                for (Object item : (List) value) {
+                    if (item instanceof AST) validateLambdaCapture((AST) item, bound, line);
+                }
+            }
+        }
+    }
+
+    private LLVMValue generateFunctionRef(FunctionRefExpr node) {
+        int line = node.line;
+        // this::method 鈥?bind current receiver
+        if (node.receiver instanceof ThisExpr) {
+            if (currentClassName == null) {
+                throw new RuntimeException("this:: is only valid inside a class method (at line " + line + ")");
+            }
+            FuncInfo fi = lookupInstanceMethod(classes.get(currentClassName), node.method);
+            if (fi == null) {
+                throw new RuntimeException("Unknown method in reference: this::" + node.method + " (at line " + line + ")");
+            }
+            if (fi.isStatic) {
+                throw new RuntimeException("this:: requires an instance method; use "
+                    + classes.get(currentClassName).simpleName + "::" + node.method + " for static methods (at line " + line + ")");
+            }
+            LLVMValue receiver = scope.lookup("this");
+            if (receiver == null) {
+                throw new RuntimeException("this:: is only valid inside a class method (at line " + line + ")");
+            }
+            String thunk = emitThunk(fi, "%" + fi.className + "*");
+            return buildFunctionValue(thunk, fi, receiver.value, receiver.type, functionSignature(fi));
+        }
+
+        if (!(node.receiver instanceof Identifier)) {
+            throw new RuntimeException("Method reference receiver must be this, an object, or a class (at line " + line + ")");
+        }
+        String owner = ((Identifier) node.receiver).name;
+
+        // Class::staticMethod 鈥?receiver-less reference
+        ClassInfo ci = classes.get(owner);
+        if (ci != null) {
+            FuncInfo fi = functions.get(ci.fullName + "." + node.method);
+            if (fi != null && fi.isStatic) {
+                String thunk = emitThunk(fi, null);
+                return functionRefValue(thunk, fi);
+            }
+            if (fi != null) {
+                throw new RuntimeException(owner + "::" + node.method
+                    + " is an instance method; use an object or this:: to bind a receiver (at line " + line + ")");
+            }
+            if (scope.lookup(owner) == null) {
+                throw new RuntimeException("Unknown method in reference: " + owner + "::" + node.method + " (at line " + line + ")");
+            }
+        }
+
+        // object::method 鈥?bind runtime receiver
+        if (scope.lookup(owner) == null) {
+            throw new RuntimeException("Unknown class or object: " + owner + " (at line " + line + ")");
+        }
+        LLVMValue receiver = generateExpr(new Identifier(owner, line));
+        if (!(receiver.type.startsWith("%") && receiver.type.endsWith("*"))) {
+            throw new RuntimeException("Method reference receiver must be a class instance (at line " + line + ")");
+        }
+        ClassInfo receiverClass = classes.get(extractClassName(receiver.type));
+        FuncInfo fi = lookupInstanceMethod(receiverClass, node.method);
+        if (fi == null) {
+            throw new RuntimeException("Unknown method in reference: " + owner + "::" + node.method + " (at line " + line + ")");
+        }
+        if (fi.isStatic) {
+            throw new RuntimeException(owner + "::" + node.method
+                + " is static; use the class name without an object receiver (at line " + line + ")");
+        }
+        String thunk = emitThunk(fi, "%" + fi.className + "*");
+        return buildFunctionValue(thunk, fi, receiver.value, receiver.type, functionSignature(fi));
+    }
+
+    /** Find a method (static or instance) on a class or its parents. */
+    private FuncInfo lookupInstanceMethod(ClassInfo ci, String method) {
+        int guard = 0;
+        while (ci != null && guard++ < 64) {
+            FuncInfo fi = functions.get(ci.fullName + "." + method);
+            if (fi != null) return fi;
+            ci = ci.parentName != null ? classes.get(ci.parentName) : null;
+        }
+        return null;
+    }
+
+    private String functionSignature(FuncInfo fi) {
+        StringBuilder result = new StringBuilder("Function<").append(fi.returnType);
+        for (String type : fi.paramTypes) result.append(',').append(type);
+        return result.append('>').toString();
+    }
+
+    /** Canonical code type used inside Function objects: Ret (i8* env, Args...). */
+    private String canonicalCodeType(FuncInfo fi) {
+        StringBuilder result = new StringBuilder(toLLVMType(fi.returnType)).append(" (i8*");
+        for (String type : fi.paramTypes) result.append(", ").append(toLLVMType(type));
+        return result.append(")*").toString();
+    }
+
+    /**
+     * Emit a top-level thunk implementing the canonical code ABI for a callee.
+     * receiverType != null means env is bitcast to the receiver and passed first.
+     */
+    private String emitThunk(FuncInfo fi, String receiverType) {
+        String name = "@cang.thunk." + thunkCount++;
+        String retType = toLLVMType(fi.returnType);
+        StringBuilder params = new StringBuilder("i8* %env");
+        List<String> callArgs = new ArrayList<>();
+        StringBuilder inside = new StringBuilder();
+        if (receiverType != null) {
+            String recv = "%recv." + thunkCount;
+            inside.append("  ").append(recv).append(" = bitcast i8* %env to ").append(receiverType).append("\n");
+            callArgs.add(receiverType + " " + recv);
+        }
+        for (int i = 0; i < fi.paramTypes.size(); i++) {
+            String llvmType = toLLVMType(fi.paramTypes.get(i));
+            params.append(", ").append(llvmType).append(" %ca.").append(i);
+            callArgs.add(llvmType + " %ca." + i);
+        }
+        String joined = String.join(", ", callArgs);
+        extraDefs.append("define ").append(retType).append(" ").append(name)
+                 .append("(").append(params).append(") {\nentry:\n").append(inside);
+        if (retType.equals("void")) {
+            extraDefs.append("  call void @").append(fi.name).append("(").append(joined).append(")\n");
+            extraDefs.append("  ret void\n");
+        } else {
+            String result = "%tr." + thunkCount;
+            extraDefs.append("  ").append(result).append(" = call ").append(retType)
+                     .append(" @").append(fi.name).append("(").append(joined).append(")\n");
+            extraDefs.append("  ret ").append(retType).append(" ").append(result).append("\n");
+        }
+        extraDefs.append("}\n\n");
+        return name;
+    }
+
+    /** Global constant Function pair for receiver-less references, loaded as a value at the use site. */
+    private String functionRefGlobal(String thunk, FuncInfo fi) {
+        String global = "@cang.fnref." + fnrefCount++;
+        extraDefs.append(global).append(" = internal constant %CangFunction { i8* bitcast(")
+                 .append(canonicalCodeType(fi)).append(" ").append(thunk)
+                 .append(" to i8*), i8* null }\n");
+        return global;
+    }
+
+    private LLVMValue functionRefValue(String thunk, FuncInfo fi) {
+        String global = functionRefGlobal(thunk, fi);
+        String loaded = "%fn.load." + tmpCount++;
+        body.append("  ").append(loaded).append(" = load %CangFunction, %CangFunction* ")
+             .append(global).append("\n");
+        return new LLVMValue(loaded, "%CangFunction", functionSignature(fi));
+    }
+
+    /** Build a runtime Function value with a bound receiver. */
+    private LLVMValue buildFunctionValue(String thunk, FuncInfo fi, String receiverValue, String receiverType, String signature) {
+        String code = "%fn.code." + tmpCount++;
+        body.append("  ").append(code).append(" = bitcast ").append(canonicalCodeType(fi))
+             .append(" ").append(thunk).append(" to i8*\n");
+        String receiver = receiverValue;
+        if (!receiverType.equals("i8*")) {
+            receiver = "%fn.recv." + tmpCount++;
+            body.append("  ").append(receiver).append(" = bitcast ").append(receiverType)
+                 .append(" ").append(receiverValue).append(" to i8*\n");
+        }
+        String v0 = "%fn.v0." + tmpCount++;
+        body.append("  ").append(v0).append(" = insertvalue %CangFunction undef, i8* ").append(code).append(", 0\n");
+        String v1 = "%fn.v1." + tmpCount++;
+        body.append("  ").append(v1).append(" = insertvalue %CangFunction ").append(v0)
+             .append(", i8* ").append(receiver).append(", 1\n");
+        return new LLVMValue(v1, "%CangFunction", signature);
+    }
+
+    /** Generate a value with the expected Function<...> context and validate it. */
+    private LLVMValue generateCallArg(AST arg, String paramType, int line) {
+        String savedExpected = expectedFunctionType;
+        expectedFunctionType = isFunctionType(paramType) ? paramType : null;
+        LLVMValue value;
+        try {
+            value = generateExpr(arg);
+        } finally {
+            expectedFunctionType = savedExpected;
+        }
+        if (isFunctionType(paramType)) {
+            checkFunctionValue(value, paramType, line);
+        } else {
+            String expectedLLVM = toLLVMType(paramType);
+            boolean compatible = value.type.equals(expectedLLVM)
+                || typesCompatible(value.type, expectedLLVM)
+                || (isNumericLLVM(value.type) && isNumericLLVM(expectedLLVM));
+            if (!compatible) {
+                throw new RuntimeException("Argument type mismatch: expected " + paramType
+                    + " but found " + cangTypeFromLLVMFull(value.type) + " (at line " + line + ")");
+            }
+        }
+        return value;
+    }
+
+    private boolean isNumericLLVM(String llvmType) {
+        return llvmType.equals("i1") || llvmType.equals("i8") || llvmType.equals("i32")
+            || llvmType.equals("i64") || llvmType.equals("float") || llvmType.equals("double");
+    }
+
+    private void checkFunctionValue(LLVMValue value, String expectedSignature, int line) {
+        String actual = value.semanticType;
+        if (actual == null || !isFunctionType(actual)) {
+            throw new RuntimeException("Expected " + expectedSignature + " but found "
+                + (actual != null ? actual : cangTypeFromLLVMFull(value.type)) + " (at line " + line + ")");
+        }
+        String[] expected = functionTypeParts(expectedSignature);
+        String[] found = functionTypeParts(actual);
+        if (expected.length != found.length) {
+            throw new RuntimeException("Function type mismatch: expected " + expectedSignature
+                + " but found " + actual + " (at line " + line + ")");
+        }
+        for (int i = 0; i < expected.length; i++) {
+            String expectedPart = expected[i].equals("Void") ? "void" : expected[i];
+            String foundPart = found[i].equals("Void") ? "void" : found[i];
+            if (expectedPart.equals(foundPart)) continue;
+            if (typesCompatible(toLLVMType(foundPart), toLLVMType(expectedPart))) continue;
+            throw new RuntimeException("Function type mismatch: expected " + expectedSignature
+                + " but found " + actual + " (at line " + line + ")");
+        }
+    }
+
+    private LLVMValue generateIdentifier(Identifier node) {
+        if (freedVars.contains(node.name)) {
+            throw new RuntimeException("Use of freed variable: " + node.name + " (at line " + node.line + ")");
+        }
+        LLVMValue val = scope.lookup(node.name);
+        if (val == null) {
+            FuncInfo function = functions.get(node.name);
+            if (function != null && function.className == null) {
+                String thunk = emitThunk(function, null);
+                return functionRefValue(thunk, function);
+            }
+            // Check static fields of current class
+            if (currentClassName != null) {
+                ClassInfo ci = classes.get(currentClassName);
+                if (ci != null) {
+                    for (FieldDecl f : ci.staticFields) {
+                        if (f.name.equals(node.name)) {
+                            // Load from global variable
+                            String globalName = "@static." + currentClassName + "_" + f.name;
+                            String llvmType = toLLVMType(f.type);
+                            String loaded = "%static." + tmpCount++;
+                            body.append("  ").append(loaded).append(" = load ").append(llvmType)
+                                 .append(", ").append(llvmType).append("* ").append(globalName).append("\n");
+                            return new LLVMValue(loaded, llvmType);
+                        }
+                    }
+                }
+            }
+            // Check global static fields map
+            for (Map.Entry<String, FieldDecl> entry : staticFields.entrySet()) {
+                if (entry.getKey().endsWith("." + node.name)) {
+                    FieldDecl f = entry.getValue();
+                    String globalName = "@static." + entry.getKey().replace(".", "_");
+                    String llvmType = toLLVMType(f.type);
+                    String loaded = "%static." + tmpCount++;
+                    body.append("  ").append(loaded).append(" = load ").append(llvmType)
+                         .append(", ").append(llvmType).append("* ").append(globalName).append("\n");
+                    return new LLVMValue(loaded, llvmType);
+                }
+            }
+            throw new RuntimeException("Undefined variable: " + node.name + " at line " + node.line);
+        }
+        // Load the value
+        String loaded = "%ld." + tmpCount++;
+        body.append("  ").append(loaded).append(" = load ").append(val.type)
+             .append(", ").append(val.type).append("* ").append(val.value).append("\n");
+        return new LLVMValue(loaded, val.type, val.semanticType);
+    }
+
+    private LLVMValue generateBinary(BinaryExpr node) {
+        LLVMValue left = generateExpr(node.left);
+        LLVMValue right = generateExpr(node.right);
+
+        String op = node.op;
+
+        // Logical operators
+        if (op.equals("&&")) {
+            String result = "%and." + tmpCount++;
+            body.append("  ").append(result).append(" = and i1 ")
+                .append(ensureI1(left)).append(", ").append(ensureI1(right)).append("\n");
+            return new LLVMValue(result, "i1");
+        }
+        if (op.equals("||")) {
+            String result = "%or." + tmpCount++;
+            body.append("  ").append(result).append(" = or i1 ")
+                .append(ensureI1(left)).append(", ").append(ensureI1(right)).append("\n");
+            return new LLVMValue(result, "i1");
+        }
+
+        // Comparison operators
+        if (op.equals("==") || op.equals("!=") || op.equals("<") || op.equals(">") ||
+            op.equals("<=") || op.equals(">=")) {
+            return generateComparison(left, op, right, node.line);
+        }
+
+        // // operator: always returns double
+        if (op.equals("//")) {
+            String l = castValue(left, "double");
+            String r = castValue(right, "double");
+            String result = "%fdiv." + tmpCount++;
+            body.append("  ").append(result).append(" = fdiv double ")
+                .append(l).append(", ").append(r).append("\n");
+            return new LLVMValue(result, "double");
+        }
+
+        // String concatenation with +
+        if (op.equals("+") && (left.type.equals("i8*") || right.type.equals("i8*"))) {
+            return generateStringConcat(left, right);
+        }
+
+        // Arithmetic operators
+        boolean isFloat = isFloatType(left.type) || isFloatType(right.type);
+        String commonType = isFloat ? (left.type.equals("double") || right.type.equals("double") ? "double" : "float") : commonIntType(left.type, right.type);
+
+        String l = castValue(left, commonType);
+        String r = castValue(right, commonType);
+        String result = "%arith." + tmpCount++;
+
+        String irOp;
+        switch (op) {
+            case "+": irOp = isFloat ? "fadd" : "add"; break;
+            case "-": irOp = isFloat ? "fsub" : "sub"; break;
+            case "*": irOp = isFloat ? "fmul" : "mul"; break;
+            case "/": irOp = isFloat ? "fdiv" : (commonType.contains("i") ? "sdiv" : "udiv"); break;
+            case "%": irOp = isFloat ? "frem" : "srem"; break;
+            default: throw new RuntimeException("Unknown operator: " + op);
+        }
+
+        body.append("  ").append(result).append(" = ").append(irOp).append(" ")
+            .append(commonType).append(" ").append(l).append(", ").append(r).append("\n");
+
+        return new LLVMValue(result, commonType);
+    }
+
+    /**
+     * Generate string concatenation: a + b
+     * First converts non-string operands to strings, then concatenates.
+     */
+    private LLVMValue generateStringConcat(LLVMValue left, LLVMValue right) {
+        // Convert non-string operands to string
+        if (!left.type.equals("i8*")) {
+            left = convertToString(left);
+        }
+        if (!right.type.equals("i8*")) {
+            right = convertToString(right);
+        }
+
+        // Get lengths
+        String lenLeft = "%len.l." + tmpCount++;
+        body.append("  ").append(lenLeft).append(" = call i64 @strlen(i8* ").append(left.value).append(")\n");
+
+        String lenRight = "%len.r." + tmpCount++;
+        body.append("  ").append(lenRight).append(" = call i64 @strlen(i8* ").append(right.value).append(")\n");
+
+        // Total size = lenLeft + lenRight + 1 (null terminator)
+        String totalLen = "%len.total." + tmpCount++;
+        body.append("  ").append(totalLen).append(" = add i64 ").append(lenLeft).append(", ").append(lenRight).append("\n");
+        String allocSize = "%size.alloc." + tmpCount++;
+        body.append("  ").append(allocSize).append(" = add i64 ").append(totalLen).append(", 1\n");
+
+        // malloc
+        String buf = "%buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @malloc(i64 ").append(allocSize).append(")\n");
+        registerRegionAllocation(buf);
+
+        // memcpy(buf, left, lenLeft)
+        body.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(buf)
+             .append(", i8* ").append(left.value)
+             .append(", i64 ").append(lenLeft).append(", i1 false)\n");
+
+        // memcpy(buf + lenLeft, right, lenRight + 1) 閳?include null terminator
+        String offset = "%offset." + tmpCount++;
+        body.append("  ").append(offset).append(" = getelementptr i8, i8* ").append(buf)
+             .append(", i64 ").append(lenLeft).append("\n");
+        String copyLen = "%copy.len." + tmpCount++;
+        body.append("  ").append(copyLen).append(" = add i64 ").append(lenRight).append(", 1\n");
+        body.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(offset)
+             .append(", i8* ").append(right.value)
+             .append(", i64 ").append(copyLen).append(", i1 false)\n");
+
+        return new LLVMValue(buf, "i8*");
+    }
+
+    /**
+     * Convert a non-string value to its string representation using snprintf.
+     */
+    private LLVMValue convertToString(LLVMValue val) {
+        // Allocate buffer (enough for any number)
+        String buf = "%tostr.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @malloc(i64 64)\n");
+        registerRegionAllocation(buf);
+
+        String fmt;
+        if (val.type.equals("i8")) {
+            // byte: zext to i32 first
+            String ext = "%tostr.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = sext i8 ").append(val.value).append(" to i32\n");
+            fmt = "@.fmt.tostr.int";
+            val = new LLVMValue(ext, "i32");
+        } else if (val.type.equals("i1")) {
+            String ext = "%tostr.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = zext i1 ").append(val.value).append(" to i32\n");
+            fmt = "@.fmt.tostr.int";
+            val = new LLVMValue(ext, "i32");
+        } else if (val.type.equals("i32")) {
+            fmt = "@.fmt.tostr.int";
+        } else if (val.type.equals("i64")) {
+            fmt = "@.fmt.tostr.long";
+        } else if (val.type.equals("float")) {
+            String ext = "%tostr.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = fpext float ").append(val.value).append(" to double\n");
+            fmt = "@.fmt.tostr.double";
+            val = new LLVMValue(ext, "double");
+        } else if (val.type.equals("double")) {
+            fmt = "@.fmt.tostr.double";
+        } else {
+            // Unknown type 閳?return empty string
+            return new LLVMValue("@.str.empty", "i8*");
+        }
+
+        body.append("  call i32 (i8*, i8*, ...) @sprintf(i8* ").append(buf)
+             .append(", i8* ").append(fmt)
+             .append(", ").append(val.type).append(" ").append(val.value).append(")\n");
+
+        return new LLVMValue(buf, "i8*");
+    }
+
+    private LLVMValue generateComparison(BinaryExpr node) {
+        LLVMValue left = generateExpr(node.left);
+        LLVMValue right = generateExpr(node.right);
+        return generateComparison(left, node.op, right, node.line);
+    }
+
+    private LLVMValue generateComparison(LLVMValue left, String op, LLVMValue right) {
+        return generateComparison(left, op, right, 0);
+    }
+
+    private LLVMValue generateComparison(LLVMValue left, String op, LLVMValue right, int line) {
+        // String comparison with strcmp
+        if (left.type.equals("i8*") && right.type.equals("i8*")) {
+            if (op.equals("==") || op.equals("!=")) {
+                return generateStringCompare(left, op, right);
+            }
+            throw new RuntimeException("Only == and != are supported for str/String (at line " + line + ")");
+        }
+
+        // Type mismatch check: string vs non-string
+        boolean leftIsString = left.type.equals("i8*");
+        boolean rightIsString = right.type.equals("i8*");
+        if (leftIsString || rightIsString) {
+            String leftName = cangTypeFromLLVM(left.type);
+            String rightName = cangTypeFromLLVM(right.type);
+            if (line > 0) {
+                throw new RuntimeException("Cannot compare " + leftName + " with " + rightName + " (at line " + line + ")");
+            }
+            throw new RuntimeException("Cannot compare " + leftName + " with " + rightName);
+        }
+
+        boolean isFloat = isFloatType(left.type) || isFloatType(right.type);
+        String commonType = isFloat ? (left.type.equals("double") || right.type.equals("double") ? "double" : "float") : commonIntType(left.type, right.type);
+
+        String l = castValue(left, commonType);
+        String r = castValue(right, commonType);
+        String result = "%cmp." + tmpCount++;
+
+        String predicate;
+        if (isFloat) {
+            switch (op) {
+                case "==": predicate = "oeq"; break;
+                case "!=": predicate = "one"; break;
+                case "<":  predicate = "olt"; break;
+                case ">":  predicate = "ogt"; break;
+                case "<=": predicate = "ole"; break;
+                case ">=": predicate = "oge"; break;
+                default: throw new RuntimeException("Unknown comparison: " + op);
+            }
+            body.append("  ").append(result).append(" = fcmp ").append(predicate).append(" ")
+                .append(commonType).append(" ").append(l).append(", ").append(r).append("\n");
+        } else {
+            switch (op) {
+                case "==": predicate = "eq"; break;
+                case "!=": predicate = "ne"; break;
+                case "<":  predicate = "slt"; break;
+                case ">":  predicate = "sgt"; break;
+                case "<=": predicate = "sle"; break;
+                case ">=": predicate = "sge"; break;
+                default: throw new RuntimeException("Unknown comparison: " + op);
+            }
+            body.append("  ").append(result).append(" = icmp ").append(predicate).append(" ")
+                .append(commonType).append(" ").append(l).append(", ").append(r).append("\n");
+        }
+
+        return new LLVMValue(result, "i1");
+    }
+
+    /**
+     * String comparison using strcmp.
+     * strcmp returns 0 if equal, <0 if left<right, >0 if left>right
+     */
+    private LLVMValue generateStringCompare(LLVMValue left, String op, LLVMValue right) {
+        // Call strcmp
+        String cmpResult = "%strcmp." + tmpCount++;
+        body.append("  ").append(cmpResult).append(" = call i32 @strcmp(i8* ")
+             .append(left.value).append(", i8* ").append(right.value).append(")\n");
+
+        String result = "%strcmp.cmp." + tmpCount++;
+        String predicate;
+        switch (op) {
+            case "==": predicate = "eq"; break;
+            case "!=": predicate = "ne"; break;
+            case "<":  predicate = "slt"; break;
+            case ">":  predicate = "sgt"; break;
+            case "<=": predicate = "sle"; break;
+            case ">=": predicate = "sge"; break;
+            default: throw new RuntimeException("Unknown string comparison: " + op);
+        }
+        body.append("  ").append(result).append(" = icmp ").append(predicate)
+             .append(" i32 ").append(cmpResult).append(", 0\n");
+
+        return new LLVMValue(result, "i1");
+    }
+
+    private LLVMValue generateUnary(UnaryExpr node) {
+        LLVMValue operand = generateExpr(node.operand);
+
+        if (node.op.equals("-")) {
+            if (isFloatType(operand.type)) {
+                String result = "%neg." + tmpCount++;
+                body.append("  ").append(result).append(" = fneg ").append(operand.type)
+                     .append(" ").append(operand.value).append("\n");
+                return new LLVMValue(result, operand.type);
+            } else {
+                String result = "%neg." + tmpCount++;
+                body.append("  ").append(result).append(" = sub ").append(operand.type)
+                     .append(" 0, ").append(operand.value).append("\n");
+                return new LLVMValue(result, operand.type);
+            }
+        }
+        if (node.op.equals("!")) {
+            String result = "%not." + tmpCount++;
+            String val = ensureI1(operand);
+            body.append("  ").append(result).append(" = xor i1 ").append(val).append(", 1\n");
+            return new LLVMValue(result, "i1");
+        }
+        if (node.op.equals("++") && node.prefix) {
+            return generateIncrement(node.operand, "add", true);
+        }
+        if (node.op.equals("--") && node.prefix) {
+            return generateIncrement(node.operand, "sub", true);
+        }
+        if (node.op.equals("++") && !node.prefix) {
+            return generateIncrement(node.operand, "add", false);
+        }
+        if (node.op.equals("--") && !node.prefix) {
+            return generateIncrement(node.operand, "sub", false);
+        }
+
+        throw new RuntimeException("Unknown unary operator: " + node.op);
+    }
+
+    private LLVMValue generateIncrement(AST target, String arithOp, boolean prefix) {
+        if (!(target instanceof Identifier)) {
+            throw new RuntimeException("Increment target must be a variable");
+        }
+        Identifier id = (Identifier) target;
+        LLVMValue ptr = scope.lookup(id.name);
+        if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name);
+
+        String loaded = "%inc.old." + tmpCount++;
+        body.append("  ").append(loaded).append(" = load ").append(ptr.type)
+             .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+
+        String one = isFloatType(ptr.type) ? "1.0" : "1";
+        String irOp = isFloatType(ptr.type) ? (arithOp.equals("add") ? "fadd" : "fsub") : arithOp;
+        String newVal = "%inc.new." + tmpCount++;
+        body.append("  ").append(newVal).append(" = ").append(irOp).append(" ")
+            .append(ptr.type).append(" ").append(loaded).append(", ").append(one).append("\n");
+
+        body.append("  store ").append(ptr.type).append(" ").append(newVal)
+             .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+
+        return new LLVMValue(prefix ? newVal : loaded, ptr.type);
+    }
+
+    private LLVMValue generateAssign(AssignExpr node) {
+        markRegionControlFlow();
+        // Provide expected Function<...> context when assigning to a Function variable.
+        String assignExpected = null;
+        if (node.target instanceof Identifier) {
+            LLVMValue target = scope.lookup(((Identifier) node.target).name);
+            if (target != null && isFunctionType(target.semanticType)) {
+                assignExpected = target.semanticType;
+            }
+        }
+        String savedExpected = expectedFunctionType;
+        expectedFunctionType = assignExpected;
+        LLVMValue val;
+        try {
+            val = generateExpr(node.value);
+        } finally {
+            expectedFunctionType = savedExpected;
+        }
+        if (assignExpected != null) {
+            checkFunctionValue(val, assignExpected, node.line);
+        }
+
+        if (node.target instanceof Identifier) {
+            Identifier id = (Identifier) node.target;
+            if (freedVars.contains(id.name)) {
+                throw new RuntimeException("Assignment to freed variable: " + id.name + " (at line " + node.line + ")");
+            }
+            if (finalVars.contains(id.name)) {
+                throw new RuntimeException("Cannot assign to final variable '" + id.name + "' (at line " + node.line + ")");
+            }
+            LLVMValue ptr = scope.lookup(id.name);
+            if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
+            body.append("  store ").append(ptr.type).append(" ").append(castValue(val, ptr.type))
+                 .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+            return new LLVMValue(val.value, ptr.type);
+        }
+
+        if (node.target instanceof FieldAccessExpr) {
+            FieldAccessExpr fa = (FieldAccessExpr) node.target;
+            // System built-in fields are final constants
+            if (fa.object instanceof Identifier && ((Identifier) fa.object).name.equals("System")) {
+                if (!fa.field.equals("ARGS") && !fa.field.equals("OS_TYPE") && !fa.field.equals("ARCH_TYPE")) {
+                    throw new RuntimeException("Unknown System field: " + fa.field + " (at line " + node.line + ")");
+                }
+                throw new RuntimeException("Cannot assign to final variable '" + fa.field + "' (at line " + node.line + ")");
+            }
+            LLVMValue objPtr = generateExprForPtr(fa.object);
+            String className = extractClassName(objPtr.type);
+            ClassInfo ci = classes.get(className);
+            if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+
+            Integer fieldIdx = ci.fieldIndices.get(fa.field);
+            if (fieldIdx == null) throw new RuntimeException("Unknown field: " + fa.field);
+
+            // fieldIdx includes type ID offset, fieldTypes starts at 0
+            String fieldType = ci.fieldTypes.get(fieldIdx - 1);
+            String fieldPtr = "%fp." + tmpCount++;
+            body.append("  ").append(fieldPtr).append(" = getelementptr ").append(ci.llvmName)
+                 .append(", ").append(ci.llvmName).append("* ").append(objPtr.value)
+                 .append(", i32 0, i32 ").append(fieldIdx).append("\n");
+            body.append("  store ").append(toLLVMType(fieldType)).append(" ")
+                 .append(castValue(val, toLLVMType(fieldType)))
+                 .append(", ").append(toLLVMType(fieldType)).append("* ").append(fieldPtr).append("\n");
+            return val;
+        }
+
+        if (node.target instanceof ArrayAccessExpr) {
+            return generateArrayAssign((ArrayAccessExpr) node.target, val, node.line);
+        }
+
+        throw new RuntimeException("Invalid assignment target");
+    }
+
+    /**
+     * Generate array element assignment: arr[index] = value
+     */
+    private LLVMValue generateArrayAssign(ArrayAccessExpr target, LLVMValue val, int line) {
+        LLVMValue arrPtr = generateExpr(target.array);
+        LLVMValue idx = generateExpr(target.index);
+
+        // Determine element type: Cang-level tracking resolves nested subscripts (a[i][j] = x)
+        String elemType = "i32"; // default
+        String cangElemType = "int";
+        String elemCang = elemCangOf(target.array);
+        if (elemCang != null) {
+            elemType = toLLVMType(elemCang);
+            cangElemType = elemCang;
+        } else if (target.array instanceof Identifier) {
+            String tracked = arrayElemTypes.get(((Identifier) target.array).name);
+            if (tracked != null) {
+                elemType = tracked;
+                cangElemType = cangTypeFromLLVMFull(elemType);
+            }
+        }
+
+        // Type check: value type must be compatible with element type
+        if (!typesCompatible(val.type, elemType)) {
+            String valCang = cangTypeFromLLVMFull(val.type);
+            throw new RuntimeException(
+                "Array element type mismatch: expected " + cangElemType +
+                " but found " + valCang + " (at line " + line + ")");
+        }
+
+        // Skip 8-byte length header
+        String dataPtr = "%arr.data." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr i8, i8* ")
+             .append(arrPtr.value).append(", i64 8\n");
+
+        String typedPtr = "%arr.typed." + tmpCount++;
+        body.append("  ").append(typedPtr).append(" = bitcast i8* ").append(dataPtr)
+             .append(" to ").append(elemType).append("*\n");
+
+        // Cast index to i64
+        String idxI64 = "%arr.idx." + tmpCount++;
+        if (idx.type.equals("i32")) {
+            body.append("  ").append(idxI64).append(" = sext i32 ").append(idx.value).append(" to i64\n");
+        } else if (idx.type.equals("i64")) {
+            body.append("  ").append(idxI64).append(" = ").append(idx.value).append("\n");
+        } else {
+            body.append("  ").append(idxI64).append(" = zext ").append(idx.type).append(" ").append(idx.value).append(" to i64\n");
+        }
+
+        // Get element pointer
+        String elemPtr = "%arr.elem." + tmpCount++;
+        body.append("  ").append(elemPtr).append(" = getelementptr ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(idxI64).append("\n");
+
+        // Store value (with cast if needed)
+        body.append("  store ").append(elemType).append(" ").append(castValue(val, elemType))
+             .append(", ").append(elemType).append("* ").append(elemPtr).append("\n");
+
+        return val;
+    }
+
+    private LLVMValue generateTernary(TernaryExpr node) {
+        LLVMValue cond = generateExpr(node.condition);
+        String i1Cond = ensureI1(cond);
+
+        LLVMValue trueVal = generateExpr(node.trueExpr);
+        LLVMValue falseVal = generateExpr(node.falseExpr);
+
+        String result = "%ternary." + tmpCount++;
+        body.append("  ").append(result).append(" = select i1 ").append(i1Cond)
+             .append(", ").append(trueVal.type).append(" ").append(castValue(trueVal, trueVal.type))
+             .append(", ").append(falseVal.type).append(" ").append(castValue(falseVal, trueVal.type)).append("\n");
+
+        return new LLVMValue(result, trueVal.type);
+    }
+
+    /**
+     * Generate like expression: obj like ClassName
+     * Checks if obj is an instance of ClassName or its subclass.
+     */
+    private LLVMValue generateLike(LikeExpr node) {
+        LLVMValue objVal = generateExpr(node.expr);
+
+        // Load type ID from object (first field, offset 0)
+        String typePtr = "%like.tid.ptr." + tmpCount++;
+        body.append("  ").append(typePtr).append(" = bitcast ").append(objVal.type)
+             .append(" ").append(objVal.value).append(" to i32*\n");
+        String typeId = "%like.tid." + tmpCount++;
+        body.append("  ").append(typeId).append(" = load i32, i32* ").append(typePtr).append("\n");
+
+        // Get target class type ID
+        ClassInfo targetInfo = classes.get(node.className);
+        if (targetInfo == null) {
+            throw new RuntimeException("Unknown class: " + node.className + " (at line " + node.line + ")");
+        }
+
+        // Collect all type IDs that are target or subclass of target
+        java.util.List<Integer> validIds = new ArrayList<>();
+        for (ClassInfo ci : classes.values()) {
+            if (isSubclass(ci.simpleName, node.className)) {
+                validIds.add(ci.typeId);
+            }
+        }
+
+        // Generate OR chain of comparisons
+        String current = "%like." + tmpCount++;
+        body.append("  ").append(current).append(" = icmp eq i32 ").append(typeId)
+             .append(", ").append(validIds.get(0)).append("\n");
+
+        for (int i = 1; i < validIds.size(); i++) {
+            String cmp = "%like.cmp." + tmpCount++;
+            body.append("  ").append(cmp).append(" = icmp eq i32 ").append(typeId)
+                 .append(", ").append(validIds.get(i)).append("\n");
+            String next = "%like.next." + tmpCount++;
+            body.append("  ").append(next).append(" = or i1 ").append(current)
+                 .append(", ").append(cmp).append("\n");
+            current = next;
+        }
+
+        return new LLVMValue(current, "i1");
+    }
+
+    private LLVMValue generateTypeCast(TypeCastExpr node) {
+        LLVMValue val = generateExpr(node.expr);
+        String targetType = toLLVMType(node.targetType);
+
+        // String/str semantic conversion while sharing the same LLVM pointer type.
+        if (targetType.equals("i8*") && node.targetType.equals("str")) {
+            if (val.type.equals("i8*")) {
+                return new LLVMValue(val.value, val.type, "str");
+            }
+            LLVMValue converted = convertToString(val);
+            converted.semanticType = "str";
+            return converted;
+        }
+        if (targetType.equals("i8*") && node.targetType.equals("String")) {
+            if (val.type.equals("i8*")) {
+                return new LLVMValue(val.value, val.type, "String");
+            }
+            LLVMValue converted = convertToString(val);
+            converted.semanticType = "String";
+            return converted;
+        }
+
+        // If types already match, return as-is
+        if (val.type.equals(targetType)) {
+            return val;
+        }
+
+        // String to number conversion
+        if (val.type.equals("i8*") && !targetType.equals("i8*")) {
+            return generateStringToNumber(val, node.targetType, targetType);
+        }
+
+        String result = "%cast." + tmpCount++;
+
+        // Float to int
+        if (!isFloatType(targetType) && isFloatType(val.type)) {
+            body.append("  ").append(result).append(" = fptosi ").append(val.type)
+                 .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            return new LLVMValue(result, targetType);
+        }
+
+        // Int to float
+        if (isFloatType(targetType) && !isFloatType(val.type)) {
+            body.append("  ").append(result).append(" = sitofp ").append(val.type)
+                 .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            return new LLVMValue(result, targetType);
+        }
+
+        // Float to float
+        if (isFloatType(targetType) && isFloatType(val.type)) {
+            if (val.type.equals("float") && targetType.equals("double")) {
+                body.append("  ").append(result).append(" = fpext float ").append(val.value).append(" to double\n");
+            } else if (val.type.equals("double") && targetType.equals("float")) {
+                body.append("  ").append(result).append(" = fptrunc double ").append(val.value).append(" to float\n");
+            }
+            return new LLVMValue(result, targetType);
+        }
+
+        // Int to int
+        int fromBits = llvmTypeBits(val.type);
+        int toBits = llvmTypeBits(targetType);
+        if (fromBits > 0 && toBits > 0) {
+            if (toBits > fromBits) {
+                body.append("  ").append(result).append(" = zext ").append(val.type)
+                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            } else if (toBits < fromBits) {
+                body.append("  ").append(result).append(" = trunc ").append(val.type)
+                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            }
+            return new LLVMValue(result, targetType);
+        }
+
+        // bool to int
+        if (val.type.equals("i1") && llvmTypeBits(targetType) > 1) {
+            body.append("  ").append(result).append(" = zext i1 ").append(val.value)
+                 .append(" to ").append(targetType).append("\n");
+            return new LLVMValue(result, targetType);
+        }
+
+        // Fallback: just change type label (shouldn't happen often)
+        return new LLVMValue(val.value, targetType);
+    }
+
+    /**
+     * Convert String to number using atoi/atol/atof.
+     * int("123") 閳?123, double("3.14") 閳?3.14, long("100") 閳?100
+     */
+    private LLVMValue generateStringToNumber(LLVMValue strVal, String cangTargetType, String llvmTargetType) {
+        String result = "%str2num." + tmpCount++;
+
+        switch (cangTargetType) {
+            case "byte":
+                // atoi returns i32, then trunc to i8
+                String byteTmp = "%str2num.i32." + tmpCount++;
+                body.append("  ").append(byteTmp).append(" = call i32 @atoi(i8* ").append(strVal.value).append(")\n");
+                body.append("  ").append(result).append(" = trunc i32 ").append(byteTmp).append(" to i8\n");
+                break;
+            case "int":
+                body.append("  ").append(result).append(" = call i32 @atoi(i8* ").append(strVal.value).append(")\n");
+                break;
+            case "long":
+                // Use sscanf with %lld for 64-bit parsing
+                String longFmt = "@.fmt.sscanf.long";
+                if (!header.toString().contains(longFmt)) {
+                    header.append(longFmt).append(" = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
+                }
+                // Allocate temp, sscanf writes to it, then load
+                String longPtr = "%long.ptr." + tmpCount++;
+                body.append("  ").append(longPtr).append(" = alloca i64\n");
+                body.append("  call i32 @sscanf(i8* ").append(strVal.value)
+                     .append(", i8* ").append(longFmt)
+                     .append(", i64* ").append(longPtr).append(")\n");
+                body.append("  ").append(result).append(" = load i64, i64* ").append(longPtr).append("\n");
+                break;
+            case "float":
+                // atof returns double, then fptrunc to float
+                String floatTmp = "%str2num.f64." + tmpCount++;
+                body.append("  ").append(floatTmp).append(" = call double @atof(i8* ").append(strVal.value).append(")\n");
+                body.append("  ").append(result).append(" = fptrunc double ").append(floatTmp).append(" to float\n");
+                break;
+            case "double":
+                body.append("  ").append(result).append(" = call double @atof(i8* ").append(strVal.value).append(")\n");
+                break;
+            default:
+                throw new RuntimeException("Cannot convert String to " + cangTargetType);
+        }
+
+        return new LLVMValue(result, llvmTargetType);
+    }
+
+    private LLVMValue generateMethodCall(MethodCallExpr node) {
+        markRegionControlFlow();
+        // Handle built-in Stdout.print
+        if (node.object instanceof Identifier) {
+            String objName = ((Identifier) node.object).name;
+            if (objName.equals("Stdout") && node.method.equals("print")) {
+                return generateStdoutPrint(node.args, false);
+            }
+            if (objName.equals("Stdout") && node.method.equals("println")) {
+                return generateStdoutPrint(node.args, true);
+            }
+            if (objName.equals("Math")) {
+                return generateMathCall(node.method, node.args, node.line);
+            }
+            if (objName.equals("System")) {
+                return generateSystemCall(node.method, node.args, node.line);
+            }
+        }
+
+        // Arrays expose length() as a built-in method. The length is stored in the i64 header.
+        if (node.method.equals("length") && node.args.isEmpty()) {
+            LLVMValue arrayValue = generateExpr(node.object);
+            if (arrayValue.semanticType != null && isArraySemanticType(arrayValue.semanticType)) {
+                String length64 = "%arr.length." + tmpCount++;
+                String length32 = "%arr.length.i32." + tmpCount++;
+                body.append("  ").append(length64).append(" = load i64, i64* ")
+                     .append(arrayValue.value).append("\n");
+                body.append("  ").append(length32).append(" = trunc i64 ").append(length64).append(" to i32\n");
+                return new LLVMValue(length32, "i32");
+            }
+        }
+
+        // Static method call: ClassName.method(...)
+        if (node.object instanceof Identifier) {
+            String objName = ((Identifier) node.object).name;
+            if (classes.containsKey(objName)) {
+                String classFullName = classes.get(objName).fullName;
+                String funcName = classFullName + "." + node.method;
+                FuncInfo fi = functions.get(funcName);
+                if (fi != null && fi.isStatic) {
+                    return generateStaticCall(fi, funcName, node.args, node.line);
+                }
+                // Class exists but method is not static or not found
+                if (fi != null && !fi.isStatic) {
+                    throw new RuntimeException("Method '" + node.method + "' in '" + objName + "' is not static, cannot call via class name (at line " + node.line + ")");
+                }
+                if (fi == null) {
+                    throw new RuntimeException("Unknown method: " + objName + "." + node.method + " (at line " + node.line + ")");
+                }
+            }
+        }
+
+        // Standalone function call (object is null)
+        if (node.object == null) {
+            LLVMValue callableSlot = scope.lookup(node.method);
+            if (callableSlot != null && callableSlot.type.equals("%CangFunction")) {
+                LLVMValue callable = generateExpr(new Identifier(node.method, node.line));
+                return generateIndirectCall(callable, node.args, node.line);
+            }
+            FuncInfo fi = functions.get(node.method);
+            if (fi == null) throw new RuntimeException("Unknown function: " + node.method);
+
+            StringBuilder args = new StringBuilder();
+            int argCount = node.args.size();
+            int paramCount = fi.paramTypes.size();
+
+            for (int i = 0; i < paramCount; i++) {
+                if (i > 0) args.append(", ");
+                String paramType = fi.paramTypes.get(i);
+                String llvmParamType = toLLVMType(paramType);
+
+                if (i < argCount && !(node.args.get(i) instanceof VoidPlaceholder)) {
+                    // Provided argument
+                    LLVMValue argVal = generateCallArg(node.args.get(i), paramType, node.line);
+                    args.append(llvmParamType).append(" ").append(castValue(argVal, llvmParamType));
+                } else {
+                    // Use default value (either void placeholder or omitted)
+                    AST defaultVal = fi.paramDefaults.get(i);
+                    if (defaultVal != null) {
+                        LLVMValue defVal = generateExpr(defaultVal);
+                        args.append(llvmParamType).append(" ").append(castValue(defVal, llvmParamType));
+                    } else {
+                        args.append(llvmParamType).append(" ").append(defaultValueForType(paramType));
+                    }
+                }
+            }
+
+            if (fi.returnType.equals("void")) {
+                body.append("  call void @").append(node.method).append("(").append(args).append(")\n");
+                return new LLVMValue("void", "void");
+            } else {
+                String result = "%call." + tmpCount++;
+                body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
+                     .append(" @").append(node.method).append("(").append(args).append(")\n");
+                return new LLVMValue(result, toLLVMType(fi.returnType));
+            }
+        }
+
+        // Regular method call
+        LLVMValue objVal = generateExpr(node.object);
+        if ("str".equals(objVal.semanticType)) {
+            throw new RuntimeException("str is a primitive type and has no methods (at line " + node.line + ")");
+        }
+
+        // Null pointer check for object method calls
+        if (objVal.type.equals("i8*") || (objVal.type.startsWith("%") && objVal.type.endsWith("*"))) {
+            int id = labelCount++;
+            String notNullLabel = "nonnull." + id;
+            String nullLabel = "isnull." + id;
+            String isNull = "%null." + tmpCount++;
+            body.append("  ").append(isNull).append(" = icmp eq ").append(objVal.type)
+                 .append(" ").append(objVal.value).append(", null\n");
+            body.append("  br i1 ").append(isNull).append(", label %").append(nullLabel)
+                 .append(", label %").append(notNullLabel).append("\n\n");
+
+            // Null handler
+            body.append(nullLabel).append(":\n");
+            String errMsg = ensureStringConstant("@.str.nullptr", "Null pointer dereference\\0A\\00", 26);
+            String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+            body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([26 x i8], [26 x i8]* ")
+                 .append(errMsg).append(", i32 0, i32 0))\n");
+            String locFmt = ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+            body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* ")
+                 .append(locFmt).append(", i32 0, i32 0), i8* ")
+                 .append(fileName).append(", i32 ").append(node.line).append(")\n");
+            body.append("  call void @exit(i32 1)\n");
+            body.append("  unreachable\n\n");
+
+            body.append(notNullLabel).append(":\n");
+        }
+
+        String className = extractClassName(objVal.type);
+        String funcName = className + "." + node.method;
+
+        FuncInfo fi = functions.get(funcName);
+        if (fi == null) {
+            // Try with namespace prefix
+            ClassInfo ci = classes.get(className);
+            if (ci != null && !ci.fullName.equals(className)) {
+                funcName = ci.fullName + "." + node.method;
+                fi = functions.get(funcName);
+            }
+        }
+        // Walk up parent chain for inherited methods
+        if (fi == null) {
+            ClassInfo ci = classes.get(className);
+            while (ci != null && ci.parentName != null) {
+                ClassInfo parent = classes.get(ci.parentName);
+                if (parent == null) break;
+                funcName = parent.fullName + "." + node.method;
+                fi = functions.get(funcName);
+                if (fi != null) break;
+                ci = parent;
+            }
+        }
+        if (fi == null) throw new RuntimeException("Unknown method: " + funcName + " (at line " + node.line + ")");
+
+        // Private access check: _ prefix methods only accessible within same class
+        if (node.method.startsWith("_")) {
+            ClassInfo ownerClass = classes.get(className);
+            String ownerName = ownerClass != null ? ownerClass.simpleName : className;
+            if (!isSameOrParentClass(currentClassName, ownerName)) {
+                String context = currentClassName != null ? currentClassName : "top-level code";
+                throw new RuntimeException("Method '" + node.method + "' is private and cannot be accessed from '" + context + "' (at line " + node.line + ")");
+            }
+        }
+
+        // Check if polymorphic dispatch is needed
+        ClassInfo objClass = classes.get(className);
+        if (objClass != null) {
+            boolean overridden = isMethodOverridden(objClass, node.method);
+            if (overridden) {
+                return generateDynamicDispatch(objVal, node, fi, className);
+            }
+        }
+
+        StringBuilder args = new StringBuilder();
+        args.append(objVal.type).append(" ").append(objVal.value);
+        for (AST arg : node.args) {
+            String paramType = fi.paramTypes.get(node.args.indexOf(arg));
+            LLVMValue argVal = generateCallArg(arg, paramType, node.line);
+            args.append(", ").append(toLLVMType(paramType)).append(" ")
+                .append(castValue(argVal, toLLVMType(paramType)));
+        }
+
+        if (fi.returnType.equals("void")) {
+            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            return new LLVMValue("void", "void");
+        } else {
+            String result = "%call." + tmpCount++;
+            body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
+                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+            return new LLVMValue(result, toLLVMType(fi.returnType));
+        }
+    }
+
+    private LLVMValue generateMathCall(String method, List<AST> nodes, int line) {
+        List<LLVMValue> args = new ArrayList<>();
+        for (AST node : nodes) args.add(generateExpr(node));
+
+        if (method.equals("abs") && args.size() == 1) {
+            LLVMValue v = args.get(0);
+            if (v.type.equals("i32") || v.type.equals("i64")) {
+                String cmp = "%math.abs.cmp." + tmpCount++;
+                String neg = "%math.abs.neg." + tmpCount++;
+                String r = "%math.abs." + tmpCount++;
+                body.append("  ").append(cmp).append(" = icmp sge ").append(v.type).append(" ").append(v.value).append(", 0\n");
+                body.append("  ").append(neg).append(" = sub ").append(v.type).append(" 0, ").append(v.value).append("\n");
+                body.append("  ").append(r).append(" = select i1 ").append(cmp)
+                    .append(", ").append(v.type).append(" ").append(v.value).append(", ").append(v.type).append(" ").append(neg).append("\n");
+                return new LLVMValue(r, v.type);
+            }
+            if (v.type.equals("double") || v.type.equals("float")) {
+                String r = "%math.abs." + tmpCount++;
+                body.append("  ").append(r).append(" = call ").append(v.type).append(" @llvm.fabs.").append(v.type.equals("double") ? "f64" : "f32").append("(").append(v.type).append(" ").append(v.value).append(")\n");
+                return new LLVMValue(r, v.type);
+            }
+        }
+
+        if ((method.equals("min") || method.equals("max")) && args.size() == 2) {
+            LLVMValue a = args.get(0), b = args.get(1);
+            String type = a.type.equals("double") || b.type.equals("double") ? "double" : (a.type.equals("i64") || b.type.equals("i64") ? "i64" : "i32");
+            String av = castValue(a, type), bv = castValue(b, type);
+            String cmp = "%math.cmp." + tmpCount++;
+            String r = "%math." + method + "." + tmpCount++;
+            String pred = method.equals("min") ? "sle" : "sge";
+            if (isFloatType(type)) {
+                pred = method.equals("min") ? "ole" : "oge";
+                body.append("  ").append(cmp).append(" = fcmp ").append(pred).append(" ").append(type).append(" ").append(av).append(", ").append(bv).append("\n");
+            } else {
+                body.append("  ").append(cmp).append(" = icmp ").append(pred).append(" ").append(type).append(" ").append(av).append(", ").append(bv).append("\n");
+            }
+            body.append("  ").append(r).append(" = select i1 ").append(cmp).append(", ").append(type).append(" ").append(av).append(", ").append(type).append(" ").append(bv).append("\n");
+            return new LLVMValue(r, type);
+        }
+
+        String intrinsic = null;
+        if (method.equals("sqrt")) intrinsic = "sqrt";
+        else if (method.equals("pow")) intrinsic = "pow";
+        else if (method.equals("floor")) intrinsic = "floor";
+        else if (method.equals("ceil")) intrinsic = "ceil";
+        else if (method.equals("round")) intrinsic = "round";
+        else if (method.equals("sin")) intrinsic = "sin";
+        else if (method.equals("cos")) intrinsic = "cos";
+        else if (method.equals("tan")) intrinsic = "tan";
+        else if (method.equals("asin")) intrinsic = "asin";
+        else if (method.equals("acos")) intrinsic = "acos";
+        else if (method.equals("atan")) intrinsic = "atan";
+        else if (method.equals("atan2")) intrinsic = "atan2";
+        else if (method.equals("log")) intrinsic = "log";
+        else if (method.equals("log10")) intrinsic = "log10";
+        else if (method.equals("exp")) intrinsic = "exp";
+        if (intrinsic != null && (args.size() == 1 || (intrinsic.equals("pow") || intrinsic.equals("atan2")) && args.size() == 2)) {
+            String r = "%math." + intrinsic + "." + tmpCount++;
+            StringBuilder callArgs = new StringBuilder();
+            for (int i = 0; i < args.size(); i++) {
+                if (i > 0) callArgs.append(", ");
+                callArgs.append("double ").append(castValue(args.get(i), "double"));
+            }
+            body.append("  ").append(r).append(" = call double @llvm.").append(intrinsic).append(".f64(").append(callArgs).append(")\n");
+            return new LLVMValue(r, "double");
+        }
+
+        if (method.equals("random") && args.isEmpty()) {
+            // Platform-independent 64-bit LCG: state = state*A + C (mod 2^64).
+            String oldState = "%math.seed.old." + tmpCount++;
+            String multiplied = "%math.seed.multiplied." + tmpCount++;
+            String nextState = "%math.seed.next." + tmpCount++;
+            String highBits = "%math.random.bits." + tmpCount++;
+            String converted = "%math.random.converted." + tmpCount++;
+            String result = "%math.random." + tmpCount++;
+            body.append("  ").append(oldState).append(" = load i64, i64* @math.seed\n");
+            body.append("  ").append(multiplied).append(" = mul i64 ").append(oldState).append(", 6364136223846793005\n");
+            body.append("  ").append(nextState).append(" = add i64 ").append(multiplied).append(", 1442695040888963407\n");
+            body.append("  store i64 ").append(nextState).append(", i64* @math.seed\n");
+            body.append("  ").append(highBits).append(" = lshr i64 ").append(nextState).append(", 32\n");
+            body.append("  ").append(converted).append(" = uitofp i64 ").append(highBits).append(" to double\n");
+            body.append("  ").append(result).append(" = fdiv double ").append(converted).append(", 4294967296.0\n");
+            return new LLVMValue(result, "double");
+        }
+        throw new RuntimeException("Unknown Math method or argument count: Math." + method + " (at line " + line + ")");
+    }
+
+    /**
+     * Generate call to a static method (no 'this' parameter).
+     */
+    private LLVMValue generateSystemCall(String method, List<AST> nodes, int line) {
+        if (method.equals("exit") && nodes.size() == 1) {
+            LLVMValue status = generateExpr(nodes.get(0));
+            body.append("  call void @exit(i32 ").append(castValue(status, "i32")).append(")\n");
+            body.append("  unreachable\n");
+            return new LLVMValue("void", "void");
+        }
+        if (method.equals("getenv") && nodes.size() == 1) {
+            LLVMValue name = generateExpr(nodes.get(0));
+            if (!name.type.equals("i8*")) throw new RuntimeException("System.getenv expects String (at line " + line + ")");
+            String result = "%system.getenv." + tmpCount++;
+            body.append("  ").append(result).append(" = call i8* @getenv(i8* ").append(name.value).append(")\n");
+            return new LLVMValue(result, "i8*", "String");
+        }
+        if (method.equals("currentTimeMillis") && nodes.isEmpty()) {
+            String seconds = "%system.time.seconds." + tmpCount++;
+            String millis = "%system.time.millis." + tmpCount++;
+            body.append("  ").append(seconds).append(" = call i64 @time(i64* null)\n");
+            body.append("  ").append(millis).append(" = mul i64 ").append(seconds).append(", 1000\n");
+            return new LLVMValue(millis, "i64");
+        }
+        throw new RuntimeException("Unknown System method or argument count: System." + method + " (at line " + line + ")");
+    }
+
+    private LLVMValue generateStaticCall(FuncInfo fi, String funcName, List<AST> nodeArgs, int line) {
+        StringBuilder args = new StringBuilder();
+        int argCount = nodeArgs.size();
+        int paramCount = fi.paramTypes.size();
+
+        for (int i = 0; i < paramCount; i++) {
+            if (i > 0) args.append(", ");
+            String paramType = fi.paramTypes.get(i);
+            String llvmParamType = toLLVMType(paramType);
+
+            if (i < argCount && !(nodeArgs.get(i) instanceof VoidPlaceholder)) {
+                LLVMValue argVal = generateCallArg(nodeArgs.get(i), paramType, line);
+                args.append(llvmParamType).append(" ").append(castValue(argVal, llvmParamType));
+            } else {
+                AST defaultVal = fi.paramDefaults.get(i);
+                if (defaultVal != null) {
+                    LLVMValue defVal = generateExpr(defaultVal);
+                    args.append(llvmParamType).append(" ").append(castValue(defVal, llvmParamType));
+                } else {
+                    args.append(llvmParamType).append(" ").append(defaultValueForType(paramType));
+                }
+            }
+        }
+
+        if (fi.returnType.equals("void")) {
+            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            return new LLVMValue("void", "void");
+        } else {
+            String result = "%call." + tmpCount++;
+            body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
+                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+            return new LLVMValue(result, toLLVMType(fi.returnType));
+        }
+    }
+
+    private LLVMValue generateStdoutPrint(List<AST> args, boolean newline) {
+        if (args.isEmpty()) throw new RuntimeException("Stdout.print requires an argument");
+        LLVMValue argVal = generateExpr(args.get(0));
+        String fmtType = cangTypeFromLLVM(argVal.type);
+        // println uses fmtConstants (with \n), print uses fmtConstantsNoNL (without \n)
+        Map<String, String> fmtMap = newline ? fmtConstants : fmtConstantsNoNL;
+        String fmtName = fmtMap.get(fmtType);
+        if (fmtName == null) fmtName = fmtMap.get("String"); // fallback
+
+        // For pointer types (String, class objects), check for null
+        if (argVal.type.equals("i8*") || argVal.type.endsWith("*")) {
+            int id = labelCount++;
+            String notNullLabel = "print.notnull." + id;
+            String endLabel = "print.end." + id;
+
+            // Check if pointer is null
+            String isNull = "%isnull." + tmpCount++;
+            body.append("  ").append(isNull).append(" = icmp eq i8* ").append(argVal.value).append(", null\n");
+            body.append("  br i1 ").append(isNull).append(", label %print.null.").append(id)
+                 .append(", label %").append(notNullLabel).append("\n\n");
+
+            // Null case: print "null" (with or without newline)
+            body.append("print.null.").append(id).append(":\n");
+            if (newline) {
+                body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([6 x i8], [6 x i8]* ")
+                     .append("@.str.null").append(", i32 0, i32 0))\n");
+            } else {
+                body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([5 x i8], [5 x i8]* ")
+                     .append("@.str.null.p").append(", i32 0, i32 0))\n");
+            }
+            body.append("  br label %").append(endLabel).append("\n\n");
+
+            // Not null: print normally
+            body.append(notNullLabel).append(":\n");
+            body.append("  call i32 (i8*, ...) @printf(i8* ").append(fmtName)
+                 .append(", i8* ").append(argVal.value).append(")\n");
+            body.append("  br label %").append(endLabel).append("\n\n");
+
+            body.append(endLabel).append(":\n");
+            return new LLVMValue("void", "void");
+        }
+
+        // For i1 (bool), we need to zext to i32 for printf
+        String argStr;
+        String argType;
+        if (argVal.type.equals("i1")) {
+            String ext = "%bool.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = zext i1 ").append(argVal.value).append(" to i32\n");
+            argStr = ext;
+            argType = "i32";
+        } else if (argVal.type.equals("i8")) {
+            String ext = "%byte.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = sext i8 ").append(argVal.value).append(" to i32\n");
+            argStr = ext;
+            argType = "i32";
+        } else if (argVal.type.equals("float")) {
+            // printf varargs promote float to double
+            String ext = "%float.ext." + tmpCount++;
+            body.append("  ").append(ext).append(" = fpext float ").append(argVal.value).append(" to double\n");
+            argStr = ext;
+            argType = "double";
+        } else {
+            argStr = argVal.value;
+            argType = argVal.type;
+        }
+
+        body.append("  call i32 (i8*, ...) @printf(i8* ").append(fmtName)
+             .append(", ").append(argType).append(" ").append(argStr).append(")\n");
+
+        return new LLVMValue("void", "void");
+    }
+
+    /**
+     * True when expr is System.ARGS field access.
+     */
+    private boolean isSystemArgs(AST expr) {
+        if (!(expr instanceof FieldAccessExpr)) return false;
+        FieldAccessExpr fa = (FieldAccessExpr) expr;
+        return fa.object instanceof Identifier
+            && ((Identifier) fa.object).name.equals("System")
+            && fa.field.equals("ARGS");
+    }
+
+    /**
+     * Generate access to System built-in fields: ARGS, OS_TYPE, ARCH_TYPE.
+     */
+    private LLVMValue generateSystemField(FieldAccessExpr node) {
+        String field = node.field;
+        int line = node.line;
+
+        if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Math")) {
+            if (field.equals("PI")) return new LLVMValue("0x400921FB54442D18", "double");
+            if (field.equals("E")) return new LLVMValue("0x4005BF0A8B145769", "double");
+            throw new RuntimeException("Unknown Math field: " + field + " (at line " + line + ")");
+        }
+
+        switch (field) {
+            case "OS_TYPE":
+                return makeStringConstant(targetPlatform.equals("macos") ? "macos" : targetPlatform);
+
+            case "ARCH_TYPE":
+                return makeStringConstant(targetArchitecture);
+
+            case "ARGS":
+                // Load array built at main entry: [i64 length][i8* ...]
+                String argsPtr = "%sysargs." + tmpCount++;
+                body.append("  ").append(argsPtr).append(" = load i8*, i8** @system.args\n");
+                return new LLVMValue(argsPtr, "i8*");
+
+            default:
+                throw new RuntimeException("Unknown System field: " + field + " (at line " + line + ")");
+        }
+    }
+
+    /**
+     * Create a string constant and return it as LLVM value.
+     */
+    private LLVMValue makeStringConstant(String value) {
+        String key = value;
+        if (!stringLiterals.containsKey(key)) {
+            String name = "@.str.sys." + stringLiterals.size();
+            int byteCount = value.length() + 1;
+            StringBuilder escaped = new StringBuilder();
+            for (char c : value.toCharArray()) {
+                if (c == '\\') escaped.append("\\5C");
+                else if (c == '\n') escaped.append("\\0A");
+                else if (c == '\t') escaped.append("\\09");
+                else if (c == '"') escaped.append("\\22");
+                else if (c >= 32 && c < 127) escaped.append(c);
+                else escaped.append(String.format("\\%02X", (int) c));
+            }
+            header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+                  .append(" x i8] c\"").append(escaped).append("\\00\"\n");
+            stringLiterals.put(key, name);
+        }
+        String globalName = stringLiterals.get(key);
+        String ptr = "%str." + tmpCount++;
+        body.append("  ").append(ptr).append(" = getelementptr [")
+            .append(value.length() + 1).append(" x i8], [")
+            .append(value.length() + 1).append(" x i8]* ")
+            .append(globalName).append(", i32 0, i32 0\n");
+        return new LLVMValue(ptr, "i8*");
+    }
+
+    private LLVMValue generateFieldAccess(FieldAccessExpr node) {
+        // Handle System built-in fields
+        if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("System")) {
+            return generateSystemField(node);
+        }
+        if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Math")) {
+            return generateSystemField(node);
+        }
+
+        LLVMValue objPtr = generateExprForPtr(node.object);
+        if (objPtr == null) {
+            String objDesc = node.object instanceof ThisExpr ? "this" :
+                           node.object instanceof Identifier ? ((Identifier) node.object).name : "?";
+            throw new RuntimeException("Cannot access field '" + node.field + "' on '" + objDesc +
+                "' 閳?'this' is only valid inside class methods (line " + node.line + ")");
+        }
+        String className = extractClassName(objPtr.type);
+        ClassInfo ci = classes.get(className);
+        if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+
+        // Private access check: _ prefix fields only accessible within same class
+        if (node.field.startsWith("_") && !isSameOrParentClass(currentClassName, ci.simpleName)) {
+            String context = currentClassName != null ? currentClassName : "top-level code";
+            throw new RuntimeException("Field '" + node.field + "' is private and cannot be accessed from '" + context + "' (at line " + node.line + ")");
+        }
+
+        Integer fieldIdx = ci.fieldIndices.get(node.field);
+        if (fieldIdx == null) throw new RuntimeException("Unknown field: " + node.field + " (at line " + node.line + ")");
+
+        // fieldIdx includes type ID offset (starts at 1), fieldTypes starts at 0
+        String fieldType = ci.fieldTypes.get(fieldIdx - 1);
+        String fieldPtr = "%fp." + tmpCount++;
+        body.append("  ").append(fieldPtr).append(" = getelementptr ").append(ci.llvmName)
+             .append(", ").append(ci.llvmName).append("* ").append(objPtr.value)
+             .append(", i32 0, i32 ").append(fieldIdx).append("\n");
+
+        String loaded = "%fld." + tmpCount++;
+        body.append("  ").append(loaded).append(" = load ").append(toLLVMType(fieldType))
+             .append(", ").append(toLLVMType(fieldType)).append("* ").append(fieldPtr).append("\n");
+        return new LLVMValue(loaded, toLLVMType(fieldType));
+    }
+
+    private LLVMValue generateExprForPtr(AST node) {
+        if (node instanceof Identifier) {
+            LLVMValue val = scope.lookup(((Identifier) node).name);
+            if (val == null) throw new RuntimeException("Undefined variable: " + ((Identifier) node).name + " (at line " + node.line + ")");
+            // Scope stores value type. Alloca type is value_type + "*".
+            // For pointer-typed variables (reference types), load the pointer from alloca.
+            if (val.type.endsWith("*")) {
+                String allocaType = val.type + "*";
+                String loaded = "%deref." + tmpCount++;
+                body.append("  ").append(loaded).append(" = load ").append(val.type)
+                     .append(", ").append(allocaType).append(" ").append(val.value).append("\n");
+                return new LLVMValue(loaded, val.type);
+            }
+            return val;
+        }
+        if (node instanceof ThisExpr) {
+            return scope.lookup("this");
+        }
+        if (node instanceof FieldAccessExpr) {
+            // Chain: obj.field 閳?generate field access, which returns a loaded value
+            // For chained field access (obj.field.field2), we need the intermediate pointer
+            FieldAccessExpr fa = (FieldAccessExpr) node;
+            LLVMValue objPtr = generateExprForPtr(fa.object);
+            String className = extractClassName(objPtr.type);
+            ClassInfo ci = classes.get(className);
+            if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+            Integer fieldIdx = ci.fieldIndices.get(fa.field);
+            if (fieldIdx == null) throw new RuntimeException("Unknown field: " + fa.field + " (at line " + node.line + ")");
+            // fieldIdx includes type ID offset, fieldTypes starts at 0
+            String fieldType = ci.fieldTypes.get(fieldIdx - 1);
+            String fieldPtr = "%fp." + tmpCount++;
+            body.append("  ").append(fieldPtr).append(" = getelementptr ").append(ci.llvmName)
+                 .append(", ").append(ci.llvmName).append("* ").append(objPtr.value)
+                 .append(", i32 0, i32 ").append(fieldIdx).append("\n");
+            return new LLVMValue(fieldPtr, toLLVMType(fieldType) + "*");
+        }
+        // Fallback: generate the expression and use the value
+        return generateExpr(node);
+    }
+
+    private LLVMValue generateNew(NewExpr node) {
+        // Boxing a primitive str into the immutable String reference wrapper.
+        if (node.className.equals("String") && node.args.size() == 1) {
+            LLVMValue value = generateExpr(node.args.get(0));
+            if (!value.type.equals("i8*")) {
+                throw new RuntimeException("new String(...) expects a string value (at line " + node.line + ")");
+            }
+            return new LLVMValue(value.value, "i8*", "String");
+        }
+        ClassInfo ci = classes.get(node.className);
+        if (ci == null) throw new RuntimeException("Unknown class: " + node.className + " (at line " + node.line + ")");
+
+        // Calculate struct size
+        String sizeVar = "%size." + tmpCount++;
+        body.append("  ").append(sizeVar).append(" = getelementptr ").append(ci.llvmName)
+             .append(", ").append(ci.llvmName).append("* null, i32 1\n");
+        String sizeOf = "%sizeof." + tmpCount++;
+        body.append("  ").append(sizeOf).append(" = ptrtoint ").append(ci.llvmName)
+             .append("* ").append(sizeVar).append(" to i64\n");
+
+        // Malloc
+        String raw = "%raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @malloc(i64 ").append(sizeOf).append(")\n");
+        registerRegionAllocation(raw);
+
+        // Bitcast
+        String obj = "%obj." + tmpCount++;
+        body.append("  ").append(obj).append(" = bitcast i8* ").append(raw)
+             .append(" to ").append(ci.llvmName).append("*\n");
+
+        // Call constructor if exists
+        String ctorName = ci.fullName + ".constructor";
+        if (functions.containsKey(ctorName)) {
+            FuncInfo fi = functions.get(ctorName);
+            StringBuilder args = new StringBuilder();
+            args.append(ci.llvmName).append("* ").append(obj);
+            int argCount = node.args.size();
+            int paramCount = fi.paramTypes.size();
+
+            for (int i = 0; i < paramCount; i++) {
+                args.append(", ");
+                String paramType = fi.paramTypes.get(i);
+                String llvmParamType = toLLVMType(paramType);
+
+                if (i < argCount && !(node.args.get(i) instanceof VoidPlaceholder)) {
+                    LLVMValue argVal = generateExpr(node.args.get(i));
+                    args.append(llvmParamType).append(" ").append(castValue(argVal, llvmParamType));
+                } else {
+                    // Use default value
+                    AST defaultVal = fi.paramDefaults.get(i);
+                    if (defaultVal != null) {
+                        LLVMValue defVal = generateExpr(defaultVal);
+                        args.append(llvmParamType).append(" ").append(castValue(defVal, llvmParamType));
+                    } else {
+                        args.append(llvmParamType).append(" ").append(defaultValueForType(paramType));
+                    }
+                }
+            }
+            body.append("  call void @").append(ctorName).append("(").append(args).append(")\n");
+        }
+
+        return new LLVMValue(obj, ci.llvmName + "*");
+    }
+
+    // ==================== Array generation ====================
+
+    /** Element LLVM type used by the most recent generateArrayLit call (for var inference). */
+    private String lastArrayElemType = null;
+    /** Element Cang type used by the most recent generateArrayLit call (for var inference). */
+    private String lastArrayElemCangType = null;
+
+    /** Register a variable as an array with the given Cang element type. */
+    private void trackArrayVar(String varName, String elemCangType) {
+        arrayElemCangTypes.put(varName, elemCangType);
+        arrayElemTypes.put(varName, toLLVMType(elemCangType));
+    }
+
+    /** If t is "Array<X>", return X; otherwise null. */
+    private String innerElemCang(String t) {
+        if (t != null && t.startsWith("Array<") && t.endsWith(">")) {
+            return t.substring(6, t.length() - 1);
+        }
+        return null;
+    }
+
+    /**
+     * Element Cang type of an array expression (the type of expr[0]), or null if unknown.
+     * a : Array<T>            -> T
+     * a[i] where a : Array<Array<T>> -> T   (i.e. elem(elem(a)))
+     */
+    private String elemCangOf(AST expr) {
+        if (expr instanceof Identifier) {
+            return arrayElemCangTypes.get(((Identifier) expr).name);
+        }
+        if (expr instanceof ArrayAccessExpr) {
+            return innerElemCang(elemCangOf(((ArrayAccessExpr) expr).array));
+        }
+        return null;
+    }
+
+    /** Best-effort Cang type name from an LLVM type (class pointers resolve to the class name). */
+    private String cangTypeFromLLVMFull(String llvmType) {
+        if (llvmType.startsWith("%") && llvmType.endsWith("*")) {
+            String cls = extractClassName(llvmType);
+            if (classes.containsKey(cls)) return cls;
+        }
+        return cangTypeFromLLVM(llvmType);
+    }
+
+    /**
+     * Infer the Cang type of an already-generated array element value, for error messages
+     * and for var element-type inference.
+     */
+    private String inferElemCang(AST node) {
+        if (node instanceof IntLit) return "int";
+        if (node instanceof LongLit) return "long";
+        if (node instanceof FloatLit) return "float";
+        if (node instanceof DoubleLit) return "double";
+        if (node instanceof BoolLit) return "bool";
+        if (node instanceof StringLit) return "String";
+        if (node instanceof StrLit) return "str";
+        if (node instanceof ArrayLit) {
+            return lastArrayElemCangType != null ? "Array<" + lastArrayElemCangType + ">" : null;
+        }
+        if (node instanceof Identifier) {
+            String elem = arrayElemCangTypes.get(((Identifier) node).name);
+            if (elem != null) return "Array<" + elem + ">";
+        }
+        return null; // caller falls back to LLVM-based name
+    }
+
+    /**
+     * Generate array literal: [1, 2, 3]
+     * Layout: [i64 length][elements...]  (length header + data)
+     * Returns pointer to the header.
+     */
+    private LLVMValue generateArrayLit(ArrayLit node) {
+        return generateArrayLit(node, null, null);
+    }
+
+    /**
+     * Generate array literal with optional expected element type.
+     * Every element's type is checked (literals and expressions alike); mismatches are compile errors.
+     * Nested ArrayLit elements inherit the expected element type recursively (int[][] = [[...],[...]]).
+     * When expectedCangType is null (var inference), the first element defines the element type.
+     */
+    private LLVMValue generateArrayLit(ArrayLit node, String expectedLLVMType, String expectedCangType) {
+        int n = node.elements.size();
+        if (n == 0) {
+            // Empty array: malloc 8 bytes (just length)
+            String ptr = "%arr.empty." + tmpCount++;
+            body.append("  ").append(ptr).append(" = call i8* @malloc(i64 8)\n");
+        registerRegionAllocation(ptr);
+            // store length 0
+            body.append("  store i64 0, i64* ").append(ptr).append("\n");
+            lastArrayElemType = expectedLLVMType;
+            lastArrayElemCangType = expectedCangType;
+            return new LLVMValue(ptr, "i8*");
+        }
+
+        // Determine element type: declared type wins, otherwise infer from first element
+        AST firstNode = node.elements.get(0);
+        LLVMValue first = generateElemValue(firstNode, expectedCangType);
+        String elemType = expectedLLVMType != null ? expectedLLVMType : first.type;
+        String elemCang;
+        if (expectedCangType != null) {
+            elemCang = expectedCangType;
+        } else {
+            elemCang = inferElemCang(firstNode);
+            if (elemCang == null) {
+                if (firstNode instanceof ArrayLit) {
+                    throw new RuntimeException(
+                        "Cannot infer element type from nested empty array literal, use explicit type e.g. int[][] m = [[1],[2]] (at line "
+                        + node.line + ")");
+                }
+                elemCang = cangTypeFromLLVMFull(first.type);
+            }
+        }
+        checkArrayElemType(first.type, elemType, actualCangOf(firstNode, first), elemCang, node.line);
+        int elemBits = llvmTypeBits(elemType);
+        if (elemBits <= 0) elemBits = 64; // default for pointers
+        long elemBytes = (elemBits + 7) / 8;
+
+        // Allocate: 8 bytes (length) + n * elemBytes
+        long totalSize = 8L + (long) n * elemBytes;
+        String ptr = "%arr." + tmpCount++;
+        body.append("  ").append(ptr).append(" = call i8* @malloc(i64 ").append(totalSize).append(")\n");
+
+        // Store length
+        body.append("  store i64 ").append(n).append(", i64* ").append(ptr).append("\n");
+
+        // Store elements (skip the 8-byte header)
+        String dataPtr = "%arr.data." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr i8, i8* ").append(ptr).append(", i64 8\n");
+        String typedPtr = "%arr.typed." + tmpCount++;
+        body.append("  ").append(typedPtr).append(" = bitcast i8* ").append(dataPtr).append(" to ").append(elemType).append("*\n");
+
+        // Store first element (already generated)
+        String elem0Ptr = "%arr.e0." + tmpCount++;
+        body.append("  ").append(elem0Ptr).append(" = getelementptr ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(typedPtr).append(", i64 0\n");
+        body.append("  store ").append(elemType).append(" ").append(castValue(first, elemType))
+             .append(", ").append(elemType).append("* ").append(elem0Ptr).append("\n");
+
+        // Store remaining elements
+        for (int i = 1; i < n; i++) {
+            AST elemNode = node.elements.get(i);
+            LLVMValue val = generateElemValue(elemNode, elemCang);
+            checkArrayElemType(val.type, elemType, actualCangOf(elemNode, val), elemCang, node.line);
+            String elemPtr = "%arr.e" + i + "." + tmpCount++;
+            body.append("  ").append(elemPtr).append(" = getelementptr ").append(elemType).append(", ")
+                 .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(i).append("\n");
+            body.append("  store ").append(elemType).append(" ").append(castValue(val, elemType))
+                 .append(", ").append(elemType).append("* ").append(elemPtr).append("\n");
+        }
+
+        lastArrayElemType = elemType;
+        lastArrayElemCangType = elemCang;
+        return new LLVMValue(ptr, "i8*");
+    }
+
+    /**
+     * Generate one array-literal element, propagating the declared element type into nested
+     * array literals so int[][] literals are checked recursively.
+     */
+    private LLVMValue generateElemValue(AST node, String expectedCang) {
+        if (node instanceof ArrayLit && expectedCang != null) {
+            String inner = innerElemCang(expectedCang);
+            if (inner != null) {
+                return generateArrayLit((ArrayLit) node, toLLVMType(inner), inner);
+            }
+        }
+        return generateExpr(node);
+    }
+
+    /** Best Cang type name for an element value: prefer node-based inference, fall back to LLVM type. */
+    private String actualCangOf(AST node, LLVMValue val) {
+        String inferred = inferElemCang(node);
+        return inferred != null ? inferred : cangTypeFromLLVMFull(val.type);
+    }
+
+    /**
+     * Check one array element's value against the expected element type.
+     */
+    private void checkArrayElemType(String actualLLVMType, String expectedLLVMType,
+                                    String actualCangType, String expectedCangType, int line) {
+        if (actualLLVMType.equals(expectedLLVMType) || typesCompatible(actualLLVMType, expectedLLVMType)) {
+            return;
+        }
+        String expectedCang = expectedCangType != null ? expectedCangType : cangTypeFromLLVMFull(expectedLLVMType);
+        throw new RuntimeException(
+            "Array element type mismatch: expected " + expectedCang +
+            " but found " + actualCangType + " (at line " + line + ")");
+    }
+
+    /**
+     * Generate array access: arr[index]
+     * Layout: [i64 length][elements...]
+     * Includes bounds checking.
+     */
+    private LLVMValue generateArrayAccess(ArrayAccessExpr node) {
+        LLVMValue arrPtr = generateExpr(node.array);
+        LLVMValue idx = generateExpr(node.index);
+
+        // Cast index to i64
+        String idxI64 = "%arr.idx." + tmpCount++;
+        if (idx.type.equals("i32")) {
+            body.append("  ").append(idxI64).append(" = sext i32 ").append(idx.value).append(" to i64\n");
+        } else if (idx.type.equals("i64")) {
+            body.append("  ").append(idxI64).append(" = ").append(idx.value).append("\n");
+        } else {
+            body.append("  ").append(idxI64).append(" = zext ").append(idx.type).append(" ").append(idx.value).append(" to i64\n");
+        }
+
+        // Load array length from header
+        String lenVar = "%arr.len." + tmpCount++;
+        body.append("  ").append(lenVar).append(" = load i64, i64* ").append(arrPtr.value).append("\n");
+
+        // Bounds check: index >= length || index < 0
+        int id = labelCount++;
+        String okLabel = "arr.ok." + id;
+        String errLabel = "arr.err." + id;
+
+        // Check index >= length
+        String geCheck = "%arr.ge." + tmpCount++;
+        body.append("  ").append(geCheck).append(" = icmp sge i64 ").append(idxI64).append(", ").append(lenVar).append("\n");
+
+        // Check index < 0
+        String ltZero = "%arr.lt0." + tmpCount++;
+        body.append("  ").append(ltZero).append(" = icmp slt i64 ").append(idxI64).append(", 0\n");
+
+        // Combine: out of bounds if (idx >= len) || (idx < 0)
+        String oob = "%arr.oob." + tmpCount++;
+        body.append("  ").append(oob).append(" = or i1 ").append(geCheck).append(", ").append(ltZero).append("\n");
+        body.append("  br i1 ").append(oob).append(", label %").append(errLabel)
+             .append(", label %").append(okLabel).append("\n\n");
+
+        // Error handler - inline
+        body.append(errLabel).append(":\n");
+        String errMsg = ensureStringConstant("@.str.oob.msg", "error: Array index out of bounds\\0A\\00", 34);
+        String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+        // Print error message directly (no format specifiers in message)
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([34 x i8], [34 x i8]* ")
+             .append(errMsg).append(", i32 0, i32 0))\n");
+        // Print location: "  at <file>:<line>\n"
+        String locFmt = ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* ")
+             .append(locFmt).append(", i32 0, i32 0), i8* ")
+             .append(fileName).append(", i32 ").append(node.line).append(")\n");
+        body.append("  call void @exit(i32 1)\n");
+        body.append("  unreachable\n\n");
+
+        // OK path
+        body.append(okLabel).append(":\n");
+
+        // Skip 8-byte length header
+        String dataPtr = "%arr.data." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr i8, i8* ")
+             .append(arrPtr.value).append(", i64 8\n");
+
+        // Determine element type: Cang-level tracking resolves nested subscripts (a[i][j])
+        String elemType; // LLVM type of elements inside node.array
+        String elemCang = elemCangOf(node.array);
+        if (elemCang != null) {
+            elemType = toLLVMType(elemCang);
+        } else if (node.array instanceof Identifier) {
+            String tracked = arrayElemTypes.get(((Identifier) node.array).name);
+            elemType = tracked != null ? tracked : "i32"; // default
+        } else if (isSystemArgs(node.array)) {
+            elemType = "i8*"; // ARGS elements are char*
+        } else {
+            elemType = "i32"; // default
+        }
+
+        String typedPtr = "%arr.typed." + tmpCount++;
+        body.append("  ").append(typedPtr).append(" = bitcast i8* ").append(dataPtr).append(" to ").append(elemType).append("*\n");
+
+        // Get element pointer
+        String elemPtr = "%arr.elem." + tmpCount++;
+        body.append("  ").append(elemPtr).append(" = getelementptr ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(idxI64).append("\n");
+
+        // Load value
+        String result = "%arr.load." + tmpCount++;
+        body.append("  ").append(result).append(" = load ").append(elemType).append(", ")
+             .append(elemType).append("* ").append(elemPtr).append("\n");
+
+        return new LLVMValue(result, elemType, elemCang);
+    }
+
+    /**
+     * Ensure a string constant exists in header (idempotent).
+     */
+    private String ensureStringConstant(String name, String text, int byteCount) {
+        if (!header.toString().contains(name)) {
+            // Ensure null terminator
+            String content = text;
+            if (!content.endsWith("\\00")) {
+                content = content + "\\00";
+                byteCount = text.length() + 1;
+            }
+            header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+                  .append(" x i8] c\"").append(content).append("\"\n");
+        }
+        return name;
+    }
+
+    // ==================== Main function ====================
+
+    /**
+     * Build System.ARGS array from main's argc/argv and store into @system.args.
+     * Layout: [i64 length][elem0][elem1]... where element is i8* (char*).
+     * Must be called while the current block can still branch (emits a loop).
+     */
+    private void emitArgsArrayInit() {
+        int id = labelCount++;
+        String loopLabel = "args.loop." + id;
+        String bodyLabel = "args.body." + id;
+        String doneLabel = "args.done." + id;
+
+        // argc64 = sext i32 %argc to i64
+        body.append("  %argc64 = sext i32 %argc to i64\n");
+        // total = 8 + argc*8
+        body.append("  %args.slots = mul i64 %argc64, 8\n");
+        body.append("  %args.total = add i64 %args.slots, 8\n");
+        // mem = malloc(total)
+        body.append("  %args.mem = call i8* @malloc(i64 %args.total)\n");
+        // System.ARGS is a global root and must outlive the entry function.
+        // It is intentionally not registered in the function region.
+        // store length header
+        body.append("  %args.lenptr = bitcast i8* %args.mem to i64*\n");
+        body.append("  store i64 %argc64, i64* %args.lenptr\n");
+        // publish to @system.args
+        body.append("  store i8* %args.mem, i8** @system.args\n");
+        // loop init
+        body.append("  %args.i = alloca i64\n");
+        body.append("  store i64 0, i64* %args.i\n");
+        body.append("  br label %").append(loopLabel).append("\n\n");
+
+        // loop condition: i < argc
+        body.append(loopLabel).append(":\n");
+        body.append("  %args.iv = load i64, i64* %args.i\n");
+        body.append("  %args.cmp = icmp slt i64 %args.iv, %argc64\n");
+        body.append("  br i1 %args.cmp, label %").append(bodyLabel)
+             .append(", label %").append(doneLabel).append("\n\n");
+
+        // loop body: slot[i] = argv[i]
+        body.append(bodyLabel).append(":\n");
+        body.append("  %args.off = mul i64 %args.iv, 8\n");
+        body.append("  %args.slot = getelementptr i8, i8* %args.mem, i64 %args.off\n");
+        body.append("  %args.slot2 = getelementptr i8, i8* %args.slot, i64 8\n");
+        body.append("  %args.slotp = bitcast i8* %args.slot2 to i8**\n");
+        body.append("  %args.ap = getelementptr i8*, i8** %argv, i64 %args.iv\n");
+        body.append("  %args.av = load i8*, i8** %args.ap\n");
+        body.append("  store i8* %args.av, i8** %args.slotp\n");
+        body.append("  %args.in = add i64 %args.iv, 1\n");
+        body.append("  store i64 %args.in, i64* %args.i\n");
+        body.append("  br label %").append(loopLabel).append("\n\n");
+
+        body.append(doneLabel).append(":\n");
+    }
+
+    private void generateAutoMain() {
+        body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+        body.append("entry:\n");
+
+        scope = new Scope(null);
+        tmpCount = 0;
+        currentFuncReturnType = "int";
+
+        emitArgsArrayInit();
+
+        for (AST stmt : topLevelStmts) {
+            generateStmt(stmt);
+        }
+
+        body.append("  ret i32 0\n");
+        body.append("}\n\n");
+        scope = null;
+    }
+
+    /**
+     * Generate main for entry-point class (class with no braces).
+     * Params become local variables initialized with defaults.
+     * Rest of file is the body.
+     */
+    private void generateEntryPointMain(ClassDecl entryClass) {
+        body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+        body.append("entry:\n");
+
+        scope = new Scope(null);
+        tmpCount = 0;
+        currentFuncReturnType = "int";
+
+        // Allocate and initialize parameters with default values
+        for (Parameter p : entryClass.ctorParams) {
+            String llvmType = toLLVMType(p.type);
+            String ptr = "%v." + p.name;
+            body.append("  ").append(ptr).append(" = alloca ").append(llvmType).append("\n");
+            scope.define(p.name, new LLVMValue(ptr, llvmType,
+                semanticKindOf(p.type)));
+            if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
+                trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
+            }
+
+            if (p.defaultValue != null) {
+                LLVMValue defVal = generateExpr(p.defaultValue);
+                body.append("  store ").append(llvmType).append(" ")
+                     .append(castValue(defVal, llvmType))
+                     .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
+            } else {
+                body.append("  store ").append(llvmType).append(" ")
+                     .append(defaultValueForType(p.type))
+                     .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
+            }
+        }
+
+        // Build System.ARGS before user code runs
+        emitArgsArrayInit();
+
+        // Generate body (rest of file)
+        for (AST stmt : entryClass.topLevelBody) {
+            generateStmt(stmt);
+        }
+
+        body.append("  ret i32 0\n");
+        body.append("}\n\n");
+        scope = null;
+    }
+
+    // ==================== Type utilities ====================
+
+    /** Cang semantic kind carried on LLVMValue for types sharing an LLVM representation. */
+    private String semanticKindOf(String cangType) {
+        return cangType != null && (cangType.equals("str") || cangType.equals("String") || isFunctionType(cangType))
+            ? cangType : null;
+    }
+
+    private boolean isFunctionType(String cangType) {
+        return cangType != null && cangType.startsWith("Function<") && cangType.endsWith(">");
+    }
+
+    private boolean isArraySemanticType(String cangType) {
+        return cangType != null && cangType.startsWith("Array<") && cangType.endsWith(">");
+    }
+
+    private String[] functionTypeParts(String cangType) {
+        String inner = cangType.substring(9, cangType.length() - 1);
+        if (inner.isEmpty()) return new String[0];
+        List<String> parts = new ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < inner.length(); i++) {
+            char c = inner.charAt(i);
+            if (c == '<') depth++;
+            else if (c == '>') depth--;
+            else if (c == ',' && depth == 0) {
+                parts.add(inner.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(inner.substring(start));
+        return parts.toArray(new String[0]);
+    }
+
+    private String functionPointerType(FuncInfo fi) {
+        StringBuilder result = new StringBuilder(toLLVMType(fi.returnType)).append(" (");
+        for (int i = 0; i < fi.paramTypes.size(); i++) {
+            if (i > 0) result.append(", ");
+            result.append(toLLVMType(fi.paramTypes.get(i)));
+        }
+        return result.append(")*").toString();
+    }
+
+    private boolean isFunctionPointerType(String llvmType) {
+        return llvmType != null && llvmType.contains("(") && llvmType.endsWith(")*");
+    }
+
+    private LLVMValue generateIndirectCall(LLVMValue callable, List<AST> nodes, int line) {
+        String signature = callable.semanticType;
+        if (signature == null || !isFunctionType(signature)) {
+            throw new RuntimeException("Cannot call value without Function type (at line " + line + ")");
+        }
+        String[] parts = functionTypeParts(signature);
+        if (parts.length == 0) {
+            throw new RuntimeException("Invalid Function type: " + signature + " (at line " + line + ")");
+        }
+        String returnCang = parts[0];
+        String returnLLVM = toLLVMType(returnCang);
+        int paramCount = parts.length - 1;
+        if (nodes.size() != paramCount) {
+            throw new RuntimeException("Function argument count mismatch: expected " + paramCount
+                + " but found " + nodes.size() + " (at line " + line + ")");
+        }
+
+        String code = "%fn.code." + tmpCount++;
+        body.append("  ").append(code).append(" = extractvalue %CangFunction ").append(callable.value).append(", 0\n");
+        String receiver = "%fn.env." + tmpCount++;
+        body.append("  ").append(receiver).append(" = extractvalue %CangFunction ").append(callable.value).append(", 1\n");
+
+        List<String> callArgs = new ArrayList<>();
+        callArgs.add("i8* " + receiver);
+        StringBuilder paramList = new StringBuilder("i8*");
+        for (int i = 0; i < paramCount; i++) {
+            String paramCang = parts[i + 1];
+            String paramLLVM = toLLVMType(paramCang);
+            String savedExpected = expectedFunctionType;
+            expectedFunctionType = isFunctionType(paramCang) ? paramCang : null;
+            LLVMValue value;
+            try {
+                value = generateExpr(nodes.get(i));
+            } finally {
+                expectedFunctionType = savedExpected;
+            }
+            if (value.semanticType != null && isFunctionType(value.semanticType)) {
+                checkFunctionValue(value, paramCang, line);
+            } else if (!value.type.equals(paramLLVM) && !typesCompatible(value.type, paramLLVM)
+                    && !(isNumericLLVM(value.type) && isNumericLLVM(paramLLVM))) {
+                throw new RuntimeException("Function argument type mismatch: expected " + paramCang
+                    + " but found " + cangTypeFromLLVMFull(value.type) + " (at line " + line + ")");
+            }
+            paramList.append(", ").append(paramLLVM);
+            callArgs.add(paramLLVM + " " + castValue(value, paramLLVM));
+        }
+
+        String codeType = returnLLVM + " (" + paramList + ")*";
+        String codePtr = "%fn.ptr." + tmpCount++;
+        body.append("  ").append(codePtr).append(" = bitcast i8* ").append(code).append(" to ").append(codeType).append("\n");
+        if (returnLLVM.equals("void")) {
+            body.append("  call void ").append(codePtr).append("(").append(String.join(", ", callArgs)).append(")\n");
+            return new LLVMValue("void", "void");
+        }
+        String result = "%indirect.call." + tmpCount++;
+        body.append("  ").append(result).append(" = call ").append(returnLLVM).append(" ")
+             .append(codePtr).append("(").append(String.join(", ", callArgs)).append(")\n");
+        return new LLVMValue(result, returnLLVM);
+    }
+
+    private String toLLVMType(String cangType) {
+        // Function values are uniform { code, receiver } structs.
+        if (isFunctionType(cangType)) {
+            return "%CangFunction";
+        }
+        // Array<T> is represented as i8* (pointer to length-prefixed data)
+        if (cangType.startsWith("Array<") && cangType.endsWith(">")) {
+            return "i8*";
+        }
+        switch (cangType) {
+            case "byte": return "i8";
+            case "int": return "i32";
+            case "long": return "i64";
+            case "float": return "float";
+            case "double": return "double";
+            case "bool": return "i1";
+            case "String": return "i8*";
+            case "str": return "i8*";
+            case "void": return "void";
+            case "Void": return "void"; // Void wrapper class is the Function return-type spelling
+            case "var": return "auto";
+            default:
+                // Class type - look up by simple name to get full name
+                ClassInfo ci = classes.get(cangType);
+                if (ci != null) {
+                    return ci.llvmName + "*"; // llvmName already includes %
+                }
+                return "%" + cangType + "*";
+        }
+    }
+
+    private String cangTypeFromLLVM(String llvmType) {
+        switch (llvmType) {
+            case "i8": return "byte";
+            case "i32": return "int";
+            case "i64": return "long";
+            case "float": return "float";
+            case "double": return "double";
+            case "i1": return "bool";
+            case "i8*": return "String";
+            default: return "object";
+        }
+    }
+
+    private boolean isFloatType(String llvmType) {
+        return llvmType.equals("float") || llvmType.equals("double");
+    }
+
+    private String commonIntType(String a, String b) {
+        if (a.equals("i64") || b.equals("i64")) return "i64";
+        if (a.equals("i32") || b.equals("i32")) return "i32";
+        if (a.equals("i8") || b.equals("i8")) return "i8";
+        return "i32";
+    }
+
+    private String defaultValueForType(String cangType) {
+        if (isFunctionType(cangType)) return "zeroinitializer";
+        switch (cangType) {
+            case "byte": return "0";
+            case "int": return "0";
+            case "long": return "0";
+            case "float": return "0.0";
+            case "double": return "0.0";
+            case "bool": return "0";
+            case "String": return "null";
+            case "str": return "null";
+            default: return "null";
+        }
+    }
+
+    private String castValue(LLVMValue val, String targetType) {
+        if (val.type.equals(targetType)) return val.value;
+
+        // Int to float
+        if (isFloatType(targetType) && !isFloatType(val.type)) {
+            String result = "%cast." + tmpCount++;
+            body.append("  ").append(result).append(" = sitofp ").append(val.type)
+                 .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            return result;
+        }
+
+        // Float to int
+        if (!isFloatType(targetType) && isFloatType(val.type)) {
+            String result = "%cast." + tmpCount++;
+            body.append("  ").append(result).append(" = fptosi ").append(val.type)
+                 .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            return result;
+        }
+
+        // Float to float
+        if (isFloatType(targetType) && isFloatType(val.type)) {
+            if (val.type.equals("float") && targetType.equals("double")) {
+                String result = "%cast." + tmpCount++;
+                body.append("  ").append(result).append(" = fpext float ").append(val.value).append(" to double\n");
+                return result;
+            }
+            if (val.type.equals("double") && targetType.equals("float")) {
+                String result = "%cast." + tmpCount++;
+                body.append("  ").append(result).append(" = fptrunc double ").append(val.value).append(" to float\n");
+                return result;
+            }
+        }
+
+        // Int to int (widening)
+        int fromBits = llvmTypeBits(val.type);
+        int toBits = llvmTypeBits(targetType);
+        if (fromBits > 0 && toBits > 0) {
+            if (toBits > fromBits) {
+                String result = "%cast." + tmpCount++;
+                body.append("  ").append(result).append(" = zext ").append(val.type)
+                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+                return result;
+            } else if (toBits < fromBits) {
+                String result = "%cast." + tmpCount++;
+                body.append("  ").append(result).append(" = trunc ").append(val.type)
+                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+                return result;
+            }
+        }
+
+        // bool to int
+        if (val.type.equals("i1") && targetType.equals("i32")) {
+            String result = "%cast." + tmpCount++;
+            body.append("  ").append(result).append(" = zext i1 ").append(val.value).append(" to i32\n");
+            return result;
+        }
+
+        // If we can't cast, return as-is (will likely cause LLVM error but at least won't crash the compiler)
+        return val.value;
+    }
+
+    private int llvmTypeBits(String llvmType) {
+        switch (llvmType) {
+            case "i1": return 1;
+            case "i8": return 8;
+            case "i32": return 32;
+            case "i64": return 64;
+            case "float": return 32;
+            case "double": return 64;
+            default: return -1;
+        }
+    }
+
+    private String ensureI1(LLVMValue val) {
+        if (val.type.equals("i1")) return val.value;
+        // Compare to 0
+        String result = "%tobool." + tmpCount++;
+        if (isFloatType(val.type)) {
+            body.append("  ").append(result).append(" = fcmp one ").append(val.type)
+                 .append(" ").append(val.value).append(", 0.0\n");
+        } else {
+            body.append("  ").append(result).append(" = icmp ne ").append(val.type)
+                 .append(" ").append(val.value).append(", 0\n");
+        }
+        return result;
+    }
+
+    private String extractClassName(String llvmType) {
+        // "%ClassName*" 閳?"ClassName"
+        if (llvmType.startsWith("%") && llvmType.endsWith("*")) {
+            return llvmType.substring(1, llvmType.length() - 1);
+        }
+        if (llvmType.startsWith("%")) {
+            return llvmType.substring(1);
+        }
+        return llvmType;
+    }
+
+    private long estimateStructSize(ClassInfo ci) {
+        // Rough estimate for malloc sizing 閳?actual LLVM does this correctly with getelementptr
+        long size = 0;
+        for (String type : ci.fieldTypes) {
+            switch (type) {
+                case "byte": size += 1; break;
+                case "int": size += 4; break;
+                case "long": size += 8; break;
+                case "float": size += 4; break;
+                case "double": size += 8; break;
+                case "bool": size += 1; break;
+                default: size += 8; break; // pointer
+            }
+        }
+        return Math.max(size, 1);
+    }
+
+    private void emitFuncParamTypes(FuncInfo fi, StringBuilder target) {
+        boolean first = true;
+        if (fi.className != null && !fi.isConstructor) {
+            target.append(toLLVMType(fi.className)).append("*");
+            first = false;
+        }
+        for (String pt : fi.paramTypes) {
+            if (!first) target.append(", ");
+            target.append(toLLVMType(pt));
+            first = false;
+        }
+    }
+}
+

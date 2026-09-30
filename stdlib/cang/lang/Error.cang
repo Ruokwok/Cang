@@ -1,0 +1,4 @@
+namespace cang/lang
+
+# Base exception object. Runtime fills message and stack for generated errors.
+class Error(String message = "", String[] stack = [])
