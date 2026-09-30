@@ -425,6 +425,7 @@ public class Cang {
 
     /**
      * Find the stdlib directory by searching up from working directory.
+     * Falls back to the stdlib bundled inside the packaged jar.
      */
     private static String findStdlibDir() {
         String cwd = System.getProperty("user.dir");
@@ -442,7 +443,39 @@ public class Cang {
                 }
             }
         }
-        return null;
+        // Packaged jar: extract bundled stdlib resources to a temp directory once.
+        return extractBundledStdlib();
+    }
+
+    /** Standard library files shipped as classpath resources inside the packaged jar. */
+    private static final String[] BUNDLED_STDLIB_FILES = {
+        "Object.cang", "Stdout.cang", "String.cang", "Math.cang",
+        "System.cang", "Function.cang", "Void.cang", "Error.cang"
+    };
+
+    /**
+     * Extract the stdlib bundled in the jar to a temp directory so imports can be read as files.
+     * Returns null when no bundled stdlib is present (e.g. running from target/classes).
+     */
+    private static String extractBundledStdlib() {
+        if (bundledStdlibDir != null) return bundledStdlibDir;
+        try {
+            File dir = new File(System.getProperty("java.io.tmpdir"), "cang-stdlib/cang/lang");
+            if (!dir.isDirectory() && !dir.mkdirs()) return null;
+            boolean found = false;
+            for (String name : BUNDLED_STDLIB_FILES) {
+                try (java.io.InputStream in = Cang.class.getResourceAsStream("/stdlib/cang/lang/" + name)) {
+                    if (in == null) continue;
+                    found = true;
+                    Files.copy(in, Path.of(dir.getPath(), name), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+            if (!found) return null;
+            bundledStdlibDir = dir.getParentFile().getParentFile().getCanonicalPath();
+            return bundledStdlibDir;
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     /**
