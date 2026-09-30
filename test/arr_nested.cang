@@ -1,0 +1,42 @@
+func int firstOf(int[] row) {
+    return row[0]
+}
+
+class T()
+
+# 1. int[][] 推导
+int[][] m = [[1, 2], [3, 4]]
+Stdout.println(m[0][0])
+Stdout.println(m[1][1])
+m[0][1] = 99
+Stdout.println(m[0][1])
+
+# 2. 外层固定、内层推导
+int[2][] rows = [[1, 2, 3], [4, 5]]
+Stdout.println(rows[0][2])
+Stdout.println(rows[1][0])
+
+# 3. var 推导（含嵌套）
+var v = [[10, 20], [30]]
+Stdout.println(v[0][1])
+Stdout.println(v[1][0])
+
+# 4. 旧泛型写法
+int[][] legacy = [[7], [8, 9]]
+Stdout.println(legacy[1][1])
+
+# 5. String 二维
+String[][] words = [["a", "b"], ["c"]]
+Stdout.println(words[0][1])
+
+# 6. 嵌套数组作为参数
+Stdout.println(firstOf(m[0]))
+Stdout.println(firstOf(rows[1]))
+
+# 7. for-each 遍历外层，循环变量是数组
+for (int[] row : rows) {
+    Stdout.println(row[0])
+}
+for (var row : rows) {
+    Stdout.println(row[1])
+}

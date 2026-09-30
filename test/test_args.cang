@@ -1,0 +1,15 @@
+namespace test
+
+import cang/lang/System
+
+class Main
+
+Stdout.println("== index access ==")
+Stdout.println(System.ARGS[0])
+
+Stdout.println("== for-each ==")
+for (var a : System.ARGS) {
+    Stdout.print("[")
+    Stdout.print(a)
+    Stdout.println("]")
+}

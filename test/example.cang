@@ -1,0 +1,33 @@
+# 测试示例
+class Test(int x = 10, String name = "Cang")
+
+# 变量
+var a = 100
+Stdout.print(a)
+
+# 数组
+int[] arr = [1, 2, 3]
+Stdout.print(arr[0])
+
+# 字符串
+Stdout.print("hello")
+Stdout.print('single quote')
+Stdout.print(`multi
+line`)
+
+# 函数
+func int add(int a, int b = 1) {
+    return a + b
+}
+Stdout.print(add(3, 4))
+
+# 控制流
+if (x > 0) {
+    Stdout.print("positive")
+} else {
+    Stdout.print("non-positive")
+}
+
+for (int i = 0; i < 3; i++) {
+    Stdout.print(i)
+}

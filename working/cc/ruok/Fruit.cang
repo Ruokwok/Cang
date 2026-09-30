@@ -1,0 +1,9 @@
+namespace cc/ruok
+
+class Fruit
+
+static String name = "Fruit"
+
+func String getName() {
+    return "Fruit"
+}

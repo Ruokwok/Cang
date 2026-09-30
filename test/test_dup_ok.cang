@@ -1,0 +1,11 @@
+namespace test
+
+import cang/lang/Object
+
+class Main
+
+Stdout.println("ok")
+
+func void add(int i) {
+    Stdout.println(i)
+}

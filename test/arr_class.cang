@@ -1,0 +1,11 @@
+class T()
+Point[] pts = [new Point(1, 2), new Point(3, 4)]
+Stdout.println(pts[0].x)
+Stdout.println(pts[1].y)
+
+Point[3] fixedPts = []
+fixedPts[2] = new Point(5, 6)
+Stdout.println(fixedPts[2].x)
+Stdout.println(fixedPts[2].y)
+
+class Point(int x = 0, int y = 0)

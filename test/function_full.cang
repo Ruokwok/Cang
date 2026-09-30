@@ -1,0 +1,19 @@
+func int inc(int x) { return x + 1 }
+func void callV(Function<Void, int> f) { f(123) }
+func int callI(Function<int, int> f, int x) { return f(x) }
+
+class T()
+static func int twice(int x) { return x * 2 }
+func void add() { Stdout.println(7) }
+func void run(Function<Void> f) { f() }
+func void demo() {
+    this.run(this::add)
+    T t2 = new T()
+    this.run(t2::add)
+}
+
+callV((i) -> void { Stdout.println(i) })
+Stdout.println(callI(inc, 41))
+Stdout.println(callI(T::twice, 21))
+var t = new T()
+t.demo()

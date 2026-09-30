@@ -4,11 +4,19 @@ target/
 !**/src/test/**/target/
 .kotlin
 
+# 编译产物（clang/lld 生成）
+*.exe
+*.ll
+*.o
+
+# 临时调试输出
+tmp_*.txt
+
+# 会话与编辑器目录
+.mimocode/
+
 ### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
+.idea/
 *.iws
 *.iml
 *.ipr

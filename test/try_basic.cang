@@ -1,0 +1,11 @@
+import cang/lang/Error
+
+class Main()
+
+try {
+    throw new Error("boom")
+    Stdout.println("not reached")
+} catch (Error e) {
+    Stdout.println(e.message)
+}
+Stdout.println("after")
