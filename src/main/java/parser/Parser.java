@@ -227,6 +227,14 @@ public class Parser {
             error("Expected class name");
             name = "unknown";
         }
+        List<String> genericParams = new ArrayList<>();
+        if (check(TokenType.LT)) {
+            advance();
+            if (!check(TokenType.IDENT)) error("Generic parameter must be an identifier");
+            genericParams.add(expect(TokenType.IDENT).value);
+            if (check(TokenType.COMMA)) error("Generic classes support exactly one type parameter");
+            expect(TokenType.GT);
+        }
         String superClass = null;
         List<AST> superArgs = new ArrayList<>();
 
@@ -260,6 +268,7 @@ public class Parser {
         ClassDecl cd = new ClassDecl(name, superClass, new ArrayList<>(), ctorParams, line);
         cd.isEntryPoint = true;
         cd.superArgs = superArgs;
+        cd.genericParams = genericParams;
         return cd;
     }
 
@@ -350,8 +359,8 @@ public class Parser {
         if (check(TokenType.IDENT) && current().value.equals("Function") && peek(1).type == TokenType.LT) {
             return true;
         }
-        // ClassName varName → declaration (lookahead for IDENT IDENT)
-        if (check(TokenType.IDENT) && peek(1).type == TokenType.IDENT) {
+        // ClassName varName or ClassName<T> varName declaration
+        if (check(TokenType.IDENT) && (peek(1).type == TokenType.IDENT || peek(1).type == TokenType.LT)) {
             return true;
         }
         // Array syntax declaration: IDENT [ ... ] IDENT  (e.g. Point[] pts, Point[10] pts, int[][] m)
@@ -376,6 +385,16 @@ public class Parser {
     private String parseType() {
         String base = parseBaseType();
         lastArraySize = -1;
+        if (check(TokenType.LT)) {
+            advance();
+            if (!check(TokenType.IDENT, TokenType.VOID, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                error("Generic type argument must be a concrete type");
+            }
+            String arg = parseBaseType();
+            if (check(TokenType.LT)) error("Nested generic types are not supported");
+            expect(TokenType.GT);
+            base = base + "<" + arg + ">";
+        }
         if (!check(TokenType.LBRACKET)) {
             return base;
         }
@@ -923,6 +942,21 @@ public class Parser {
                 error("Expected class name after 'new'");
                 className = "unknown";
             }
+            List<String> typeArgs = new ArrayList<>();
+            if (check(TokenType.LT)) {
+                advance();
+                if (check(TokenType.GT)) {
+                    advance(); // diamond
+                } else {
+                    if (!check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                        error("Generic type argument must be a concrete type");
+                    }
+                    typeArgs.add(parseBaseType());
+                    if (check(TokenType.LT)) error("Nested generic types are not supported");
+                    if (check(TokenType.COMMA)) error("Generic classes support exactly one type argument");
+                    expect(TokenType.GT);
+                }
+            }
             expect(TokenType.LPAREN);
             List<AST> args = new ArrayList<>();
             if (!check(TokenType.RPAREN)) {
@@ -933,7 +967,7 @@ public class Parser {
                 }
             }
             expect(TokenType.RPAREN);
-            return new NewExpr(className, args, line);
+            return new NewExpr(className, typeArgs, args, line);
         }
 
         // Type cast: byte(expr), int(expr), long(expr), float(expr), double(expr), string(expr)

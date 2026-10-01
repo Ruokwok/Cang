@@ -1,0 +1,12 @@
+namespace cc/demo
+
+# Circle - 继承 Point，演示单继承与方法覆盖
+class Circle(int x = 0, int y = 0, int r = 0) : Point(x, y)
+
+func int kind() {
+    return 1
+}
+
+func int areaApprox() {
+    return this.r * this.r
+}

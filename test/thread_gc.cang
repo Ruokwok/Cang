@@ -1,0 +1,7 @@
+func int work(int x) {
+    Stdout.println("concat:" + "ok")
+    return x + 1
+}
+Thread<int> t = Thread.spawn(work, 41)
+System.gc()
+Stdout.println(t.join())

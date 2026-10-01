@@ -1,0 +1,12 @@
+namespace cc/demo
+
+# Point - 基类
+class Point(int x = 0, int y = 0)
+
+func int sum() {
+    return this.x + this.y
+}
+
+func int kind() {
+    return 0
+}

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Cang compiler launcher: cang <namespace/Main[.cang]> [options]
+exec java -cp "$(dirname "$0")/target/classes" Cang "$@"

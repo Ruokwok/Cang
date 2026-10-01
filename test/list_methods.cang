@@ -1,0 +1,12 @@
+import cang/lang/List
+
+class Main()
+List<int> nums = new List<>()
+Stdout.println(nums.add(10))
+Stdout.println(nums.add(20))
+Stdout.println(nums.contains(10))
+Stdout.println(nums.contains(99))
+Stdout.println(nums.remove(0))
+Stdout.println(nums.size())
+nums.clear()
+Stdout.println(nums.isEmpty())

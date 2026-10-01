@@ -1,0 +1,4 @@
+func int one() { return 1 }
+Thread<int> t = Thread.spawn(one)
+Stdout.println(t.join())
+Stdout.println(t.join())

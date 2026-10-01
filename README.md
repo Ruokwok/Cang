@@ -22,7 +22,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
 - `Math`、`System`、`Stdout`、`String` 等基础标准库；
 - `try/catch/finally` 与 `Error` 的第一版实现；
-- 手动 `free` 内存释放；
+- Boehm GC 自动内存管理（默认）+ `free` 提前释放，`--no-gc` 可切回手动模式；
 - Windows、Linux、macOS 目标平台常量和基础交叉编译参数。
 
 ## 快速示例
@@ -124,46 +124,75 @@ javac -encoding UTF-8 -d target/classes (Get-ChildItem -Recurse src/main/java -F
 
 ## 编译 Cang 程序
 
+源码放在 `src/` 下，用命名空间路径引用（自动补 `.cang` 并在 `src/` 下查找）：
+
 ```powershell
-java -cp target/classes Cang test/example.cang
+cang cc/ruok/Main
+cang cc/ruok/Main.cang
+```
+
+产物统一输出到 `target/`：
+
+```text
+src/cc/ruok/Main.cang → target/Main.exe
+```
+
+也支持直接传文件路径（兼容旧用法）：
+
+```powershell
+cang test/example.cang
 ```
 
 只生成 LLVM IR：
 
 ```powershell
-java -cp target/classes Cang test/example.cang --no-link
+cang test/example.cang --no-link
 ```
 
 指定目标平台和架构：
 
 ```powershell
-java -cp target/classes Cang test/example.cang --target windows --arch amd64
-java -cp target/classes Cang test/example.cang --target linux --arch amd64
-java -cp target/classes Cang test/example.cang --target linux --arch aarch64
-java -cp target/classes Cang test/example.cang --target macos --arch amd64
+cang test/example.cang --target windows --arch amd64
+cang test/example.cang --target linux --arch amd64
+cang test/example.cang --target linux --arch aarch64
+cang test/example.cang --target macos --arch amd64
+```
+
+`cang` 是仓库根目录的启动脚本（`cang.cmd` / `cang`）；没有该命令时等价于：
+
+```powershell
+java -cp target\classes Cang <参数>
 ```
 
 `--target` 和 `--arch` 会影响 `System.OS_TYPE` 与 `System.ARCH_TYPE`。真正的跨架构链接还需要对应的 clang、gcc 和系统库。
 
 ## 内存管理
 
-Cang 当前主要使用手动内存管理：
+Cang 默认使用 Boehm GC 自动回收，`free` 可选用于提前释放：
 
 ```cang
 class Main()
 
 int[] values = [1, 2, 3]
-Point p = new Point()
-free values, p
+System.gc()        # 手动触发一次回收（可选）
+
+# 也可以提前释放
+free values
+```
+
+编译开关：
+
+```powershell
+Cang app.cang              # 默认 Boehm GC（GC_malloc 静态链接）
+Cang app.cang --no-gc      # 切回纯手动 free 模式
 ```
 
 重要限制：
 
-- 没有完整自动 GC；
-- 对象别名可能导致 use-after-free；
-- 对象字段不会自动递归释放；
-- 字符串字面量来自常量池，不能手动 `free`；
-- malloc 失败处理和运行时安全性仍不完善。
+- GC 模式下 `free` 映射为 `GC_free`，对象别名下提前 `free` 仍可能 use-after-free；
+- 字符串字面量来自常量池，不能 `free`；
+- 含 `Thread.spawn` 的程序自动降级为手动分配（线程栈尚未注册 GC）；
+- Linux GC 库已就位但端到端链接依赖本机 WSL；macOS 目标编译尚未实现。
 
 ## 标准库
 
@@ -211,7 +240,7 @@ Cang 目前不应被视为稳定语言或生产级编译器，主要限制包括
 - lambda 不支持捕获外部变量；
 - 异常系统目前只覆盖第一版同函数控制流场景；
 - 数组越界和空指针等部分运行时错误仍可能直接终止程序；
-- 手动内存管理存在别名和生命周期风险；
+- 在别名场景下提前 `free` 存在 use-after-free 风险；
 - Unicode、非 ASCII 字符串和跨平台细节仍需持续完善；
 - 编译器当前主要通过字符串拼接生成 LLVM IR，鲁棒性和优化能力有限；
 - 包管理、LSP、格式化工具、调试器和成熟 IDE 支持尚未完善。

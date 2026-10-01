@@ -1,0 +1,3 @@
+func int bad(int[] a) { return 0 }
+int[] arr = [1, 2]
+Thread<int> t = Thread.spawn(bad, arr)

@@ -1,0 +1,8 @@
+namespace cc/demo
+
+# Box - 泛型类，编译期单态化
+class Box<T>(T value)
+
+func T get() {
+    return this.value
+}

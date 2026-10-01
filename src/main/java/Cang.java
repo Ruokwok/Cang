@@ -23,12 +23,14 @@ public class Cang {
             System.exit(1);
         }
 
-        String filename = args[0];
+        String filename = resolveSourcePath(args[0]);
         boolean noLink = false;
         String target = "windows";
         String architecture = "amd64";
         String clangPath = "clang";
         String gccPath = "gcc";
+        boolean gc = true;          // Boehm GC is on by default
+        String gcLibDir = null;
 
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
@@ -37,6 +39,9 @@ public class Cang {
                 case "--arch": architecture = args[++i].toLowerCase(); break;
                 case "--clang": clangPath = args[++i]; break;
                 case "--gcc": gccPath = args[++i]; break;
+                case "--gc": gc = true; break;
+                case "--no-gc": gc = false; break;
+                case "--gc-lib": gcLibDir = args[++i]; break;
             }
         }
 
@@ -45,7 +50,7 @@ public class Cang {
 
         String llFile;
         try {
-            llFile = compile(filename, sourceCode, noLink, target, architecture);
+            llFile = compile(filename, sourceCode, noLink, target, architecture, gc);
         } catch (CompileError e) {
             System.err.println(e.format());
             System.exit(1);
@@ -62,17 +67,17 @@ public class Cang {
             return;
         }
 
-        String baseName = filename.replaceAll("\\.[^.]+$", "");
+        String baseName = outputFileBase(filename);
         switch (target) {
-            case "windows": compileWindows(llFile, baseName, clangPath, gccPath); break;
-            case "linux":   compileLinux(llFile, baseName); break;
-            case "macos":   compileMacOS(llFile, baseName); break;
+            case "windows": compileWindows(llFile, baseName, clangPath, gccPath, gc, gcLibDir); break;
+            case "linux":   compileLinux(llFile, baseName, gc, gcLibDir); break;
+            case "macos":   compileMacOS(llFile, baseName, gc, gcLibDir); break;
             default:
                 System.exit(1);
         }
     }
 
-    private static String compile(String filename, String code, boolean noLink, String target, String architecture) throws IOException {
+    private static String compile(String filename, String code, boolean noLink, String target, String architecture, boolean gc) throws IOException {
         long startTime = System.currentTimeMillis();
 
         // 1. Lexing
@@ -113,6 +118,7 @@ public class Cang {
         codegen.setSourceFile(filename);
         codegen.setTargetPlatform(target);
         codegen.setTargetArchitecture(architecture);
+        codegen.setGcEnabled(gc);
         String llvmIR;
         try {
             llvmIR = codegen.generate(fullProgram);
@@ -124,7 +130,7 @@ public class Cang {
         long genTime = System.currentTimeMillis() - genStart;
 
         // Write .ll file
-        String baseName = filename.replaceAll("\\.[^.]+$", "");
+        String baseName = outputFileBase(filename);
         String llFile = baseName + ".ll";
         Files.writeString(Path.of(llFile), llvmIR);
         long llLines = llvmIR.split("\n").length;
@@ -450,7 +456,7 @@ public class Cang {
     /** Standard library files shipped as classpath resources inside the packaged jar. */
     private static final String[] BUNDLED_STDLIB_FILES = {
         "Object.cang", "Stdout.cang", "String.cang", "Math.cang",
-        "System.cang", "Function.cang", "Void.cang", "Error.cang"
+        "System.cang", "Function.cang", "Void.cang", "Thread.cang", "Error.cang"
     };
 
     /**
@@ -653,7 +659,7 @@ public class Cang {
     }
 
     private static void compileWindows(String llFile, String baseName,
-                                        String clangPath, String gccPath) throws IOException, InterruptedException {
+                                        String clangPath, String gccPath, boolean gc, String gcLibDir) throws IOException, InterruptedException {
         String objFile = baseName + ".o";
         String exeFile = baseName + ".exe";
 
@@ -679,6 +685,23 @@ public class Cang {
         System.out.println("      clang: " + clangPath);
         System.out.println("      gcc:   " + gccPath);
 
+        List<String> linkArgs = new ArrayList<>();
+        linkArgs.add(gccPath);
+        linkArgs.add(objFile);
+        linkArgs.add("-o");
+        linkArgs.add(exeFile);
+        if (gc) {
+            String dir = findGcLibDir("windows", gcLibDir);
+            if (dir == null) {
+                System.err.println("error: --gc requires Boehm GC static library libgc.a");
+                System.err.println("       provide it at runtime/boehm/windows-amd64/lib/libgc.a or pass --gc-lib <dir>");
+                System.exit(1);
+            }
+            linkArgs.add("-L" + dir);
+            linkArgs.add("-lgc");
+            System.out.println("      gc:     " + dir);
+        }
+
         long t1 = System.currentTimeMillis();
         System.out.print("      Compiling .ll -> .o ... ");
         ProcessBuilder pb1 = new ProcessBuilder(clangPath,
@@ -698,7 +721,7 @@ public class Cang {
 
         long t2 = System.currentTimeMillis();
         System.out.print("      Linking .o -> .exe ... ");
-        ProcessBuilder pb2 = new ProcessBuilder(gccPath, objFile, "-o", exeFile);
+        ProcessBuilder pb2 = new ProcessBuilder(linkArgs);
         pb2.redirectErrorStream(true);
         pb2.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         if (pb2.start().waitFor() == 0) {
@@ -707,11 +730,35 @@ public class Cang {
             System.out.println("[OK] Compiled: " + exeFile);
         } else {
             System.out.println("FAILED");
-            ProcessBuilder pbDebug = new ProcessBuilder(gccPath, objFile, "-o", exeFile);
+            ProcessBuilder pbDebug = new ProcessBuilder(linkArgs);
             pbDebug.inheritIO();
             pbDebug.start().waitFor();
             System.exit(1);
         }
+    }
+
+    /** Locate a Boehm GC static library directory for --gc linking. */
+    private static String findGcLibDir(String target, String override) {
+        List<String> candidates = new ArrayList<>();
+        if (override != null) candidates.add(override);
+        String cwd = System.getProperty("user.dir");
+        candidates.add(cwd + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib");
+        candidates.add(cwd + File.separator + ".." + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib");
+        if (target.equals("windows")) {
+            // Development build fallback produced from the bundled bdwgc sources.
+            candidates.add(cwd + File.separator + "target" + File.separator + "boehm-build" + File.separator + "bdwgc");
+        }
+        for (String dir : candidates) {
+            if (dir == null) continue;
+            if (new File(dir, "libgc.a").isFile()) {
+                try {
+                    return new File(dir).getCanonicalPath();
+                } catch (IOException e) {
+                    return dir;
+                }
+            }
+        }
+        return null;
     }
 
     private static String findTool(String toolName, String[] candidates) {
@@ -729,15 +776,27 @@ public class Cang {
         return toolName;
     }
 
-    private static void compileLinux(String llFile, String baseName) throws IOException, InterruptedException {
+    private static void compileLinux(String llFile, String baseName, boolean gc, String gcLibDir) throws IOException, InterruptedException {
         String exeFile = baseName;
         String wslLlFile = toWslPath(llFile);
         String wslExeFile = toWslPath(exeFile);
 
+        String gcArgs = "";
+        if (gc) {
+            String dir = findGcLibDir("linux", gcLibDir);
+            if (dir == null) {
+                System.err.println("error: --gc for Linux requires Boehm GC static library libgc.a");
+                System.err.println("       provide it at runtime/boehm/linux-amd64/lib/libgc.a or pass --gc-lib <dir>");
+                System.err.println("       (the library must be built for the Linux target, not Windows)");
+                System.exit(1);
+            }
+            gcArgs = " -L\"" + toWslPath(dir) + "\" -lgc";
+        }
+
         System.out.println("Compiling for Linux via WSL...");
         ProcessBuilder pb = new ProcessBuilder("wsl",
             "sh", "-c",
-            "clang -target x86_64-unknown-linux-gnu -fuse-ld=lld \"" + wslLlFile + "\" -o \"" + wslExeFile + "\"");
+            "clang -target x86_64-unknown-linux-gnu -fuse-ld=lld \"" + wslLlFile + "\"" + gcArgs + " -o \"" + wslExeFile + "\"");
         pb.inheritIO();
         if (pb.start().waitFor() == 0) {
             System.out.println("Success: " + exeFile + " (Linux ELF)");
@@ -747,7 +806,11 @@ public class Cang {
         }
     }
 
-    private static void compileMacOS(String llFile, String baseName) throws IOException, InterruptedException {
+    private static void compileMacOS(String llFile, String baseName, boolean gc, String gcLibDir) throws IOException, InterruptedException {
+        if (gc && findGcLibDir("macos", gcLibDir) == null) {
+            System.err.println("error: --gc for macOS requires Boehm GC static library libgc.a");
+            System.err.println("       provide it at runtime/boehm/macos-amd64/lib/libgc.a or pass --gc-lib <dir>");
+        }
         System.exit(1);
     }
 
@@ -758,5 +821,42 @@ public class Cang {
             p = "/mnt/" + drive + p.substring(2);
         }
         return p;
+    }
+
+    /**
+     * Resolve a Cang source argument:
+     *   cc/ruok/Main        -> src/cc/ruok/Main.cang (preferred, namespace under src/)
+     *   cc/ruok/Main.cang   -> src/cc/ruok/Main.cang (preferred)
+     *   test/foo.cang       -> test/foo.cang (direct path fallback, keeps old workflows)
+     */
+    private static String resolveSourcePath(String arg) {
+        String withExt = arg.endsWith(".cang") ? arg : arg + ".cang";
+        String normalized = withExt.replace('\\', '/');
+        String flat = normalized.replace('/', File.separatorChar);
+        String direct = arg.replace('\\', '/').replace('/', File.separatorChar);
+        String[] candidates = {
+            "src" + File.separator + flat,
+            flat,
+            direct
+        };
+        java.util.List<String> searched = new java.util.ArrayList<>();
+        for (String c : candidates) {
+            if (new File(c).isFile()) return c;
+            if (!searched.contains(c)) searched.add(c);
+        }
+        System.err.println("error: cannot find source: " + arg);
+        for (String c : searched) System.err.println("  searched: " + c);
+        System.exit(1);
+        return null;
+    }
+
+    /** Build artifacts always go to target/<source name> (e.g. target/Main.exe). */
+    private static String outputFileBase(String sourceFile) {
+        String simple = new File(sourceFile).getName();
+        if (simple.endsWith(".cang")) simple = simple.substring(0, simple.length() - ".cang".length());
+        try {
+            Files.createDirectories(Path.of("target"));
+        } catch (IOException ignored) {}
+        return "target" + File.separator + simple;
     }
 }

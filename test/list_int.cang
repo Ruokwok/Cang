@@ -1,0 +1,14 @@
+import cang/lang/List
+
+class Main()
+List<int> list = new List<>()
+for (int i = 0; i < 20; i++) {
+    list.add(i)
+}
+Stdout.println(list.size())
+Stdout.println(list.get(19))
+int sum = 0
+for (int value : list) {
+    sum = sum + value
+}
+Stdout.println(sum)

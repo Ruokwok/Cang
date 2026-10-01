@@ -1,0 +1,31 @@
+namespace cang/lang
+
+# List<T> - 编译器内建动态数组。
+# 字段和方法用于 IDE/类型提示；运行时实现由 LLVMGen 内建生成。
+class List<T>()
+
+# 内部存储字段（由编译器内建实现管理）
+T[] _data
+int _size
+int _capacity
+
+# 当前元素数量
+native func int size()
+
+# 按下标读取元素
+native func T get(int index)
+
+# 追加元素，必要时自动扩容，返回新元素的下标
+native func int add(T value)
+
+# 删除指定下标的元素，返回被删除的元素
+native func T remove(int index)
+
+# 判断列表是否包含指定元素
+native func bool contains(T value)
+
+# 清空列表
+native func void clear()
+
+# 是否为空
+native func bool isEmpty()

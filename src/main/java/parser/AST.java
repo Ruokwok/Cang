@@ -168,9 +168,13 @@ public abstract class AST {
 
     public static class NewExpr extends AST {
         public String className;
+        public List<String> typeArgs;
         public List<AST> args;
         public NewExpr(String className, List<AST> args, int line) {
-            super(line); this.className = className; this.args = args;
+            this(className, new ArrayList<>(), args, line);
+        }
+        public NewExpr(String className, List<String> typeArgs, List<AST> args, int line) {
+            super(line); this.className = className; this.typeArgs = typeArgs; this.args = args;
         }
     }
 
@@ -351,6 +355,7 @@ public abstract class AST {
     public static class ClassDecl extends AST {
         public String name;
         public String superClass;
+        public List<String> genericParams;
         public List<AST> members;
         public List<Parameter> ctorParams; // constructor params (implicit ctor)
         public List<AST> topLevelBody; // for entry-point class (no braces): rest of file
@@ -358,14 +363,14 @@ public abstract class AST {
         public List<AST> superArgs; // parent constructor arguments
         public String namespace = ""; // namespace from its source file (e.g. "cang/lang")
         public ClassDecl(String name, String superClass, List<AST> members, int line) {
-            super(line); this.name = name; this.superClass = superClass; this.members = members;
+            super(line); this.name = name; this.superClass = superClass; this.genericParams = new ArrayList<>(); this.members = members;
             this.ctorParams = new ArrayList<>();
             this.topLevelBody = new ArrayList<>();
             this.isEntryPoint = false;
             this.superArgs = new ArrayList<>();
         }
         public ClassDecl(String name, String superClass, List<AST> members, List<Parameter> ctorParams, int line) {
-            super(line); this.name = name; this.superClass = superClass; this.members = members;
+            super(line); this.name = name; this.superClass = superClass; this.genericParams = new ArrayList<>(); this.members = members;
             this.ctorParams = ctorParams;
             this.topLevelBody = new ArrayList<>();
             this.isEntryPoint = false;

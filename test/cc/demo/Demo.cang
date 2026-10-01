@@ -1,0 +1,247 @@
+# Cang 综合演示项目
+namespace cc/demo
+
+import cang/lang/Error
+import cc/demo/Point
+import cc/demo/Circle
+import cc/demo/Box
+import cc/demo/NotFound
+
+class Demo()
+
+# ==================== 方法定义 ====================
+
+# 静态方法（支持默认参数）
+static func int addN(int a, int b = 10) {
+    return a + b
+}
+
+# 静态方法，作为 Function 值传递
+static func void show(int v) {
+    Stdout.println(v)
+}
+
+# 接收 Function 的静态方法
+static func void callOne(Function<Void, int> f) {
+    f(7)
+}
+
+# 实例方法
+func int doubleIt(int x) {
+    return x * 2
+}
+
+func void runFn(Function<Void> f) {
+    f()
+}
+
+func void helloFromThis() {
+    Stdout.println("hello from this::")
+}
+
+# 演示 this:: 与 object:: 方法引用
+func void runRefs() {
+    this.runFn(this::helloFromThis)
+    var other = new Demo()
+    this.runFn(other::helloFromThis)
+}
+
+# ==================== 逻辑代码 ====================
+
+Stdout.println("=== Cang demo start ===")
+
+# ---------- 变量与基本类型 ----------
+int a = 17
+int b = 5
+final int LIMIT = 3
+long big = 1234567890L
+float ff = 2.5f
+double dd = 3.14159
+byte bt = 65b
+bool flag = a > b
+var inferred = 42
+
+Stdout.println(a)
+Stdout.println(big)
+Stdout.println(ff)
+Stdout.println(dd)
+Stdout.println(bt)
+Stdout.println(flag)
+Stdout.println(inferred)
+
+# ---------- 运算符与表达式 ----------
+Stdout.println(a + b)
+Stdout.println(a % b)
+Stdout.println(a // b)
+int tern = a > b ? a : b
+Stdout.println(tern)
+int u = 5
+u++
+u--
+Stdout.println(u)
+Stdout.println(flag && a != b)
+Stdout.println(!flag)
+
+# ---------- 字符串 str / String ----------
+string s1 = 'single'
+String s2 = "double"
+String s3 = `line one
+line two`
+Stdout.println(s1)
+Stdout.println(s2)
+Stdout.println(s3)
+Stdout.println(s1 == "single")
+Stdout.println(s2 != "double")
+Stdout.println("count: " + a)
+String boxed = new String(s1)
+Stdout.println(boxed)
+Stdout.println(string(42))
+Stdout.println(int("42") + 8)
+
+# ---------- 控制流 ----------
+if (a > 10) {
+    Stdout.println("a > 10")
+} else if (a > 5) {
+    Stdout.println("a > 5")
+} else {
+    Stdout.println("a <= 5")
+}
+
+int w = 0
+while (w < LIMIT) {
+    w++
+}
+Stdout.println(w)
+
+int sum = 0
+for (int i = 0; i <= LIMIT; i++) {
+    if (i == 2) continue
+    if (i == 99) break
+    sum = sum + i
+}
+Stdout.println(sum)
+
+switch (b) {
+    case 4:
+        Stdout.println("four")
+    case 5:
+        Stdout.println("five")
+    default:
+        Stdout.println("other")
+}
+
+# ---------- 数组 ----------
+int[] arr = [1, 2, 3, 4]
+Stdout.println(arr.length())
+arr[0] = 10
+Stdout.println(arr[0])
+int total = 0
+for (int v : arr) {
+    total = total + v
+}
+Stdout.println(total)
+
+int[3] fixed = [7, 8, 9]
+Stdout.println(fixed[2])
+
+int[][] mat = [[1, 2], [3, 4]]
+Stdout.println(mat.length())
+Stdout.println(mat[1][0])
+for (int[] row : mat) {
+    for (int x : row) {
+        Stdout.print(x)
+    }
+}
+Stdout.println("")
+
+int[] garbage = [100, 200]
+free garbage
+Stdout.println("array freed")
+
+# ---------- 类、继承与多态 ----------
+Point p = new Point(3, 4)
+Stdout.println(p.sum())
+Stdout.println(p.x)
+
+Circle c = new Circle(1, 2, 3)
+Stdout.println(c.kind())
+Stdout.println(c.r)
+Stdout.println(c.areaApprox())
+
+Point poly = new Circle(5, 6, 7)
+Stdout.println(poly.kind())
+Stdout.println(poly like Circle)
+Stdout.println(poly like Point)
+
+Point np = null
+Stdout.println(np)
+
+# ---------- 静态方法与默认参数 ----------
+Stdout.println(Demo.addN(5))
+Stdout.println(Demo.addN(5, 2))
+
+var demo = new Demo()
+Stdout.println(demo.doubleIt(21))
+
+# ---------- Function：lambda / 静态引用 / this 引用 / 对象引用 ----------
+Demo.callOne((i) -> void {
+    Stdout.println("lambda got " + i)
+})
+Demo.callOne(Demo::show)
+demo.runRefs()
+
+# ---------- 异常：throw / try / catch / finally ----------
+try {
+    throw new NotFound("item missing")
+} catch (NotFound e) {
+    Stdout.println(e.message)
+} finally {
+    Stdout.println("finally ran")
+}
+
+try {
+    throw new Error("plain failure")
+} catch (Error e) {
+    Stdout.println(e.message)
+}
+
+# ---------- Math ----------
+Stdout.println(Math.PI > 3.14)
+Stdout.println(Math.abs(-7))
+Stdout.println(Math.max(3, 8))
+Stdout.println(Math.min(3, 8))
+Stdout.println(Math.sqrt(9.0))
+Stdout.println(Math.pow(2.0, 3.0))
+Stdout.println(Math.floor(2.9))
+Stdout.println(Math.ceil(2.1))
+Stdout.println(Math.round(2.6))
+Stdout.println(Math.sin(0.0))
+Stdout.println(Math.cos(0.0))
+Stdout.println(Math.log(Math.E))
+double rnd = Math.random()
+Stdout.println(rnd >= 0.0 && rnd < 1.0)
+
+# ---------- System ----------
+Stdout.println(System.OS_TYPE)
+Stdout.println(System.ARCH_TYPE)
+long now = System.currentTimeMillis()
+Stdout.println(now > 0)
+Stdout.println(System.getenv("CANG_NO_SUCH_VAR"))
+Stdout.println(System.ARGS[0])
+int argCount = 0
+for (String arg : System.ARGS) {
+    argCount = argCount + 1
+}
+Stdout.println(argCount >= 1)
+
+# ---------- 泛型类（单态化） ----------
+Box<String> box = new Box<>("boxed value")
+Stdout.println(box.get())
+
+# ---------- 手动内存管理 ----------
+Point temp = new Point(9, 9)
+Stdout.println(temp.sum())
+free temp
+Stdout.println("temp freed")
+
+Stdout.println("=== Cang demo end ===")

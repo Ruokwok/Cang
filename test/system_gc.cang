@@ -1,0 +1,5 @@
+class Main()
+int[] a = [1, 2, 3]
+System.gc()
+Stdout.println(a.length())
+Stdout.println("system.gc ok")

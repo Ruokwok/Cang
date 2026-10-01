@@ -1,0 +1,15 @@
+func int addOne(int value) {
+    return value + 1
+}
+
+func int addTwo(int left, int right) {
+    return left + right
+}
+
+Thread<int> worker = Thread.spawn(addOne, 41)
+Thread<int> pair = Thread.spawn(addTwo, 20, 22)
+int first = worker.join()
+int second = pair.join()
+
+Stdout.println(first)
+Stdout.println(second)

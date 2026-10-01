@@ -1,0 +1,15 @@
+import cang/lang/Error
+
+class Main()
+Point p = null
+try {
+    p.get()
+} catch (Error e) {
+    Stdout.println(e.message)
+}
+Stdout.println("after")
+
+class Point()
+func void get() {
+    Stdout.println("ok")
+}

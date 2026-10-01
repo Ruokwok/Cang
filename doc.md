@@ -1,8 +1,23 @@
 # Cang 语言开发文档
 
-Cang 是一门使用 Java 编写前端、输出 LLVM IR 的编译型语言。它采用接近 Java/C 的语法，同时提供顶层逻辑代码、类、继承、静态方法、数组、函数对象和手动内存管理。
+Cang 是一门使用 Java 编写前端、输出 LLVM IR 的编译型语言。它采用接近 Java/C 的语法，同时提供顶层逻辑代码、类、继承、静态方法、数组、函数对象和 Boehm GC 自动内存管理（可选 `--no-gc` 手动模式）。
 
 本文档面向 Cang 初学者，也可作为当前编译器实现的语法和标准库参考。
+
+## Thread<T>
+
+`Thread<T>` 是编译器内建的线程句柄，使用 `Thread.spawn(function, args...)` 创建，并通过 `thread.join()` 等待并取得 `T`。
+
+- 入口必须是顶层、无捕获的普通函数标识符；
+- 结果类型 `T`：`void`、`int`、`long`、`float`、`double`、`bool`、`byte`、`String`、`str`；
+- 参数为同范围的值类型，个数任意；对象、数组、`Function`、lambda、方法引用会被明确拒绝（禁止跨线程共享可变状态）；
+- Windows：GC 模式经 `GC_CreateThread` 创建（线程由 Boehm 附着），`--no-gc` 模式用原生 `CreateThread`；`join` 使用 `WaitForSingleObject`；
+- Linux/macOS：`pthread_create`/`pthread_join`，GC 模式在线程入口调用 `GC_register_my_thread` 注册线程栈；
+- 与默认 Boehm GC 兼容，无需降级；
+- `join()` 只能调用一次，重复调用立即报错退出；线程创建失败同样报错退出；
+- 线程内异常不跨线程传播：未捕获异常会终止整个进程（与主流程一致）；线程函数内部的 `try/catch` 正常工作。
+
+验证状态：`test/thread_demo.cang`、`thread_types.cang`、`thread_gc.cang` 在 Windows/MinGW + GC 下端到端通过（含 `Thread<Void>/Thread<String>/Thread<double>`、String 参数、线程内 GC 分配与 `System.gc()`）；Linux/macOS 已验证 LLVM IR 与目标文件编译，实际链接运行需对应平台环境。
 
 > 文档基于当前编译器实现。部分高级功能仍在开发中，文末列出了已知限制。
 
@@ -38,16 +53,37 @@ javac -encoding UTF-8 -d target/classes (Get-ChildItem -Recurse src/main/java -F
 
 ### 1.3 编译 Cang 程序
 
+源码按命名空间放在 `src/` 下，直接用命名空间路径引用（自动补 `.cang` 并在 `src/` 下查找）：
+
 ```powershell
-java -cp target/classes Cang test/hello.cang
+cang cc/ruok/Main
+cang cc/ruok/Main.cang
 ```
 
-默认目标平台是 Windows。
+等价于：
+
+```powershell
+java -cp target\classes Cang cc/ruok/Main
+```
+
+产物统一输出到 `target/`：
+
+```text
+src/cc/ruok/Main.cang → target/Main.ll → target/Main.o → target/Main.exe
+```
+
+也支持直接传文件路径（兼容旧用法）：
+
+```powershell
+cang test/example.cang
+```
+
+找不到源码时会打印搜索过的候选路径。
 
 只生成 LLVM IR、不进行本地链接：
 
 ```powershell
-java -cp target/classes Cang test/hello.cang --no-link
+cang test/example.cang --no-link
 ```
 
 指定目标平台：
@@ -66,6 +102,30 @@ java -cp target/classes Cang test/hello.cang --target linux --arch aarch64
 ```
 
 `--target` 和 `--arch` 会影响 `System.OS_TYPE` 与 `System.ARCH_TYPE` 的编译期值。真正的跨架构链接还需要对应的 clang/gcc 和系统库。
+
+内存管理默认使用 Boehm GC 自动回收（静态链接，堆分配走 `GC_malloc`）：
+
+```powershell
+java -cp target/classes Cang test/hello.cang                # 默认开启 GC
+java -cp target/classes Cang test/hello.cang --no-gc        # 切回手动 free 模式
+java -cp target/classes Cang test/hello.cang --gc --gc-lib "D:\path\to\gc\lib"   # 显式指定库目录
+```
+
+手动控制回收时机：
+
+```cang
+System.gc()    # 立即触发一次垃圾回收（--no-gc 模式下为空操作）
+```
+
+GC 静态库按目标平台查找：
+
+```text
+runtime/boehm/<target>-<arch>/lib/libgc.a
+```
+
+已就位：`windows-amd64`（本机构建）与 `linux-amd64`（Ubuntu libgc-dev 取回）。macOS 目标编译尚未实现。
+
+注意：`Thread.spawn` 与默认 Boehm GC 兼容（Windows 经 `GC_CreateThread` 附着线程，posix 在线程入口注册线程栈），线程程序不需要特殊开关；对象和数组不允许作为线程参数。
 
 ---
 
@@ -747,9 +807,19 @@ for (int[] row : matrix) {
 
 ---
 
-## 12. 手动内存管理
+## 12. 内存管理
 
-Cang 当前使用手动释放堆对象和数组。
+Cang 默认使用 Boehm GC 自动回收，同时保留 `free` 作为提前释放手段。
+
+### 12.0 默认：Boehm GC 自动回收
+
+- 堆分配：`GC_malloc/GC_realloc`，main 入口自动调用 `GC_init`；
+- 不可达的数组/对象在分配压力下**自动回收**，无需业务代码干预；
+- `System.gc()` 可在任意时机手动触发一次回收；
+- 字符串常量在只读全局区，不参与 GC；
+- 加 `--no-gc` 切回纯手动模式（`malloc/free`，无人回收）；
+- 显式 `free` 在 GC 模式下映射为 `GC_free`（可提前释放，语义不变）；
+- 与 `Thread.spawn` 兼容：Windows 经 `GC_CreateThread` 附着线程，posix 在线程入口注册线程栈，无需降级。
 
 ### 12.1 free
 
@@ -1191,12 +1261,14 @@ var f = (i) -> void {
 
 ### 21.4 内存管理
 
-Cang 当前主要采用手动内存管理：
+Cang 默认采用 Boehm GC 自动回收：
 
-- 数组和对象使用 `free`；
+- 数组和对象由 GC 自动回收，`System.gc()` 可手动触发；
+- `free` 仍可用于提前释放（GC 模式下映射为 `GC_free`）；
+- `--no-gc` 可切回纯手动模式；
 - 基本类型使用栈槽位；
 - 字符串字面量由常量池管理；
-- 尚未提供完整自动 GC。
+- 线程与 GC 已兼容，但对象/数组不允许跨线程传递，线程间异常不传播。
 
 ---
 

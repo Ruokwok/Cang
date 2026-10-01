@@ -82,6 +82,8 @@ public class LLVMGen {
     private int strCount = 0;
 
     private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
+    private final Map<String, ClassDecl> genericTemplates = new LinkedHashMap<>();
+    private final Map<String, String> genericTypeOwners = new LinkedHashMap<>();
     private final Map<String, FuncInfo> functions = new LinkedHashMap<>();
     private final Map<String, String> stringLiterals = new LinkedHashMap<>(); // text 閳?global name
     private final List<LoopContext> loopStack = new ArrayList<>();
@@ -90,6 +92,7 @@ public class LLVMGen {
     private Scope scope;
     private String currentClassName;
     private String currentFuncReturnType = "void";
+    private String currentGcFrame = null;
     private String currentNamespace = ""; // e.g. "cc/ruok/cang"
     private final List<String> imports = new ArrayList<>();
     private final Map<String, String> importedClasses = new HashMap<>(); // simpleName -> fullName
@@ -134,6 +137,26 @@ public class LLVMGen {
         regionStraightLine = false;
     }
 
+    private void emitGcFrameSetup() {
+        currentGcFrame = null; // Automatic GC is intentionally disabled; memory is manually managed.
+    }
+
+    private void registerGcRoot(String allocaName, String llvmType) {
+        // Automatic GC is disabled; explicit free manages heap objects.
+    }
+
+    private boolean isReferenceLLVMType(String llvmType) {
+        return llvmType.equals("i8*") || llvmType.startsWith("%") && llvmType.endsWith("*");
+    }
+
+    private int gcArrayFlags(String elemType) {
+        return 5 | (isReferenceLLVMType(elemType) ? 2 : 0);
+    }
+
+    private void emitGcFramePop() {
+        currentGcFrame = null;
+    }
+
     public void setSourceFile(String file) {
         this.sourceFile = file;
     }
@@ -149,6 +172,17 @@ public class LLVMGen {
         if (value.equals("arm64")) value = "aarch64";
         this.targetArchitecture = value;
     }
+
+    // Boehm GC mode: heap allocation goes through GC_*, explicit free maps to GC_free.
+    private boolean gcEnabled = false;
+
+    public void setGcEnabled(boolean enabled) {
+        this.gcEnabled = enabled;
+    }
+
+    private String allocFn() { return gcEnabled ? "GC_malloc" : "malloc"; }
+    private String reallocFn() { return gcEnabled ? "GC_realloc" : "realloc"; }
+    private String freeFn() { return gcEnabled ? "GC_free" : "free"; }
 
     // ==================== Entry point ====================
 
@@ -209,6 +243,7 @@ public class LLVMGen {
             }
         }
 
+        prepareGenericMonomorphization(program.members);
         List<ClassDecl> classDecls = new ArrayList<>();
         List<AST> topLevelFuncs = new ArrayList<>();
         List<AST> mainStatements = new ArrayList<>(); // top-level statements for main()
@@ -217,6 +252,10 @@ public class LLVMGen {
         for (AST member : program.members) {
             if (member instanceof ClassDecl) {
                 ClassDecl cd = (ClassDecl) member;
+                if (!cd.genericParams.isEmpty()) {
+                    if (cd.genericParams.size() != 1) throw new RuntimeException("Generic class '" + cd.name + "' must have exactly one type parameter");
+                    genericTemplates.put(cd.name, cd);
+                }
                 // Classes without explicit parent inherit from Object (but Object itself has no parent)
                 if (cd.superClass == null && !cd.name.equals("Object")) {
                     cd.superClass = "Object";
@@ -283,6 +322,8 @@ public class LLVMGen {
     private int lambdaCount = 0;
     private int thunkCount = 0;
     private int fnrefCount = 0;
+    private int threadCount = 0;
+    private int runtimeErrorCount = 0;
     // Expected Function<...> signature while generating a value used as a Function argument.
     private String expectedFunctionType = null;
 
@@ -293,6 +334,88 @@ public class LLVMGen {
     }
 
     // ==================== Pass 1: Collection ====================
+
+    private void prepareGenericMonomorphization(List<AST> members) {
+        Map<String, String> chosen = new LinkedHashMap<>();
+        for (AST root : members) collectGenericUses(root, chosen);
+        for (AST root : members) {
+            if (!(root instanceof ClassDecl)) continue;
+            ClassDecl cd = (ClassDecl) root;
+            if (cd.genericParams.isEmpty() || cd.name.equals("List") || cd.name.equals("Thread")) continue;
+            String arg = chosen.get(cd.name);
+            if (arg == null) throw new RuntimeException("Generic class '" + cd.name + "' has no concrete type argument");
+            if (arg.contains("<") || arg.contains(">") || arg.contains(",")) throw new RuntimeException("Nested generic types are not supported");
+            String specialized = cd.name + "_" + arg;
+            genericTypeOwners.put(cd.name, specialized);
+            rewriteAstTypes(cd, cd.genericParams.get(0), arg);
+            cd.name = specialized;
+            cd.genericParams.clear();
+        }
+        for (AST root : members) rewriteGenericNames(root);
+    }
+
+    private void collectGenericUses(AST node, Map<String, String> chosen) {
+        if (node == null) return;
+        if (node instanceof VarDecl) {
+            String t = ((VarDecl) node).type;
+            int lt = t.indexOf('<'), gt = t.lastIndexOf('>');
+            if (lt > 0 && gt > lt) {
+                String owner = t.substring(0, lt);
+                // Array<T> and Function<...> are built-in internal types, not generic classes.
+                if (owner.equals("Array") || owner.equals("Function") || owner.equals("List") || owner.equals("Thread")) {
+                    // Continue walking child AST nodes without recording a class specialization.
+                } else {
+                String arg = t.substring(lt + 1, gt);
+                String previous = chosen.putIfAbsent(owner, arg);
+                if (previous != null && !previous.equals(arg)) {
+                    throw new RuntimeException("Generic class '" + owner + "' is used with conflicting type arguments '" + previous + "' and '" + arg + "'");
+                }
+                }
+            }
+        }
+        if (node instanceof NewExpr) {
+            NewExpr n = (NewExpr) node;
+            if (!n.typeArgs.isEmpty()) chosen.put(n.className, n.typeArgs.get(0));
+        }
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) collectGenericUses((AST) v, chosen);
+                else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) collectGenericUses((AST) x, chosen);
+            } catch (IllegalAccessException ignored) { }
+        }
+    }
+
+    private void rewriteAstTypes(AST node, String parameter, String concrete) {
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof String && (f.getName().equals("type") || f.getName().equals("returnType"))) {
+                    if (v.equals(parameter)) f.set(node, concrete);
+                } else if (v instanceof AST) rewriteAstTypes((AST) v, parameter, concrete);
+                else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) rewriteAstTypes((AST) x, parameter, concrete);
+            } catch (IllegalAccessException ignored) { }
+        }
+    }
+
+    private void rewriteGenericNames(AST node) {
+        if (node instanceof VarDecl) {
+            VarDecl v = (VarDecl) node;
+            for (Map.Entry<String, String> e : genericTypeOwners.entrySet())
+                if (!e.getKey().equals("List") && v.type.startsWith(e.getKey() + "<")) v.type = e.getValue();
+        } else if (node instanceof NewExpr) {
+            NewExpr n = (NewExpr) node;
+            String owner = genericTypeOwners.get(n.className);
+            if (owner != null && !n.className.equals("List")) n.className = owner;
+        }
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) rewriteGenericNames((AST) v);
+                else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) rewriteGenericNames((AST) x);
+            } catch (IllegalAccessException ignored) { }
+        }
+    }
 
     private void collectClass(ClassDecl decl) {
         ClassInfo info = new ClassInfo();
@@ -667,6 +790,7 @@ public class LLVMGen {
 
         // External declarations
         header.append("declare i8* @malloc(i64)\n");
+        header.append("declare i8* @realloc(i8*, i64)\n");
         header.append("declare void @free(i8*)\n");
         header.append("declare i32 @printf(i8*, ...)\n");
         header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
@@ -675,6 +799,21 @@ public class LLVMGen {
         header.append("declare i32 @atoi(i8*)\n");
         header.append("declare i32 @sscanf(i8*, i8*, ...)\n");
         header.append("declare double @atof(i8*)\n");
+        if (gcEnabled) {
+            header.append("declare void @GC_gcollect()\n");
+            header.append("declare void @GC_init()\n");
+            header.append("declare i8* @GC_malloc(i64)\n");
+            header.append("declare i8* @GC_realloc(i8*, i64)\n");
+            header.append("declare void @GC_free(i8*)\n");
+            header.append("declare i32 @GC_get_stack_base(i8*)\n");
+            header.append("declare i32 @GC_register_my_thread(i8*)\n");
+            header.append("declare i32 @GC_unregister_my_thread(i8*)\n");
+            header.append("declare i8* @GC_CreateThread(i8*, i64, i32 (i8*)*, i8*, i32, i32*)\n");
+        }
+        if (!targetPlatform.equals("windows")) {
+            header.append("declare i32 @pthread_create(i8**, i8*, i8* (i8*)*, i8*)\n");
+            header.append("declare i32 @pthread_join(i64, i8**)\n");
+        }
         header.append("@math.seed = global i64 1\n");
         header.append("declare double @llvm.fabs.f64(double)\n");
         header.append("declare float @llvm.fabs.f32(float)\n");
@@ -698,6 +837,11 @@ public class LLVMGen {
         header.append("declare void @cang_throw(i8*)\n");
         header.append("declare i8* @getenv(i8*)\n");
         header.append("declare i64 @time(i64*)\n");
+        if (targetPlatform.equals("windows")) {
+            header.append("declare i8* @CreateThread(i8*, i64, i32 (i8*)*, i8*, i32, i32*)\n");
+            header.append("declare i32 @WaitForSingleObject(i8*, i32)\n");
+            header.append("declare i32 @CloseHandle(i8*)\n");
+        }
         header.append("declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)\n");
         header.append("declare void @llvm.memset.p0i8.p0i8.i64(i8*, i8, i64, i1)\n\n");
 
@@ -708,6 +852,11 @@ public class LLVMGen {
         header.append("@.str.null.p = private constant [5 x i8] c\"null\\00\"\n");
         header.append("@.stack_depth = global i32 0\n");
         header.append("@system.args = global i8* null\n\n");
+
+
+
+        // Manual memory management is used by the current runtime.
+        // Heap objects and arrays are allocated directly with malloc and released by free.
 
         // Runtime error function (for future use)
         header.append("define void @cang_error(i8* %msg, i8* %file, i32 %line) {\n");
@@ -741,7 +890,9 @@ public class LLVMGen {
         header.append("\n");
 
         // Function object: { code pointer, receiver/environment }
-        header.append("%CangFunction = type { i8*, i8* }\n\n");
+        header.append("%CangFunction = type { i8*, i8* }\n");
+        header.append("%CangThreadHandle = type { i64, i8*, i32 }\n");
+        header.append("%CangList = type { i8*, i64, i64 }\n\n");
 
         // Object constructor (no-op)
         header.append("define void @cang_lang_Object.constructor(%cang_lang_Object* %this) {\n");
@@ -874,6 +1025,7 @@ public class LLVMGen {
 
         scope = new Scope(null);
         beginRegion();
+        emitGcFrameSetup();
         scope.define("this", new LLVMValue("%this", "%" + fullName + "*"));
         currentFuncReturnType = "void";
 
@@ -886,6 +1038,7 @@ public class LLVMGen {
                  .append(", ").append(pType).append("* ").append(allocaName).append("\n");
             scope.define(p.name, new LLVMValue(allocaName, pType,
                 semanticKindOf(p.type)));
+            registerGcRoot(allocaName, pType);
             if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
                 trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
             }
@@ -944,6 +1097,7 @@ public class LLVMGen {
         }
 
         endRegionCleanup();
+        emitGcFramePop();
         body.append("  ret void\n");
         body.append("}\n\n");
         scope = null;
@@ -964,6 +1118,7 @@ public class LLVMGen {
 
         scope = new Scope(null);
         beginRegion();
+        emitGcFrameSetup();
         // Define 'this'
         scope.define("this", new LLVMValue("%this", "%" + fullName + "*"));
         currentFuncReturnType = "void";
@@ -977,6 +1132,7 @@ public class LLVMGen {
                  .append(", ").append(pLLVMType).append("* ").append(allocaName).append("\n");
             scope.define(p.name, new LLVMValue(allocaName, pLLVMType,
                 semanticKindOf(p.type)));
+            registerGcRoot(allocaName, pLLVMType);
             if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
                 trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
             }
@@ -1046,6 +1202,7 @@ public class LLVMGen {
         scope = new Scope(null);
         tmpCount = 0;
         currentFuncReturnType = decl.returnType;
+        emitGcFrameSetup();
 
         if (className != null && !decl.isStatic) {
             scope.define("this", new LLVMValue("%this", "%" + className + "*"));
@@ -1060,6 +1217,7 @@ public class LLVMGen {
                  .append(", ").append(pLLVMType).append("* ").append(allocaName).append("\n");
             scope.define(p.name, new LLVMValue(allocaName, pLLVMType,
                 semanticKindOf(p.type)));
+            registerGcRoot(allocaName, pLLVMType);
             if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
                 trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
             }
@@ -1155,6 +1313,47 @@ public class LLVMGen {
         }
     }
 
+    /** Raise a runtime Error at a check site, then continue through an unreachable dead block. */
+    private void emitRuntimeError(String message, int line, String continuationLabel) {
+        if (classes.get("Error") == null) {
+            emitFatalError(message, line, continuationLabel);
+            return;
+        }
+        List<AST> args = new ArrayList<>();
+        args.add(new StringLit(message, line));
+        LLVMValue error = generateNew(new NewExpr("Error", args, line));
+        String raw = "%runtime.error." + tmpCount++;
+        body.append("  ").append(raw).append(" = bitcast ").append(error.type).append(" ").append(error.value).append(" to i8*\n");
+        body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
+        if (exceptionHandlers.isEmpty()) {
+            emitUncaughtError(line);
+        } else {
+            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+        }
+        // Unreachable continuation so following code keeps forming a valid block.
+        body.append("runtime.error.dead.").append(runtimeErrorCount++).append(":\n");
+        body.append("  br label %").append(continuationLabel).append("\n");
+    }
+
+    /**
+     * Always-fatal runtime error (print + exit), for unrecoverable conditions such as
+     * double join or thread creation failure. Never routed through catch handlers.
+     */
+    private void emitFatalError(String message, int line, String continuationLabel) {
+        int id = runtimeErrorCount++;
+        String msg = ensureStringConstant("@.str.rterror." + id, message + "\\0A\\00", message.length() + 2);
+        String file = ensureStringConstant("@.str.rtfile." + id, sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+        ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0), i8* ")
+             .append(msg).append(")\n");
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* @.str.locfmt, i32 0, i32 0), i8* ")
+             .append(file).append(", i32 ").append(line).append(")\n");
+        body.append("  call void @exit(i32 1)\n");
+        body.append("  unreachable\n");
+        body.append("runtime.error.dead.").append(id).append(":\n");
+        body.append("  br label %").append(continuationLabel).append("\n");
+    }
+
     private void generateThrow(ThrowStmt stmt) {
         LLVMValue value = generateExpr(stmt.value);
         if (!(value.type.endsWith("*") && value.type.startsWith("%"))) {
@@ -1165,6 +1364,7 @@ public class LLVMGen {
         body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
         if (exceptionHandlers.isEmpty()) {
             emitUncaughtError(stmt.line);
+            body.append("throw.dead.").append(labelCount++).append(":\n");
         } else {
             body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
             // Statements after throw are dead code but must still form a valid LLVM block.
@@ -1213,7 +1413,6 @@ public class LLVMGen {
              .append(fileName).append(", i32 ").append(line).append(")\n");
         body.append("  call void @exit(i32 1)\n");
         body.append("  unreachable\n");
-        body.append("throw.dead.").append(labelCount++).append(":\n");
     }
 
     private void generateTry(TryStmt stmt) {
@@ -1274,6 +1473,7 @@ public class LLVMGen {
             body.append("  ").append(typedSlot).append(" = alloca ").append(errorType).append("\n");
             body.append("  store ").append(errorType).append(" ").append(typed).append(", ").append(errorType).append("* ").append(typedSlot).append("\n");
             scope.define(c.name, new LLVMValue(typedSlot, errorType, c.type));
+            registerGcRoot(typedSlot, errorType);
             int catchStart = body.length();
             generateStmt(c.body);
             emitBranchIfNeeded(after, catchStart);
@@ -1305,8 +1505,8 @@ public class LLVMGen {
                 body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
             } else {
                 emitUncaughtError(stmt.line);
-                // emitUncaughtError ends with an empty dead-code label; terminate it
-                // so the shared continue label is not preceded by an empty block.
+                body.append("runtime.rethrow.dead.").append(labelCount++).append(":\n");
+                // emitUncaughtError terminates the uncaught block; continue in a dead block.
                 body.append("  br label %").append(continueLabel).append("\n");
             }
             body.append(continueLabel).append(":\n");
@@ -1353,7 +1553,7 @@ public class LLVMGen {
                     freeValue = "%free.cast." + tmpCount++;
                     body.append("  ").append(freeValue).append(" = bitcast ").append(ptr.type).append(" ").append(value).append(" to i8*\n");
                 }
-                body.append("  call void @free(i8* ").append(freeValue).append(")\n");
+                body.append("  call void @").append(freeFn()).append("(i8* ").append(freeValue).append(")\n");
                 body.append("  store ").append(ptr.type).append(" null, ").append(ptr.type).append("* ").append(ptr.value).append("\n");
             }
             freedVars.add(name);
@@ -1395,6 +1595,7 @@ public class LLVMGen {
                 String ptrName = "%v." + decl.name;
                 body.append("  ").append(ptrName).append(" = alloca i8*\n");
                 scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + lastArrayElemCangType + ">"));
+                registerGcRoot(ptrName, "i8*");
                 body.append("  store i8* ").append(arrVal.value).append(", i8** ").append(ptrName).append("\n");
                 return;
             }
@@ -1455,6 +1656,7 @@ public class LLVMGen {
                 String ptrName = "%v." + decl.name;
                 body.append("  ").append(ptrName).append(" = alloca i8*\n");
                 scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + elemCangType + ">"));
+                registerGcRoot(ptrName, "i8*");
                 body.append("  store i8* ").append(arrVal.value).append(", i8** ").append(ptrName).append("\n");
                 return;
             }
@@ -1466,8 +1668,17 @@ public class LLVMGen {
 
         body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
         scope.define(decl.name, new LLVMValue(ptrName, llvmType, semanticKindOf(cangType)));
+        registerGcRoot(ptrName, llvmType);
 
         if (decl.init != null) {
+            if (isListType(cangType) && decl.init instanceof NewExpr) {
+                NewExpr newExpr = (NewExpr) decl.init;
+                if (newExpr.typeArgs.isEmpty()) {
+                    String elemType = listElementType(cangType);
+                    newExpr.typeArgs.add(elemType);
+                }
+                newExpr.className = "List";
+            }
             String savedExpected = expectedFunctionType;
             expectedFunctionType = isFunctionType(cangType) ? cangType : null;
             LLVMValue val;
@@ -1483,7 +1694,8 @@ public class LLVMGen {
             if (isFunctionType(cangType)) {
                 checkFunctionValue(val, cangType, decl.line);
             }
-            body.append("  store ").append(llvmType).append(" ").append(castValue(val, llvmType))
+            String castedInit = castValue(val, llvmType);
+            body.append("  store ").append(llvmType).append(" ").append(castedInit)
                  .append(", ").append(llvmType).append("* ").append(ptrName).append("\n");
             // Array aliasing (e.g. Array<int> b = a): carry element type tracking over
             if (decl.init instanceof Identifier) {
@@ -1506,7 +1718,7 @@ public class LLVMGen {
         long dataSize = (long) n * elemBytes;
 
         String ptr = "%arr.fix." + tmpCount++;
-        body.append("  ").append(ptr).append(" = call i8* @malloc(i64 ").append(totalSize).append(")\n");
+        body.append("  ").append(ptr).append(" = call i8* @").append(allocFn()).append("(i64 ").append(totalSize).append(")\n");
         registerRegionAllocation(ptr);
         body.append("  store i64 ").append(n).append(", i64* ").append(ptr).append("\n");
 
@@ -1739,7 +1951,57 @@ public class LLVMGen {
      * Generate for-each: for(var i : arr)
      * Equivalent to: for(int idx=0; idx<len; idx++) { var i = arr[idx]; ... }
      */
+    private void generateListForEach(ForEachStmt stmt, LLVMValue list, String elemCang) {
+        String elemLLVM = toLLVMType(elemCang);
+        int id = labelCount++;
+        String cond = "list.foreach.cond." + id;
+        String bodyLabel = "list.foreach.body." + id;
+        String update = "list.foreach.update." + id;
+        String end = "list.foreach.end." + id;
+        String sizePtr = "%list.foreach.sizeptr." + tmpCount++;
+        String dataPtr = "%list.foreach.dataptr." + tmpCount++;
+        String indexPtr = "%list.foreach.indexptr." + tmpCount++;
+        body.append("  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
+        body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n");
+        body.append("  ").append(indexPtr).append(" = alloca i64\n  store i64 0, i64* ").append(indexPtr).append("\n");
+        body.append("  br label %").append(cond).append("\n").append(cond).append(":\n");
+        String index = "%list.foreach.index." + tmpCount++;
+        String size = "%list.foreach.size." + tmpCount++;
+        String cmp = "%list.foreach.cmp." + tmpCount++;
+        body.append("  ").append(index).append(" = load i64, i64* ").append(indexPtr).append("\n");
+        body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+        body.append("  ").append(cmp).append(" = icmp ult i64 ").append(index).append(", ").append(size).append("\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(bodyLabel).append(", label %").append(end).append("\n").append(bodyLabel).append(":\n");
+        String data = "%list.foreach.data." + tmpCount++;
+        long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+        String byteOffset = "%list.foreach.offset." + tmpCount++;
+        String slot = "%list.foreach.slot." + tmpCount++;
+        String typed = "%list.foreach.typed." + tmpCount++;
+        String value = "%list.foreach.value." + tmpCount++;
+        body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n");
+        body.append("  ").append(byteOffset).append(" = mul i64 ").append(index).append(", ").append(elemBytes).append("\n");
+        body.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(byteOffset).append("\n");
+        body.append("  ").append(typed).append(" = bitcast i8* ").append(slot).append(" to ").append(elemLLVM).append("*\n");
+        body.append("  ").append(value).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(typed).append("\n");
+        String varPtr = "%list.foreach.var." + id;
+        body.append("  ").append(varPtr).append(" = alloca ").append(elemLLVM).append("\n");
+        body.append("  store ").append(elemLLVM).append(" ").append(value).append(", ").append(elemLLVM).append("* ").append(varPtr).append("\n");
+        scope.define(stmt.varName, new LLVMValue(varPtr, elemLLVM, elemCang));
+        int start = body.length();
+        generateStmt(stmt.body);
+        emitBranchIfNeeded(update, start);
+        body.append(update).append(":\n");
+        String next = "%list.foreach.next." + tmpCount++;
+        body.append("  ").append(next).append(" = add i64 ").append(index).append(", 1\n  store i64 ").append(next).append(", i64* ").append(indexPtr).append("\n  br label %").append(cond).append("\n");
+        body.append(end).append(":\n");
+    }
+
     private void generateForEach(ForEachStmt stmt) {
+        LLVMValue iterable = generateExpr(stmt.iterable);
+        if (iterable.semanticType != null && isListType(iterable.semanticType)) {
+            generateListForEach(stmt, iterable, listElementType(iterable.semanticType));
+            return;
+        }
         int id = labelCount++;
         String condLabel = "foreach.cond." + id;
         String bodyLabel = "foreach.body." + id;
@@ -1783,6 +2045,7 @@ public class LLVMGen {
             varLLVMType = toLLVMType(stmt.varType);
         }
         body.append("  ").append(varPtr).append(" = alloca ").append(varLLVMType).append("\n");
+        registerGcRoot(varPtr, varLLVMType);
 
         // Determine element type from tracked info
         String elemType = varLLVMType;
@@ -1873,14 +2136,17 @@ public class LLVMGen {
                 }
             }
 
+            emitGcFramePop();
+            String castedRet = castValue(val, toLLVMType(retType));
             body.append("  ret ").append(toLLVMType(retType)).append(" ")
-                 .append(castValue(val, toLLVMType(retType))).append("\n");
+                 .append(castedRet).append("\n");
         } else {
             // return; with no value 鈥?only valid for void functions
             if (!retType.equals("void")) {
                 throw new RuntimeException(
                     "Function must return a value of type '" + retType + "' (at line " + stmt.line + ")");
             }
+            emitGcFramePop();
             body.append("  ret void\n");
         }
     }
@@ -2486,7 +2752,7 @@ public class LLVMGen {
 
         // malloc
         String buf = "%buf." + tmpCount++;
-        body.append("  ").append(buf).append(" = call i8* @malloc(i64 ").append(allocSize).append(")\n");
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 ").append(allocSize).append(")\n");
         registerRegionAllocation(buf);
 
         // memcpy(buf, left, lenLeft)
@@ -2513,7 +2779,7 @@ public class LLVMGen {
     private LLVMValue convertToString(LLVMValue val) {
         // Allocate buffer (enough for any number)
         String buf = "%tostr.buf." + tmpCount++;
-        body.append("  ").append(buf).append(" = call i8* @malloc(i64 64)\n");
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 64)\n");
         registerRegionAllocation(buf);
 
         String fmt;
@@ -2740,7 +3006,8 @@ public class LLVMGen {
             }
             LLVMValue ptr = scope.lookup(id.name);
             if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
-            body.append("  store ").append(ptr.type).append(" ").append(castValue(val, ptr.type))
+            String castedAssign = castValue(val, ptr.type);
+            body.append("  store ").append(ptr.type).append(" ").append(castedAssign)
                  .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
             return new LLVMValue(val.value, ptr.type);
         }
@@ -2768,8 +3035,9 @@ public class LLVMGen {
             body.append("  ").append(fieldPtr).append(" = getelementptr ").append(ci.llvmName)
                  .append(", ").append(ci.llvmName).append("* ").append(objPtr.value)
                  .append(", i32 0, i32 ").append(fieldIdx).append("\n");
+            String castedField = castValue(val, toLLVMType(fieldType));
             body.append("  store ").append(toLLVMType(fieldType)).append(" ")
-                 .append(castValue(val, toLLVMType(fieldType)))
+                 .append(castedField)
                  .append(", ").append(toLLVMType(fieldType)).append("* ").append(fieldPtr).append("\n");
             return val;
         }
@@ -2836,7 +3104,8 @@ public class LLVMGen {
              .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(idxI64).append("\n");
 
         // Store value (with cast if needed)
-        body.append("  store ").append(elemType).append(" ").append(castValue(val, elemType))
+        String castedElem = castValue(val, elemType);
+        body.append("  store ").append(elemType).append(" ").append(castedElem)
              .append(", ").append(elemType).append("* ").append(elemPtr).append("\n");
 
         return val;
@@ -3033,8 +3302,229 @@ public class LLVMGen {
         return new LLVMValue(result, llvmTargetType);
     }
 
+    private LLVMValue generateListMethod(LLVMValue list, String listType, String method, List<AST> args, int line) {
+        String elemCang = listElementType(listType);
+        String elemLLVM = toLLVMType(elemCang);
+        String dataPtr = "%list.data." + tmpCount++;
+        String sizePtr = "%list.size.ptr." + tmpCount++;
+        String capPtr = "%list.cap.ptr." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n");
+        body.append("  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
+        body.append("  ").append(capPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 2\n");
+
+        if (method.equals("isEmpty") && args.isEmpty()) {
+            String size = "%list.empty.size." + tmpCount++;
+            String result = "%list.empty.result." + tmpCount++;
+            body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+            body.append("  ").append(result).append(" = icmp eq i64 ").append(size).append(", 0\n");
+            return new LLVMValue(result, "i1");
+        }
+
+        if (method.equals("size") && args.isEmpty()) {
+            String size = "%list.size." + tmpCount++;
+            body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+            String result = "%list.size.i32." + tmpCount++;
+            body.append("  ").append(result).append(" = trunc i64 ").append(size).append(" to i32\n");
+            return new LLVMValue(result, "i32");
+        }
+
+        if (method.equals("get") && args.size() == 1) {
+            LLVMValue index = generateExpr(args.get(0));
+            String index64 = "%list.index." + tmpCount++;
+            body.append("  ").append(index64).append(" = sext i32 ").append(castValue(index, "i32")).append(" to i64\n");
+            String size = "%list.get.size." + tmpCount++;
+            body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+            String bad = "list.get.bad." + tmpCount++;
+            String ok = "list.get.ok." + tmpCount++;
+            String check = "%list.get.check." + tmpCount++;
+            body.append("  ").append(check).append(" = icmp ult i64 ").append(index64).append(", ").append(size).append("\n");
+            body.append("  br i1 ").append(check).append(", label %").append(ok).append(", label %").append(bad).append("\n");
+            body.append(bad).append(":\n");
+            emitRuntimeError("List index out of bounds", line, ok);
+            body.append(ok).append(":\n");
+            String data = "%list.get.data." + tmpCount++;
+            body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n");
+            long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+            String byteOffset = "%list.get.offset." + tmpCount++;
+            body.append("  ").append(byteOffset).append(" = mul i64 ").append(index64).append(", ").append(elemBytes).append("\n");
+            String elemPtr = "%list.get.elem." + tmpCount++;
+            body.append("  ").append(elemPtr).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(byteOffset).append("\n");
+            String typed = "%list.get.typed." + tmpCount++;
+            body.append("  ").append(typed).append(" = bitcast i8* ").append(elemPtr).append(" to ").append(elemLLVM).append("*\n");
+            String result = "%list.get." + tmpCount++;
+            body.append("  ").append(result).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(typed).append("\n");
+            return new LLVMValue(result, elemLLVM, elemCang);
+        }
+
+        if (method.equals("add") && args.size() == 1) {
+            LLVMValue value = generateCallArg(args.get(0), elemCang, line);
+            String size = "%list.add.size." + tmpCount++;
+            String capacity = "%list.add.capacity." + tmpCount++;
+            body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+            body.append("  ").append(capacity).append(" = load i64, i64* ").append(capPtr).append("\n");
+            String needs = "%list.add.needs." + tmpCount++;
+            body.append("  ").append(needs).append(" = icmp uge i64 ").append(size).append(", ").append(capacity).append("\n");
+            int id = labelCount++;
+            String grow = "list.grow." + id;
+            String append = "list.append." + id;
+            String done = "list.add.done." + id;
+            body.append("  br i1 ").append(needs).append(", label %").append(grow).append(", label %").append(append).append("\n");
+            body.append(grow).append(":\n");
+            String newCap = "%list.newcap." + tmpCount++;
+            body.append("  ").append(newCap).append(" = add i64 ").append(capacity).append(", 8\n");
+            String oldData = "%list.olddata." + tmpCount++;
+            body.append("  ").append(oldData).append(" = load i8*, i8** ").append(dataPtr).append("\n");
+            String bytes = "%list.bytes." + tmpCount++;
+            long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+            body.append("  ").append(bytes).append(" = mul i64 ").append(newCap).append(", ").append(elemBytes).append("\n");
+            String resized = "%list.resized." + tmpCount++;
+            body.append("  ").append(resized).append(" = call i8* @").append(reallocFn()).append("(i8* ").append(oldData).append(", i64 ").append(bytes).append(")\n");
+            body.append("  store i8* ").append(resized).append(", i8** ").append(dataPtr).append("\n");
+            body.append("  store i64 ").append(newCap).append(", i64* ").append(capPtr).append("\n");
+            body.append("  br label %").append(append).append("\n");
+            body.append(append).append(":\n");
+            String data = "%list.add.data." + tmpCount++;
+            body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n");
+            String byteOffset = "%list.add.offset." + tmpCount++;
+            body.append("  ").append(byteOffset).append(" = mul i64 ").append(size).append(", ").append(elemBytes).append("\n");
+            String slot = "%list.add.slot." + tmpCount++;
+            body.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(byteOffset).append("\n");
+            String typedSlot = "%list.add.typed." + tmpCount++;
+            body.append("  ").append(typedSlot).append(" = bitcast i8* ").append(slot).append(" to ").append(elemLLVM).append("*\n");
+            String casted = castValue(value, elemLLVM);
+            body.append("  store ").append(elemLLVM).append(" ").append(casted).append(", ").append(elemLLVM).append("* ").append(typedSlot).append("\n");
+            String next = "%list.add.next." + tmpCount++;
+            body.append("  ").append(next).append(" = add i64 ").append(size).append(", 1\n");
+            body.append("  store i64 ").append(next).append(", i64* ").append(sizePtr).append("\n");
+            body.append("  br label %").append(done).append("\n");
+            body.append(done).append(":\n");
+            String indexResult = "%list.add.index." + tmpCount++;
+            body.append("  ").append(indexResult).append(" = trunc i64 ").append(size).append(" to i32\n");
+            return new LLVMValue(indexResult, "i32");
+        }
+        if (method.equals("remove") && args.size() == 1) return generateListRemove(list, elemCang, args.get(0), line);
+        if (method.equals("contains") && args.size() == 1) return generateListContains(list, elemCang, args.get(0), line);
+        if (method.equals("clear") && args.isEmpty()) {
+            body.append("  store i64 0, i64* ").append(sizePtr).append("\n");
+            return new LLVMValue("void", "void");
+        }
+        throw new RuntimeException("Unknown List method or argument count: " + method + " (at line " + line + ")");
+    }
+
+    private LLVMValue generateListRemove(LLVMValue list, String elemCang, AST indexNode, int line) {
+        String elemLLVM = toLLVMType(elemCang);
+        String index = "%list.remove.index." + tmpCount++;
+        body.append("  ").append(index).append(" = sext i32 ").append(castValue(generateExpr(indexNode), "i32")).append(" to i64\n");
+        String sizePtr = "%list.remove.sizeptr." + tmpCount++;
+        String dataPtr = "%list.remove.dataptr." + tmpCount++;
+        body.append("  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
+        body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n");
+        String size = "%list.remove.size." + tmpCount++;
+        body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+        String check = "%list.remove.check." + tmpCount++;
+        String bad = "list.remove.bad." + tmpCount++;
+        String ok = "list.remove.ok." + tmpCount++;
+        body.append("  ").append(check).append(" = icmp ult i64 ").append(index).append(", ").append(size).append("\n");
+        body.append("  br i1 ").append(check).append(", label %").append(ok).append(", label %").append(bad).append("\n").append(bad).append(":\n");
+        emitRuntimeError("List index out of bounds", line, ok);
+        body.append(ok).append(":\n");
+        String data = "%list.remove.data." + tmpCount++;
+        body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n");
+        long bytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+        String offset = "%list.remove.offset." + tmpCount++;
+        body.append("  ").append(offset).append(" = mul i64 ").append(index).append(", ").append(bytes).append("\n");
+        String oldPtr = "%list.remove.oldptr." + tmpCount++;
+        String oldTyped = "%list.remove.oldtyped." + tmpCount++;
+        body.append("  ").append(oldPtr).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(offset).append("\n");
+        body.append("  ").append(oldTyped).append(" = bitcast i8* ").append(oldPtr).append(" to ").append(elemLLVM).append("*\n");
+        String removed = "%list.removed." + tmpCount++;
+        body.append("  ").append(removed).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(oldTyped).append("\n");
+        String loop = "list.remove.loop." + labelCount++;
+        String copy = "list.remove.copy." + labelCount++;
+        String done = "list.remove.done." + labelCount++;
+        String iPtr = "%list.remove.iptr." + tmpCount++;
+        body.append("  ").append(iPtr).append(" = alloca i64\n  store i64 ").append(index).append(", i64* ").append(iPtr).append("\n  br label %").append(loop).append("\n").append(loop).append(":\n");
+        String i = "%list.remove.i." + tmpCount++;
+        String next = "%list.remove.next." + tmpCount++;
+        String hasNext = "%list.remove.hasnext." + tmpCount++;
+        body.append("  ").append(i).append(" = load i64, i64* ").append(iPtr).append("\n  ").append(next).append(" = add i64 ").append(i).append(", 1\n  ").append(hasNext).append(" = icmp ult i64 ").append(next).append(", ").append(size).append("\n  br i1 ").append(hasNext).append(", label %").append(copy).append(", label %").append(done).append("\n").append(copy).append(":\n");
+        String srcOff = "%list.remove.srcoff." + tmpCount++;
+        String dstOff = "%list.remove.dstoff." + tmpCount++;
+        body.append("  ").append(srcOff).append(" = mul i64 ").append(next).append(", ").append(bytes).append("\n  ").append(dstOff).append(" = mul i64 ").append(i).append(", ").append(bytes).append("\n");
+        String srcPtr = "%list.remove.src." + tmpCount++;
+        String dstPtr = "%list.remove.dst." + tmpCount++;
+        body.append("  ").append(srcPtr).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(srcOff).append("\n  ").append(dstPtr).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(dstOff).append("\n");
+        String srcTyped = "%list.remove.srctyped." + tmpCount++;
+        String dstTyped = "%list.remove.dsttyped." + tmpCount++;
+        body.append("  ").append(srcTyped).append(" = bitcast i8* ").append(srcPtr).append(" to ").append(elemLLVM).append("*\n  ").append(dstTyped).append(" = bitcast i8* ").append(dstPtr).append(" to ").append(elemLLVM).append("*\n");
+        String copied = "%list.remove.copied." + tmpCount++;
+        body.append("  ").append(copied).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(srcTyped).append("\n  store ").append(elemLLVM).append(" ").append(copied).append(", ").append(elemLLVM).append("* ").append(dstTyped).append("\n  store i64 ").append(next).append(", i64* ").append(iPtr).append("\n  br label %").append(loop).append("\n").append(done).append(":\n");
+        String newSize = "%list.remove.newsize." + tmpCount++;
+        body.append("  ").append(newSize).append(" = sub i64 ").append(size).append(", 1\n  store i64 ").append(newSize).append(", i64* ").append(sizePtr).append("\n");
+        return new LLVMValue(removed, elemLLVM, elemCang);
+    }
+
+    private LLVMValue generateListContains(LLVMValue list, String elemCang, AST targetNode, int line) {
+        String elemLLVM = toLLVMType(elemCang);
+        LLVMValue target = generateCallArg(targetNode, elemCang, line);
+        String dataPtr = "%list.contains.dataptr." + tmpCount++;
+        String sizePtr = "%list.contains.sizeptr." + tmpCount++;
+        body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
+        String data = "%list.contains.data." + tmpCount++;
+        String size = "%list.contains.size." + tmpCount++;
+        body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
+        String foundPtr = "%list.contains.foundptr." + tmpCount++;
+        String indexPtr = "%list.contains.indexptr." + tmpCount++;
+        body.append("  ").append(foundPtr).append(" = alloca i1\n  store i1 0, i1* ").append(foundPtr).append("\n  ").append(indexPtr).append(" = alloca i64\n  store i64 0, i64* ").append(indexPtr).append("\n");
+        int id = labelCount++;
+        String loop = "list.contains.loop." + id;
+        String check = "list.contains.check." + id;
+        String done = "list.contains.done." + id;
+        body.append("  br label %").append(loop).append("\n").append(loop).append(":\n");
+        String index = "%list.contains.index." + tmpCount++;
+        String active = "%list.contains.active." + tmpCount++;
+        body.append("  ").append(index).append(" = load i64, i64* ").append(indexPtr).append("\n  ").append(active).append(" = icmp ult i64 ").append(index).append(", ").append(size).append("\n  br i1 ").append(active).append(", label %").append(check).append(", label %").append(done).append("\n").append(check).append(":\n");
+        long bytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+        String off = "%list.contains.off." + tmpCount++;
+        String slot = "%list.contains.slot." + tmpCount++;
+        String typed = "%list.contains.typed." + tmpCount++;
+        body.append("  ").append(off).append(" = mul i64 ").append(index).append(", ").append(bytes).append("\n  ").append(slot).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(off).append("\n  ").append(typed).append(" = bitcast i8* ").append(slot).append(" to ").append(elemLLVM).append("*\n");
+        String current = "%list.contains.current." + tmpCount++;
+        body.append("  ").append(current).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(typed).append("\n");
+        String equal = "%list.contains.equal." + tmpCount++;
+        if (elemLLVM.equals("i8*")) {
+            String cmp = "%list.contains.strcmp." + tmpCount++;
+            body.append("  ").append(cmp).append(" = call i32 @strcmp(i8* ").append(current).append(", i8* ").append(target.value).append(")\n  ").append(equal).append(" = icmp eq i32 ").append(cmp).append(", 0\n");
+        } else {
+            body.append("  ").append(equal).append(" = icmp eq ").append(elemLLVM).append(" ").append(current).append(", ").append(castValue(target, elemLLVM)).append("\n");
+        }
+        String next = "%list.contains.next." + tmpCount++;
+        body.append("  ").append(next).append(" = add i64 ").append(index).append(", 1\n  store i64 ").append(next).append(", i64* ").append(indexPtr).append("\n");
+        String found = "%list.contains.found." + tmpCount++;
+        body.append("  ").append(found).append(" = load i1, i1* ").append(foundPtr).append("\n");
+        String finalFound = "%list.contains.final." + tmpCount++;
+        body.append("  ").append(finalFound).append(" = or i1 ").append(found).append(", ").append(equal).append("\n  store i1 ").append(finalFound).append(", i1* ").append(foundPtr).append("\n");
+        body.append("  br label %").append(loop).append("\n").append(done).append(":\n");
+        String result = "%list.contains.result." + tmpCount++;
+        body.append("  ").append(result).append(" = load i1, i1* ").append(foundPtr).append("\n");
+        return new LLVMValue(result, "i1");
+    }
+
     private LLVMValue generateMethodCall(MethodCallExpr node) {
         markRegionControlFlow();
+        // Thread<T> is a compiler intrinsic. Phase one intentionally targets Windows/MinGW.
+        if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Thread")
+                && node.method.equals("spawn")) {
+            return generateThreadSpawn(node);
+        }
+        if (node.object != null && node.method.equals("join")) {
+            LLVMValue receiver = generateExpr(node.object);
+            if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+                if (!node.args.isEmpty()) throw new RuntimeException("Thread.join accepts no arguments (at line " + node.line + ")");
+                return generateThreadJoin(receiver, node.line);
+            }
+        }
+
         // Handle built-in Stdout.print
         if (node.object instanceof Identifier) {
             String objName = ((Identifier) node.object).name;
@@ -3049,6 +3539,14 @@ public class LLVMGen {
             }
             if (objName.equals("System")) {
                 return generateSystemCall(node.method, node.args, node.line);
+            }
+        }
+
+        // List<T> is a compiler-built dynamic array.
+        if (node.object != null) {
+            LLVMValue listValue = generateExpr(node.object);
+            if (listValue.semanticType != null && isListType(listValue.semanticType)) {
+                return generateListMethod(listValue, listValue.semanticType, node.method, node.args, node.line);
             }
         }
 
@@ -3148,18 +3646,9 @@ public class LLVMGen {
             body.append("  br i1 ").append(isNull).append(", label %").append(nullLabel)
                  .append(", label %").append(notNullLabel).append("\n\n");
 
-            // Null handler
+            // Null handler: raise a catchable Error, then fall through to the not-null path label.
             body.append(nullLabel).append(":\n");
-            String errMsg = ensureStringConstant("@.str.nullptr", "Null pointer dereference\\0A\\00", 26);
-            String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
-            body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([26 x i8], [26 x i8]* ")
-                 .append(errMsg).append(", i32 0, i32 0))\n");
-            String locFmt = ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
-            body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* ")
-                 .append(locFmt).append(", i32 0, i32 0), i8* ")
-                 .append(fileName).append(", i32 ").append(node.line).append(")\n");
-            body.append("  call void @exit(i32 1)\n");
-            body.append("  unreachable\n\n");
+            emitRuntimeError("Null pointer dereference", node.line, notNullLabel);
 
             body.append(notNullLabel).append(":\n");
         }
@@ -3227,6 +3716,245 @@ public class LLVMGen {
                  .append(" @").append(funcName).append("(").append(args).append(")\n");
             return new LLVMValue(result, toLLVMType(fi.returnType));
         }
+    }
+
+    private boolean isThreadType(String type) {
+        return type != null && type.startsWith("Thread<") && type.endsWith(">") && type.length() > 8;
+    }
+
+    private String threadResultType(String type) {
+        return type.substring(7, type.length() - 1);
+    }
+
+    /** Value types allowed as thread entry return/parameter types (no objects/arrays/Function). */
+    private static boolean isThreadValueType(String t) {
+        return t.equals("void") || t.equals("int") || t.equals("long") || t.equals("float")
+            || t.equals("double") || t.equals("bool") || t.equals("byte")
+            || t.equals("String") || t.equals("str");
+    }
+
+    private LLVMValue generateThreadSpawn(MethodCallExpr node) {
+        if (node.args.isEmpty()) throw new RuntimeException("Thread.spawn requires a non-capturing ordinary function identifier (at line " + node.line + ")");
+        AST entry = node.args.get(0);
+        if (!(entry instanceof Identifier)) {
+            throw new RuntimeException("Thread.spawn requires a non-capturing ordinary function identifier; capturing lambda and Function receiver are not supported (at line " + node.line + ")");
+        }
+        String entryName = ((Identifier) entry).name;
+        FuncInfo ordinary = functions.get(entryName);
+        if (ordinary == null || ordinary.className != null || ordinary.isStatic) {
+            throw new RuntimeException("Thread.spawn requires a top-level ordinary function identifier (at line " + node.line + ")");
+        }
+        if (!isThreadValueType(ordinary.returnType)) {
+            throw new RuntimeException("Thread result type must be void or a value type (int/long/float/double/bool/byte/String); objects and arrays cannot cross threads (at line " + node.line + ")");
+        }
+        for (String p : ordinary.paramTypes) {
+            if (p.equals("void") || !isThreadValueType(p)) {
+                throw new RuntimeException("Thread parameters must be value types (int/long/float/double/bool/byte/String); objects and arrays cannot cross threads (at line " + node.line + ")");
+            }
+        }
+        if (node.args.size() - 1 != ordinary.paramTypes.size()) {
+            throw new RuntimeException("Thread.spawn argument count mismatch: expected " + ordinary.paramTypes.size() + " but found " + (node.args.size() - 1) + " (at line " + node.line + ")");
+        }
+
+        boolean isVoid = ordinary.returnType.equals("void");
+
+        // Pack layout: { fn ptr, args..., [i8* resultSlot] }
+        StringBuilder st = new StringBuilder("{ i8*");
+        for (String p : ordinary.paramTypes) st.append(", ").append(toLLVMType(p));
+        if (!isVoid) st.append(", i8*");
+        st.append(" }");
+        String startType = st.toString();
+
+        List<LLVMValue> values = new ArrayList<>();
+        for (int i = 1; i < node.args.size(); i++) {
+            values.add(generateCallArg(node.args.get(i), ordinary.paramTypes.get(i - 1), node.line));
+        }
+
+        String raw = "%thread.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 256)\n");
+        String start = "%thread.start." + tmpCount++;
+        body.append("  ").append(start).append(" = bitcast i8* ").append(raw).append(" to ").append(startType).append("*\n");
+        String fp = "%thread.fp." + tmpCount++;
+        body.append("  ").append(fp).append(" = getelementptr ").append(startType).append(", ").append(startType).append("* ").append(start).append(", i32 0, i32 0\n");
+        body.append("  store i8* bitcast (").append(functionPointerType(ordinary)).append(" @").append(entryName).append(" to i8*), i8** ").append(fp).append("\n");
+        for (int i = 0; i < values.size(); i++) {
+            String paramLLVM = toLLVMType(ordinary.paramTypes.get(i));
+            String ap = "%thread.ap." + tmpCount++;
+            body.append("  ").append(ap).append(" = getelementptr ").append(startType).append(", ").append(startType).append("* ").append(start).append(", i32 0, i32 ").append(i + 1).append("\n");
+            body.append("  store ").append(paramLLVM).append(" ").append(castValue(values.get(i), paramLLVM)).append(", ").append(paramLLVM).append("* ").append(ap).append("\n");
+        }
+        String rpRaw = "null";
+        if (!isVoid) {
+            String resultLLVM = toLLVMType(ordinary.returnType);
+            long bits = llvmTypeBits(resultLLVM);
+            long slotBytes = bits <= 0 ? 8 : Math.max(8, (bits + 7) / 8);
+            rpRaw = "%thread.result.raw." + tmpCount++;
+            body.append("  ").append(rpRaw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(slotBytes).append(")\n");
+            String rfield = "%thread.rfield." + tmpCount++;
+            int resultIndex = 1 + values.size();
+            body.append("  ").append(rfield).append(" = getelementptr ").append(startType).append(", ").append(startType).append("* ").append(start).append(", i32 0, i32 ").append(resultIndex).append("\n");
+            body.append("  store i8* ").append(rpRaw).append(", i8** ").append(rfield).append("\n");
+        }
+        String handleRaw = "%thread.handle.raw." + tmpCount++;
+        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+        String handle = "%thread.handle." + tmpCount++;
+        body.append("  ").append(handle).append(" = bitcast i8* ").append(handleRaw).append(" to %CangThreadHandle*\n");
+        String tid = "%thread.id." + tmpCount++;
+        body.append("  ").append(tid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 0\n");
+        String rid = "%thread.rid." + tmpCount++;
+        body.append("  ").append(rid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 1\n");
+        body.append("  store i8* ").append(rpRaw).append(", i8** ").append(rid).append("\n");
+        String joined = "%thread.joined." + tmpCount++;
+        body.append("  ").append(joined).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 2\n");
+        body.append("  store i32 0, i32* ").append(joined).append("\n");
+
+        emitThreadEntry(ordinary, startType, isVoid, threadCount);
+
+        if (targetPlatform.equals("windows")) {
+            String entryFn = "@cang.thread.entry." + threadCount;
+            String createFn = gcEnabled ? "@GC_CreateThread" : "@CreateThread";
+            String created = "%thread.created." + tmpCount++;
+            body.append("  ").append(created).append(" = call i8* ").append(createFn).append("(i8* null, i64 0, i32 (i8*)* ").append(entryFn).append(", i8* ").append(raw).append(", i32 0, i32* null)\n");
+            String isNull = "%thread.isnull." + tmpCount++;
+            String bad = "thread.create.bad." + threadCount;
+            String ok = "thread.create.ok." + threadCount;
+            body.append("  ").append(isNull).append(" = icmp eq i8* ").append(created).append(", null\n");
+            body.append("  br i1 ").append(isNull).append(", label %").append(bad).append(", label %").append(ok).append("\n");
+            body.append(bad).append(":\n");
+            emitFatalError("Thread creation failed", node.line, ok);
+            body.append(ok).append(":\n");
+            String tid32 = "%thread.id32." + tmpCount++;
+            body.append("  ").append(tid32).append(" = ptrtoint i8* ").append(created).append(" to i64\n");
+            body.append("  store i64 ").append(tid32).append(", i64* ").append(tid).append("\n");
+        } else {
+            String entryFn = "@cang.thread.entry." + threadCount;
+            String ptidSlot = "%thread.ptid.slot." + tmpCount++;
+            String ptid = "%thread.ptid." + tmpCount++;
+            body.append("  ").append(ptidSlot).append(" = alloca i64\n");
+            body.append("  ").append(ptid).append(" = bitcast i64* ").append(ptidSlot).append(" to i8**\n");
+            String rc = "%thread.rc." + tmpCount++;
+            body.append("  ").append(rc).append(" = call i32 @pthread_create(i8** ").append(ptid).append(", i8* null, i8* (i8*)* ").append(entryFn).append(", i8* ").append(raw).append(")\n");
+            String failed = "%thread.failed." + tmpCount++;
+            String bad = "thread.create.bad." + threadCount;
+            String ok = "thread.create.ok." + threadCount;
+            body.append("  ").append(failed).append(" = icmp ne i32 ").append(rc).append(", 0\n");
+            body.append("  br i1 ").append(failed).append(", label %").append(bad).append(", label %").append(ok).append("\n");
+            body.append(bad).append(":\n");
+            emitFatalError("Thread creation failed", node.line, ok);
+            body.append(ok).append(":\n");
+            String tidVal = "%thread.ptid.load." + tmpCount++;
+            body.append("  ").append(tidVal).append(" = load i64, i64* ").append(ptidSlot).append("\n");
+            body.append("  store i64 ").append(tidVal).append(", i64* ").append(tid).append("\n");
+        }
+        threadCount++;
+        return new LLVMValue(handle, "%CangThreadHandle*", "Thread<" + ordinary.returnType + ">");
+    }
+
+    private void emitThreadEntry(FuncInfo ordinary, String startType, boolean isVoid, int id) {
+        String retLLVM = toLLVMType(ordinary.returnType);
+        boolean posix = !targetPlatform.equals("windows");
+        StringBuilder x = new StringBuilder();
+        x.append("define ").append(posix ? "i8*" : "i32")
+         .append(" @cang.thread.entry.").append(id).append("(i8* %arg) {\nentry:\n");
+
+        // Register this native thread with Boehm GC before any GC-managed allocation.
+        // On Windows, GC_CreateThread attaches the thread itself; posix threads register here.
+        String sb = "%gc.sb." + id;
+        String sb8 = "%gc.sb8." + id;
+        boolean registerWithGc = gcEnabled && !targetPlatform.equals("windows");
+        if (registerWithGc) {
+            x.append("  ").append(sb).append(" = alloca [64 x i8]\n");
+            x.append("  ").append(sb8).append(" = getelementptr [64 x i8], [64 x i8]* ").append(sb).append(", i32 0, i32 0\n");
+            x.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(sb8).append(", i8 0, i64 64, i1 false)\n");
+            x.append("  %gc.sbres1.").append(id).append(" = call i32 @GC_get_stack_base(i8* ").append(sb8).append(")\n");
+            x.append("  %gc.sbres2.").append(id).append(" = call i32 @GC_register_my_thread(i8* ").append(sb8).append(")\n");
+        }
+
+        x.append("  %s = bitcast i8* %arg to ").append(startType).append("*\n");
+        x.append("  %f = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 0\n");
+        x.append("  %code = load i8*, i8** %f\n");
+
+        StringBuilder fnType = new StringBuilder(toLLVMType(ordinary.returnType)).append(" (");
+        StringBuilder args = new StringBuilder();
+        for (int i = 0; i < ordinary.paramTypes.size(); i++) {
+            String llvmType = toLLVMType(ordinary.paramTypes.get(i));
+            if (i > 0) { fnType.append(", "); args.append(", "); }
+            fnType.append(llvmType);
+            String p = "%p" + (i + 1);
+            x.append("  ").append(p).append("p = getelementptr ").append(startType).append(", ").append(startType)
+             .append("* %s, i32 0, i32 ").append(i + 1).append("\n");
+            x.append("  ").append(p).append(" = load ").append(llvmType).append(", ").append(llvmType).append("* ").append(p).append("p\n");
+            args.append(llvmType).append(" ").append(p);
+        }
+        fnType.append(")*");
+        x.append("  %fp = bitcast i8* %code to ").append(fnType).append("\n");
+        if (isVoid) {
+            x.append("  call void %fp(").append(args).append(")\n");
+        } else {
+            x.append("  %r = call ").append(retLLVM).append(" %fp(").append(args).append(")\n");
+            int ri = 1 + ordinary.paramTypes.size();
+            x.append("  %rp = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 ").append(ri).append("\n");
+            x.append("  %rpp = load i8*, i8** %rp\n");
+            x.append("  %rpt = bitcast i8* %rpp to ").append(retLLVM).append("*\n");
+            x.append("  store ").append(retLLVM).append(" %r, ").append(retLLVM).append("* %rpt\n");
+        }
+        if (registerWithGc) {
+            x.append("  %gc.sbres3.").append(id).append(" = call i32 @GC_unregister_my_thread(i8* ").append(sb8).append(")\n");
+        }
+        x.append("  call void @").append(freeFn()).append("(i8* %arg)\n");
+        if (posix) x.append("  ret i8* null\n}\n\n");
+        else x.append("  ret i32 0\n}\n\n");
+        extraDefs.append(x);
+    }
+
+    private LLVMValue generateThreadJoin(LLVMValue receiver, int line) {
+        String semantic = receiver.semanticType;
+        String resultCang = semantic != null && isThreadType(semantic) ? threadResultType(semantic) : "int";
+        boolean isVoid = resultCang.equals("void") || resultCang.equals("Void");
+
+        String joinedPtr = "%thread.join.joined." + tmpCount++;
+        body.append("  ").append(joinedPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value).append(", i32 0, i32 2\n");
+        String joined = "%thread.join.joinedval." + tmpCount++;
+        body.append("  ").append(joined).append(" = load i32, i32* ").append(joinedPtr).append("\n");
+        String isJoined = "%thread.join.isjoined." + tmpCount++;
+        String bad = "thread.join.already." + labelCount++;
+        String ok = "thread.join.ok." + labelCount++;
+        body.append("  ").append(isJoined).append(" = icmp eq i32 ").append(joined).append(", 1\n");
+        body.append("  br i1 ").append(isJoined).append(", label %").append(bad).append(", label %").append(ok).append("\n");
+        body.append(bad).append(":\n");
+        emitFatalError("Thread already joined", line, ok);
+        body.append(ok).append(":\n");
+        body.append("  store i32 1, i32* ").append(joinedPtr).append("\n");
+
+        String tid = "%thread.join.id." + tmpCount++;
+        body.append("  ").append(tid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value).append(", i32 0, i32 0\n");
+        String handle = "%thread.join.handle." + tmpCount++;
+        body.append("  ").append(handle).append(" = load i64, i64* ").append(tid).append("\n");
+        if (targetPlatform.equals("windows")) {
+            String hp = "%thread.join.hp." + tmpCount++;
+            body.append("  ").append(hp).append(" = inttoptr i64 ").append(handle).append(" to i8*\n");
+            body.append("  call i32 @WaitForSingleObject(i8* ").append(hp).append(", i32 -1)\n");
+            body.append("  call i32 @CloseHandle(i8* ").append(hp).append(")\n");
+        } else {
+            body.append("  call i32 @pthread_join(i64 ").append(handle).append(", i8** null)\n");
+        }
+
+        if (isVoid) {
+            return new LLVMValue("void", "void");
+        }
+        String resultLLVM = toLLVMType(resultCang);
+        String rid = "%thread.join.result." + tmpCount++;
+        body.append("  ").append(rid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value).append(", i32 0, i32 1\n");
+        String result = "%thread.join.result.ptr." + tmpCount++;
+        body.append("  ").append(result).append(" = load i8*, i8** ").append(rid).append("\n");
+        String typed = "%thread.join.typed." + tmpCount++;
+        body.append("  ").append(typed).append(" = bitcast i8* ").append(result).append(" to ").append(resultLLVM).append("*\n");
+        String value = "%thread.join.value." + tmpCount++;
+        body.append("  ").append(value).append(" = load ").append(resultLLVM).append(", ").append(resultLLVM).append("* ").append(typed).append("\n");
+        body.append("  call void @").append(freeFn()).append("(i8* ").append(result).append(")\n");
+        String resultSemantic = null;
+        if (resultCang.equals("String") || resultCang.equals("str")) resultSemantic = resultCang;
+        return new LLVMValue(value, resultLLVM, resultSemantic);
     }
 
     private LLVMValue generateMathCall(String method, List<AST> nodes, int line) {
@@ -3322,8 +4050,16 @@ public class LLVMGen {
     private LLVMValue generateSystemCall(String method, List<AST> nodes, int line) {
         if (method.equals("exit") && nodes.size() == 1) {
             LLVMValue status = generateExpr(nodes.get(0));
-            body.append("  call void @exit(i32 ").append(castValue(status, "i32")).append(")\n");
+            String castedExit = castValue(status, "i32");
+            body.append("  call void @exit(i32 ").append(castedExit).append(")\n");
             body.append("  unreachable\n");
+            return new LLVMValue("void", "void");
+        }
+        if (method.equals("gc") && nodes.isEmpty()) {
+            // Manual collection trigger; no-op when running without --gc.
+            if (gcEnabled) {
+                body.append("  call void @GC_gcollect()\n");
+            }
             return new LLVMValue("void", "void");
         }
         if (method.equals("getenv") && nodes.size() == 1) {
@@ -3332,6 +4068,10 @@ public class LLVMGen {
             String result = "%system.getenv." + tmpCount++;
             body.append("  ").append(result).append(" = call i8* @getenv(i8* ").append(name.value).append(")\n");
             return new LLVMValue(result, "i8*", "String");
+        }
+        if (method.equals("gc") && nodes.isEmpty()) {
+
+            return new LLVMValue("void", "void");
         }
         if (method.equals("currentTimeMillis") && nodes.isEmpty()) {
             String seconds = "%system.time.seconds." + tmpCount++;
@@ -3605,6 +4345,35 @@ public class LLVMGen {
     }
 
     private LLVMValue generateNew(NewExpr node) {
+        if (node.className.equals("List") || isListType(node.className)) {
+            String elemCang = !node.typeArgs.isEmpty() ? node.typeArgs.get(0) : listElementType(node.className);
+            if (elemCang == null) throw new RuntimeException("List requires one concrete element type (at line " + node.line + ")");
+            String elemLLVM = toLLVMType(elemCang);
+            String raw = "%list.new.raw." + tmpCount++;
+            String obj = "%list.new." + tmpCount++;
+            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+            body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangList*\n");
+            String data = "%list.new.data." + tmpCount++;
+            long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
+            long initialBytes = 8L * elemBytes;
+            body.append("  ").append(data).append(" = call i8* @").append(allocFn()).append("(i64 ").append(initialBytes).append(")\n");
+            String dataField = "%list.new.datafield." + tmpCount++;
+            String sizeField = "%list.new.sizefield." + tmpCount++;
+            String capField = "%list.new.capfield." + tmpCount++;
+            body.append("  ").append(dataField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 0\n");
+            body.append("  store i8* ").append(data).append(", i8** ").append(dataField).append("\n");
+            body.append("  ").append(sizeField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 1\n");
+            body.append("  store i64 0, i64* ").append(sizeField).append("\n");
+            body.append("  ").append(capField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 2\n");
+            body.append("  store i64 8, i64* ").append(capField).append("\n");
+            LLVMValue result = new LLVMValue(obj, "%CangList*", "List<" + elemCang + ">");
+            if (node.args.size() == 1) {
+                generateListMethod(result, result.semanticType, "add", node.args, node.line);
+            } else if (!node.args.isEmpty()) {
+                throw new RuntimeException("List constructor accepts zero or one initial element (at line " + node.line + ")");
+            }
+            return result;
+        }
         // Boxing a primitive str into the immutable String reference wrapper.
         if (node.className.equals("String") && node.args.size() == 1) {
             LLVMValue value = generateExpr(node.args.get(0));
@@ -3626,7 +4395,7 @@ public class LLVMGen {
 
         // Malloc
         String raw = "%raw." + tmpCount++;
-        body.append("  ").append(raw).append(" = call i8* @malloc(i64 ").append(sizeOf).append(")\n");
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(sizeOf).append(")\n");
         registerRegionAllocation(raw);
 
         // Bitcast
@@ -3755,7 +4524,7 @@ public class LLVMGen {
         if (n == 0) {
             // Empty array: malloc 8 bytes (just length)
             String ptr = "%arr.empty." + tmpCount++;
-            body.append("  ").append(ptr).append(" = call i8* @malloc(i64 8)\n");
+            body.append("  ").append(ptr).append(" = call i8* @").append(allocFn()).append("(i64 8)\n");
         registerRegionAllocation(ptr);
             // store length 0
             body.append("  store i64 0, i64* ").append(ptr).append("\n");
@@ -3790,7 +4559,7 @@ public class LLVMGen {
         // Allocate: 8 bytes (length) + n * elemBytes
         long totalSize = 8L + (long) n * elemBytes;
         String ptr = "%arr." + tmpCount++;
-        body.append("  ").append(ptr).append(" = call i8* @malloc(i64 ").append(totalSize).append(")\n");
+        body.append("  ").append(ptr).append(" = call i8* @").append(allocFn()).append("(i64 ").append(totalSize).append(")\n");
 
         // Store length
         body.append("  store i64 ").append(n).append(", i64* ").append(ptr).append("\n");
@@ -3805,7 +4574,8 @@ public class LLVMGen {
         String elem0Ptr = "%arr.e0." + tmpCount++;
         body.append("  ").append(elem0Ptr).append(" = getelementptr ").append(elemType).append(", ")
              .append(elemType).append("* ").append(typedPtr).append(", i64 0\n");
-        body.append("  store ").append(elemType).append(" ").append(castValue(first, elemType))
+        String castedFirst = castValue(first, elemType);
+        body.append("  store ").append(elemType).append(" ").append(castedFirst)
              .append(", ").append(elemType).append("* ").append(elem0Ptr).append("\n");
 
         // Store remaining elements
@@ -3816,7 +4586,8 @@ public class LLVMGen {
             String elemPtr = "%arr.e" + i + "." + tmpCount++;
             body.append("  ").append(elemPtr).append(" = getelementptr ").append(elemType).append(", ")
                  .append(elemType).append("* ").append(typedPtr).append(", i64 ").append(i).append("\n");
-            body.append("  store ").append(elemType).append(" ").append(castValue(val, elemType))
+            String castedElem = castValue(val, elemType);
+            body.append("  store ").append(elemType).append(" ").append(castedElem)
                  .append(", ").append(elemType).append("* ").append(elemPtr).append("\n");
         }
 
@@ -3901,20 +4672,9 @@ public class LLVMGen {
         body.append("  br i1 ").append(oob).append(", label %").append(errLabel)
              .append(", label %").append(okLabel).append("\n\n");
 
-        // Error handler - inline
+        // Error handler - raise a catchable Error (falls back to print+exit without Error class)
         body.append(errLabel).append(":\n");
-        String errMsg = ensureStringConstant("@.str.oob.msg", "error: Array index out of bounds\\0A\\00", 34);
-        String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
-        // Print error message directly (no format specifiers in message)
-        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([34 x i8], [34 x i8]* ")
-             .append(errMsg).append(", i32 0, i32 0))\n");
-        // Print location: "  at <file>:<line>\n"
-        String locFmt = ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
-        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* ")
-             .append(locFmt).append(", i32 0, i32 0), i8* ")
-             .append(fileName).append(", i32 ").append(node.line).append(")\n");
-        body.append("  call void @exit(i32 1)\n");
-        body.append("  unreachable\n\n");
+        emitRuntimeError("Array index out of bounds", node.line, okLabel);
 
         // OK path
         body.append(okLabel).append(":\n");
@@ -3990,7 +4750,7 @@ public class LLVMGen {
         body.append("  %args.slots = mul i64 %argc64, 8\n");
         body.append("  %args.total = add i64 %args.slots, 8\n");
         // mem = malloc(total)
-        body.append("  %args.mem = call i8* @malloc(i64 %args.total)\n");
+        body.append("  %args.mem = call i8* @").append(allocFn()).append("(i64 %args.total)\n");
         // System.ARGS is a global root and must outlive the entry function.
         // It is intentionally not registered in the function region.
         // store length header
@@ -4029,10 +4789,12 @@ public class LLVMGen {
     private void generateAutoMain() {
         body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         body.append("entry:\n");
+        if (gcEnabled) body.append("  call void @GC_init()\n");
 
         scope = new Scope(null);
         tmpCount = 0;
         currentFuncReturnType = "int";
+        emitGcFrameSetup();
 
         emitArgsArrayInit();
 
@@ -4040,6 +4802,7 @@ public class LLVMGen {
             generateStmt(stmt);
         }
 
+        emitGcFramePop();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;
@@ -4053,10 +4816,12 @@ public class LLVMGen {
     private void generateEntryPointMain(ClassDecl entryClass) {
         body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         body.append("entry:\n");
+        if (gcEnabled) body.append("  call void @GC_init()\n");
 
         scope = new Scope(null);
         tmpCount = 0;
         currentFuncReturnType = "int";
+        emitGcFrameSetup();
 
         // Allocate and initialize parameters with default values
         for (Parameter p : entryClass.ctorParams) {
@@ -4065,14 +4830,16 @@ public class LLVMGen {
             body.append("  ").append(ptr).append(" = alloca ").append(llvmType).append("\n");
             scope.define(p.name, new LLVMValue(ptr, llvmType,
                 semanticKindOf(p.type)));
+            registerGcRoot(ptr, llvmType);
             if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
                 trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
             }
 
             if (p.defaultValue != null) {
                 LLVMValue defVal = generateExpr(p.defaultValue);
+                String castedDefault = castValue(defVal, llvmType);
                 body.append("  store ").append(llvmType).append(" ")
-                     .append(castValue(defVal, llvmType))
+                     .append(castedDefault)
                      .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
             } else {
                 body.append("  store ").append(llvmType).append(" ")
@@ -4089,6 +4856,7 @@ public class LLVMGen {
             generateStmt(stmt);
         }
 
+        emitGcFramePop();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;
@@ -4098,7 +4866,7 @@ public class LLVMGen {
 
     /** Cang semantic kind carried on LLVMValue for types sharing an LLVM representation. */
     private String semanticKindOf(String cangType) {
-        return cangType != null && (cangType.equals("str") || cangType.equals("String") || isFunctionType(cangType))
+        return cangType != null && (cangType.equals("str") || cangType.equals("String") || isFunctionType(cangType) || isListType(cangType) || isThreadType(cangType))
             ? cangType : null;
     }
 
@@ -4108,6 +4876,16 @@ public class LLVMGen {
 
     private boolean isArraySemanticType(String cangType) {
         return cangType != null && cangType.startsWith("Array<") && cangType.endsWith(">");
+    }
+
+    private boolean isListType(String cangType) {
+        return cangType != null && ((cangType.startsWith("List<") && cangType.endsWith(">")) || cangType.startsWith("List_"));
+    }
+
+    private String listElementType(String cangType) {
+        if (cangType.startsWith("List<")) return cangType.substring(5, cangType.length() - 1);
+        if (cangType.startsWith("List_")) return cangType.substring(5);
+        return null;
     }
 
     private String[] functionTypeParts(String cangType) {
@@ -4205,6 +4983,12 @@ public class LLVMGen {
         // Function values are uniform { code, receiver } structs.
         if (isFunctionType(cangType)) {
             return "%CangFunction";
+        }
+        if (isListType(cangType)) {
+            return "%CangList*";
+        }
+        if (isThreadType(cangType)) {
+            return "%CangThreadHandle*";
         }
         // Array<T> is represented as i8* (pointer to length-prefixed data)
         if (cangType.startsWith("Array<") && cangType.endsWith(">")) {

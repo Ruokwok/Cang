@@ -1,0 +1,6 @@
+import cang/lang/Error
+
+class Main()
+
+int[] a = [1]
+Stdout.println(a[5])

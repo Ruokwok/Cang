@@ -1,0 +1,8 @@
+namespace cang/lang
+
+# Thread<T> - compiler intrinsic thread handle.
+# Thread.spawn(fn, args...) 创建线程；thread.join() 等待并取得 T，且只能调用一次。
+# T 与参数支持 void/int/long/float/double/bool/byte/String/str；
+# 对象、数组、Function、lambda、方法引用不允许跨线程。
+# 与 Boehm GC 兼容：Windows 经 GC_CreateThread 附着，posix 在线程入口注册线程栈。
+class Thread<T>
