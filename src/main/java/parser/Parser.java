@@ -524,6 +524,7 @@ public class Parser {
         if (check(TokenType.BREAK)) { int line = advance().line; optionalSemicolon(); return new BreakStmt(line); }
         if (check(TokenType.CONTINUE)) { int line = advance().line; optionalSemicolon(); return new ContinueStmt(line); }
         if (check(TokenType.FREE)) return parseFreeStmt();
+        if (check(TokenType.THREAD)) return parseThreadBlockStmt();
         if (check(TokenType.LBRACE)) return parseBlock();
         // final var/type declaration
         if (check(TokenType.FINAL)) {
@@ -580,6 +581,12 @@ public class Parser {
         }
         optionalSemicolon();
         return new FreeStmt(names, line);
+    }
+
+    private AST parseThreadBlockStmt() {
+        int line = advance().line; // 'thread'
+        AST body = parseBlock();
+        return new ThreadBlockStmt(body, line);
     }
 
     private AST parseVarDecl() {

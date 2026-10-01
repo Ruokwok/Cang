@@ -1,0 +1,8 @@
+# thread {} must not capture locals.
+class Cap()
+func void go() {
+    int x = 1
+    thread {
+        Stdout.println(x)
+    }
+}

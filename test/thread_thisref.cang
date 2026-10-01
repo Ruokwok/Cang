@@ -1,0 +1,7 @@
+# thread {} must not reference this.
+class ThisR(int v)
+func void go() {
+    thread {
+        Stdout.println(this.v)
+    }
+}

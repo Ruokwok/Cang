@@ -1,0 +1,13 @@
+# thread {} in method body (called) + top-level.
+class Block2()
+func void worker() {
+    thread {
+        Stdout.println("in worker")
+    }
+}
+
+Block2 b = new Block2()
+b.worker()
+thread {
+    Stdout.println("top-level block")
+}

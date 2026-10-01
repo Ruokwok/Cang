@@ -324,6 +324,9 @@ public class LLVMGen {
     private int fnrefCount = 0;
     private int threadCount = 0;
     private int runtimeErrorCount = 0;
+    private int threadBlockCount = 0;
+    // Globals holding spawned `thread { }` handles; joined just before program exit.
+    private final List<String> threadBlockHandles = new ArrayList<>();
     // Expected Function<...> signature while generating a value used as a Function argument.
     private String expectedFunctionType = null;
 
@@ -1306,6 +1309,8 @@ public class LLVMGen {
             }
         } else if (node instanceof FreeStmt) {
             generateFree((FreeStmt) node);
+        } else if (node instanceof ThreadBlockStmt) {
+            generateThreadBlock((ThreadBlockStmt) node);
         } else if (node instanceof ExprStmt) {
             generateExpr(((ExprStmt) node).expr);
         } else if (node instanceof VarDecl) {
@@ -1529,6 +1534,104 @@ public class LLVMGen {
             ci = ci.parentName != null ? classes.get(ci.parentName) : null;
         }
         return false;
+    }
+
+    /**
+     * thread { ... } sugar: compile the block into a synthetic top-level void function,
+     * spawn it via the regular Thread.spawn path (GC-aware), store the handle globally,
+     * and join all such threads just before program exit so their output is never lost.
+     */
+    private void generateThreadBlock(ThreadBlockStmt stmt) {
+        if (!loopStack.isEmpty()) {
+            throw new RuntimeException("thread block inside loops is not supported yet (at line " + stmt.line + ")");
+        }
+        // Same no-capture rule as lambdas: the block runs on another stack.
+        validateLambdaCapture(stmt.body, new java.util.HashSet<String>(), stmt.line, "Thread block");
+
+        int n = threadBlockCount++;
+        String entryName = "cang.threadblock." + n;
+        String fnName = "@" + entryName;
+
+        Scope savedScope = scope;
+        String savedReturn = currentFuncReturnType;
+        List<LoopContext> savedLoops = new ArrayList<>(loopStack);
+        Deque<String> savedHandlers = new ArrayDeque<>(exceptionHandlers);
+        loopStack.clear();
+        exceptionHandlers.clear();
+        scope = new Scope(null);
+        currentFuncReturnType = "void";
+
+        int start = body.length();
+        body.append("define void ").append(fnName).append("() {\nentry:\n");
+        generateBlockBody((Block) stmt.body);
+        String trimmed = body.substring(start).trim();
+        int lastBreak = trimmed.lastIndexOf('\n');
+        String lastLine = (lastBreak >= 0 ? trimmed.substring(lastBreak + 1) : trimmed).trim();
+        boolean terminated = lastLine.startsWith("ret ") || lastLine.startsWith("br ") || lastLine.equals("unreachable");
+        if (!terminated) body.append("  ret void\n");
+        body.append("}\n\n");
+        int end = body.length();
+        extraDefs.append(body, start, end);
+        body.delete(start, end);
+
+        scope = savedScope;
+        currentFuncReturnType = savedReturn;
+        loopStack.clear();
+        loopStack.addAll(savedLoops);
+        exceptionHandlers.clear();
+        exceptionHandlers.addAll(savedHandlers);
+
+        // Register as a plain top-level void function so Thread.spawn accepts it.
+        FuncInfo fi = new FuncInfo();
+        fi.name = entryName;
+        fi.returnType = "void";
+        fi.isStatic = false;
+        fi.className = null;
+        functions.put(entryName, fi);
+
+        LLVMValue handle = generateThreadSpawn(new MethodCallExpr(
+            new Identifier("Thread", stmt.line),
+            "spawn",
+            java.util.Collections.singletonList(new Identifier(entryName, stmt.line)),
+            stmt.line));
+
+        String global = "@cang.thread.handle." + n;
+        extraDefs.append(global).append(" = global %CangThreadHandle* null\n");
+        body.append("  store %CangThreadHandle* ").append(handle.value)
+             .append(", %CangThreadHandle** ").append(global).append("\n");
+        threadBlockHandles.add(global);
+    }
+
+    /** Join every thread spawned by `thread { }` blocks, just before the program returns. */
+    private void emitThreadBlockJoins() {
+        for (String global : threadBlockHandles) {
+            int id = labelCount++;
+            String skip = "thb.join.skip." + id;
+            String doJoin = "thb.join.do." + id;
+            String handle = "%thb.join.h." + tmpCount++;
+            body.append("  ").append(handle).append(" = load %CangThreadHandle*, %CangThreadHandle** ")
+                 .append(global).append("\n");
+            // A thread block in a method that was never called keeps its handle null.
+            String isNull = "%thb.join.isnull." + tmpCount++;
+            body.append("  ").append(isNull).append(" = icmp eq %CangThreadHandle* ").append(handle).append(", null\n");
+            body.append("  br i1 ").append(isNull).append(", label %").append(skip).append(", label %").append(doJoin).append("\n");
+            body.append(doJoin).append(":\n");
+            String idPtr = "%thb.join.id." + tmpCount++;
+            body.append("  ").append(idPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ")
+                 .append(handle).append(", i32 0, i32 0\n");
+            String tid = "%thb.join.tid." + tmpCount++;
+            body.append("  ").append(tid).append(" = load i64, i64* ").append(idPtr).append("\n");
+            if (targetPlatform.equals("windows")) {
+                String hp = "%thb.join.hp." + tmpCount++;
+                body.append("  ").append(hp).append(" = inttoptr i64 ").append(tid).append(" to i8*\n");
+                body.append("  call i32 @WaitForSingleObject(i8* ").append(hp).append(", i32 -1)\n");
+                body.append("  call i32 @CloseHandle(i8* ").append(hp).append(")\n");
+            } else {
+                body.append("  call i32 @pthread_join(i64 ").append(tid).append(", i8** null)\n");
+            }
+            body.append("  br label %").append(skip).append("\n");
+            body.append(skip).append(":\n");
+        }
     }
 
     private void generateFree(FreeStmt stmt) {
@@ -2355,27 +2458,27 @@ public class LLVMGen {
     private void validateLambdaNoCapture(AST node, String parameter, int line) {
         java.util.Set<String> bound = new java.util.HashSet<>();
         bound.add(parameter);
-        validateLambdaCapture(node, bound, line);
+        validateLambdaCapture(node, bound, line, "Lambda");
     }
 
-    private void validateLambdaCapture(AST node, java.util.Set<String> bound, int line) {
+    private void validateLambdaCapture(AST node, java.util.Set<String> bound, int line, String context) {
         if (node == null) return;
         if (node instanceof LambdaExpr) {
             java.util.Set<String> inner = new java.util.HashSet<>(bound);
             inner.add(((LambdaExpr) node).parameter);
-            validateLambdaCapture(((LambdaExpr) node).body, inner, line);
+            validateLambdaCapture(((LambdaExpr) node).body, inner, line, context);
             return;
         }
         if (node instanceof Identifier) {
             String name = ((Identifier) node).name;
             if (!bound.contains(name) && scope.lookup(name) != null) {
-                throw new RuntimeException("Lambda cannot capture external variable '" + name + "' (at line " + line + ")");
+                throw new RuntimeException(context + " cannot capture external variable '" + name + "' (at line " + line + ")");
             }
             return;
         }
         if (node instanceof ThisExpr) {
             if (scope.lookup("this") != null) {
-                throw new RuntimeException("Lambda cannot capture 'this'; use this::method instead (at line " + line + ")");
+                throw new RuntimeException(context + " cannot capture 'this'; use this::method instead (at line " + line + ")");
             }
             return;
         }
@@ -2387,10 +2490,10 @@ public class LLVMGen {
                 continue;
             }
             if (value instanceof AST) {
-                validateLambdaCapture((AST) value, bound, line);
+                validateLambdaCapture((AST) value, bound, line, context);
             } else if (value instanceof List) {
                 for (Object item : (List) value) {
-                    if (item instanceof AST) validateLambdaCapture((AST) item, bound, line);
+                    if (item instanceof AST) validateLambdaCapture((AST) item, bound, line, context);
                 }
             }
         }
@@ -4803,6 +4906,7 @@ public class LLVMGen {
         }
 
         emitGcFramePop();
+        emitThreadBlockJoins();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;
@@ -4857,6 +4961,7 @@ public class LLVMGen {
         }
 
         emitGcFramePop();
+        emitThreadBlockJoins();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;

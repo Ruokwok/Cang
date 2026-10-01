@@ -1,0 +1,10 @@
+# named Thread.spawn returns + thread {} fire-and-forget mixed.
+func int compute(int a) {
+    return a * 2
+}
+
+Thread<int> t = Thread.spawn(compute, 21)
+thread {
+    Stdout.println("side channel")
+}
+Stdout.println(t.join())

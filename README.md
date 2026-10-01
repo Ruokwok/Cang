@@ -191,7 +191,7 @@ Cang app.cang --no-gc      # 切回纯手动 free 模式
 
 - GC 模式下 `free` 映射为 `GC_free`，对象别名下提前 `free` 仍可能 use-after-free；
 - 字符串字面量来自常量池，不能 `free`；
-- 含 `Thread.spawn` 的程序自动降级为手动分配（线程栈尚未注册 GC）；
+- 线程与 GC 兼容：Windows 经 `GC_CreateThread` 附着，posix 在线程入口注册线程栈，无需降级；
 - Linux GC 库已就位但端到端链接依赖本机 WSL；macOS 目标编译尚未实现。
 
 ## 标准库

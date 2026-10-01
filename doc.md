@@ -17,7 +17,31 @@ Cang 是一门使用 Java 编写前端、输出 LLVM IR 的编译型语言。它
 - `join()` 只能调用一次，重复调用立即报错退出；线程创建失败同样报错退出；
 - 线程内异常不跨线程传播：未捕获异常会终止整个进程（与主流程一致）；线程函数内部的 `try/catch` 正常工作。
 
-验证状态：`test/thread_demo.cang`、`thread_types.cang`、`thread_gc.cang` 在 Windows/MinGW + GC 下端到端通过（含 `Thread<Void>/Thread<String>/Thread<double>`、String 参数、线程内 GC 分配与 `System.gc()`）；Linux/macOS 已验证 LLVM IR 与目标文件编译，实际链接运行需对应平台环境。
+验证状态：`test/thread_demo.cang`、`thread_types.cang`、`thread_gc.cang`、`thread_block.cang`、`thread_block2.cang`、`thread_block3.cang` 在 Windows/MinGW + GC 下端到端通过（含 `Thread<Void>/Thread<String>/Thread<double>`、String 参数、线程内 GC 分配与 `System.gc()`、`thread { }` 顶层/方法体）；Linux/macOS 已验证 LLVM IR 与目标文件编译，实际链接运行需对应平台环境。
+
+### thread { } 语法糖
+
+用于创建无需返回值的线程，可写在方法体或顶层代码中：
+
+```cang
+class Main()
+
+Stdout.println("before")
+
+thread {
+    Stdout.println("in thread")
+}
+
+Stdout.println("main continues")
+```
+
+语义：
+
+- 块被编译成一个独立的无参 `void` 函数，并通过 `Thread.spawn` 启动（继承 `Thread` 的 GC 语义与跨平台路径）；
+- 当前线程不等待，继续执行后面的语句；
+- 程序返回前会自动 join 所有 `thread { }` 创建的线程，保证块内输出不会因进程退出而丢失；
+- 与无捕获 lambda 相同，**不允许捕获外部变量或 `this`**（报 `Thread block cannot capture ...`）；
+- 暂不支持写在循环体内（编译期报错）。
 
 > 文档基于当前编译器实现。部分高级功能仍在开发中，文末列出了已知限制。
 

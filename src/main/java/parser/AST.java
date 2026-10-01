@@ -203,6 +203,11 @@ public abstract class AST {
         public FreeStmt(List<String> names, int line) { super(line); this.names = names; }
     }
 
+    public static class ThreadBlockStmt extends AST {
+        public AST body;
+        public ThreadBlockStmt(AST body, int line) { super(line); this.body = body; }
+    }
+
     public static class IfStmt extends AST {
         public AST condition;
         public AST thenBlock;
@@ -343,6 +348,8 @@ public abstract class AST {
             } else if (node instanceof LambdaExpr) {
                 LambdaExpr lambda = (LambdaExpr) node;
                 setSourceFileRecursive(lambda.body, file);
+            } else if (node instanceof ThreadBlockStmt) {
+                setSourceFileRecursive(((ThreadBlockStmt) node).body, file);
             } else if (node instanceof ConstructorDecl) {
                 ConstructorDecl cd = (ConstructorDecl) node;
                 if (cd.body instanceof Block) {

@@ -1,0 +1,5 @@
+class Main()
+int x = 1
+thread {
+    Stdout.println(x)
+}
