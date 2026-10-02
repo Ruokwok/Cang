@@ -23,15 +23,15 @@
 - 修复：`generateStringConcat` 对两侧做 `select` 守卫，null 操作数替换为 `"null"` 字面量，**对齐 Java 语义**（`"a"+null` → `anull`）。
 - 验证：`test/t_strnull.cang` → `anull / nullb / nullnull / [null]`。
 
-### 4. 🔴 深递归裸栈溢出 —— 待修
-- 现象：100 万层递归 → `0xC00000FD` 原生栈溢出，进程无任何提示；`@.stack_depth`（emitHeader 内）定义后从未使用；编译期无深度限制。
-- 修复指引（推荐：深度计数器）：
-  - 在 `emitHeader` 把 `@.stack_depth` 注释为深度计数器，配一个常量上限（如 10000，对齐 Java 帧数经验）。
-  - `generateFunction` 生成函数体前发 `enter`：`atomicrmw add` 自增（线程安全）→ load → `icmp ugt limit` → 超限走 `emitFatalError("Stack overflow: recursion too deep", ...)`（用 Fatal 不用 catchable，避免 catch 内递归无限循环）。
-  - 每个 `ret` 前发 `leave`：`atomicrmw sub`。注意 `generateReturn` 与 `generateFunction` 尾部隐式 ret 都要覆盖；用生成器侧的"当前函数是否有守卫"栈跟踪（lambda/嵌套 codegen 场景）。
-  - native 函数（无 body）与构造器首版可不加（递归几乎都经用户函数/方法）。
-  - 线程入口把计数器视为全局和即可：检查只可能出现保守误报（多线程深度之和超限提前报错），不会漏报（单线程深度 ≤ 全局计数）。
-- 验证：`func int f(int n){ return f(n+1) }` 应打印 `error: Stack overflow...` 退出 1，而非 ACCESS_VIOLATION。
+### 4. ✅ 深递归裸栈溢出 —— 已修复
+- 现象：100 万层递归 → `0xC00000FD` 原生栈溢出，进程无任何提示。
+- 修复（SP 探测方案，非计数器）：
+  - 新增 `@.stack.base = internal thread_local global i64 0`（每线程栈基址）；main 两个入口与 `emitThreadEntry` 开头各写入一次本线程栈顶地址（`emitStackBaseSet`）。
+  - `generateFunction` 用户函数入口发射探测（`emitStackOverflowProbe`）：`alloca i8` 取本帧地址 → 与 `base - STACK_BUDGET(960KB)` 比较 → 触线走 `emitFatalError("Stack overflow: recursion too deep")`。
+  - 选 SP 探测而非深度计数器的原因：帧大小因函数而异，常数帧数上限无法同时避免"误报"和"先于计数器裸崩"；SP 方案按真实剩余字节判定、无需在每个 `ret` 减计数、天然按线程隔离（thread_local）。
+  - 预算标定（Windows 实测）：主线程栈 ~1MB；瘦帧（~50B）原生 20000 层 ✓ / 30000 层裸崩；960KB 预算 → 触发点 ≈ 93.75% 栈容量，任何帧尺寸都先于裸崩触发，误差路径留 64KB。
+- 验证：`test/t_stackoverflow.cang`（1 亿层）→ `error: Stack overflow: recursion too deep at :1` 退出 1；`test/t_rec_ok.cang`（10000 层）→ 正常输出退出 0；回归 31/31。
+- 教训（复发！）：初版值名 `%stk.ovf.N` 与标签 `stk.ovf.N` 同名撞上 #34 同款 LLVM 命名空间冲突，`function_full`（多函数才触发计数器巧合）才暴露——**值/标签成对生成处前缀必须不同，且要用多函数用例回归**。
 
 ### 5. 🔴 循环内局部变量反复 alloca → 栈溢出 —— 待修
 - 现象：每次循环迭代对循环体内的局部变量重新 `alloca` 且从不恢复栈指针；300 万次 `int j = i` → 栈溢出；对照组（循环内无变量声明）正常。
@@ -211,10 +211,10 @@
 ## 修复优先级建议（滚动更新）
 
 1. ~~1–3 裸崩溃三件套~~ ✅
-2. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
-3. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
-4. **4 + 5**（栈溢出两件套：递归深度计数器、循环 alloca 提升）
-5. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
+2. ~~4 深递归裸栈溢出~~ ✅（SP 探测 + thread_local 栈基址，见第 4 条）
+3. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
+4. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
+5. **5**（循环 alloca 栈溢出）→ 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
 6. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）
 7. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 8. 其余 🟡 按批次清理

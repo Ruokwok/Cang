@@ -1,0 +1,9 @@
+func int rec(int n) {
+    if (n <= 0) { return 0 }
+    int x = rec(n - 1)
+    return x + n
+}
+
+class Main()
+Stdout.println(rec(100000000))
+Stdout.println("unreachable")

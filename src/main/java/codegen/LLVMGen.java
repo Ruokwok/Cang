@@ -79,6 +79,10 @@ public class LLVMGen {
 
     private int tmpCount = 0;
     private int labelCount = 0;
+    // Native stack budget measured from the per-thread stack base: ~1MB Windows main thread
+    // crashes at ~20-30k skinny frames; 960KB trips the friendly error before the raw
+    // 0xC00000FD blowout while leaving headroom for the error path itself.
+    private static final long STACK_BUDGET = 983040L;
     private int strCount = 0;
 
     private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
@@ -854,6 +858,9 @@ public class LLVMGen {
         header.append("@.str.null = private constant [6 x i8] c\"null\\0A\\00\"\n");
         header.append("@.str.null.p = private constant [5 x i8] c\"null\\00\"\n");
         header.append("@.stack_depth = global i32 0\n");
+        // Per-thread native stack base (address of a frame near thread start). Set by main
+        // and every thread entry; function-entry SP probes compare against it (debug.md #4).
+        header.append("@.stack.base = internal thread_local global i64 0\n");
         header.append("@system.args = global i8* null\n\n");
 
 
@@ -1227,6 +1234,9 @@ public class LLVMGen {
             }
         }
 
+        // Stack-overflow guard (debug.md #4) — probe before running user code.
+        emitStackOverflowProbe(decl.line);
+
         // Generate body
         int bodyStart = body.length();
         generateBlockBody((Block) decl.body);
@@ -1345,6 +1355,50 @@ public class LLVMGen {
      * Always-fatal runtime error (print + exit), for unrecoverable conditions such as
      * double join or thread creation failure. Never routed through catch handlers.
      */
+    /**
+     * Record the current thread's stack base (debug.md #4). Called once at the start of
+     * main and of every thread entry; function-entry probes compare SP against this.
+     */
+    private void emitStackBaseSet(StringBuilder sb, String tag) {
+        String p = "%stkbase.p." + tag;
+        String v = "%stkbase.v." + tag;
+        sb.append("  ").append(p).append(" = alloca i8\n");
+        sb.append("  ").append(v).append(" = ptrtoint i8* ").append(p).append(" to i64\n");
+        sb.append("  store i64 ").append(v).append(", i64* @.stack.base\n");
+    }
+
+    /**
+     * Stack-overflow guard at function entry (debug.md #4): probe this frame's address and
+     * raise a friendly fatal error when the thread has used more than STACK_BUDGET bytes.
+     * The probe is SP-based, so it adapts to any frame size and needs no decrement on ret.
+     */
+    private void emitStackOverflowProbe(int line) {
+        int sid = labelCount++;
+        String okL = "stk.ok." + sid;
+        String ovfL = "stk.ovf." + sid;
+        String probe = "%stk.probe." + tmpCount++;
+        String sp = "%stk.sp." + tmpCount++;
+        String base = "%stk.base." + tmpCount++;
+        String lim = "%stk.lim." + tmpCount++;
+        String under = "%stk.under." + tmpCount++;
+        String nz = "%stk.nz." + tmpCount++;
+        // Value prefix must differ from the label prefix (%stk.ovf.N vs label stk.ovf.N
+        // share one namespace in LLVM — see debug.md #34).
+        String ovf = "%stk.need." + tmpCount++;
+        body.append("  ").append(probe).append(" = alloca i8\n");
+        body.append("  ").append(sp).append(" = ptrtoint i8* ").append(probe).append(" to i64\n");
+        body.append("  ").append(base).append(" = load i64, i64* @.stack.base\n");
+        body.append("  ").append(lim).append(" = sub i64 ").append(base).append(", ").append(STACK_BUDGET).append("\n");
+        body.append("  ").append(under).append(" = icmp ult i64 ").append(sp).append(", ").append(lim).append("\n");
+        body.append("  ").append(nz).append(" = icmp ne i64 ").append(base).append(", 0\n");
+        body.append("  ").append(ovf).append(" = and i1 ").append(nz).append(", ").append(under).append("\n");
+        body.append("  br i1 ").append(ovf).append(", label %").append(ovfL)
+             .append(", label %").append(okL).append("\n\n");
+        body.append(ovfL).append(":\n");
+        emitFatalError("Stack overflow: recursion too deep", line, okL);
+        body.append(okL).append(":\n");
+    }
+
     private void emitFatalError(String message, int line, String continuationLabel) {
         int id = runtimeErrorCount++;
         String msg = ensureStringConstant("@.str.rterror." + id, message + "\\0A\\00", message.length() + 2);
@@ -4093,6 +4147,8 @@ public class LLVMGen {
         StringBuilder x = new StringBuilder();
         x.append("define ").append(posix ? "i8*" : "i32")
          .append(" @cang.thread.entry.").append(id).append("(i8* %arg) {\nentry:\n");
+        // Per-thread stack base: the thread's own stack top (debug.md #4).
+        emitStackBaseSet(x, "th." + id);
 
         // Register this native thread with Boehm GC before any GC-managed allocation.
         // On Windows, GC_CreateThread attaches the thread itself; posix threads register here.
@@ -5062,6 +5118,7 @@ public class LLVMGen {
     private void generateAutoMain() {
         body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         body.append("entry:\n");
+        emitStackBaseSet(body, "main");
         if (gcEnabled) body.append("  call void @GC_init()\n");
 
         scope = new Scope(null);
@@ -5090,6 +5147,7 @@ public class LLVMGen {
     private void generateEntryPointMain(ClassDecl entryClass) {
         body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         body.append("entry:\n");
+        emitStackBaseSet(body, "main");
         if (gcEnabled) body.append("  call void @GC_init()\n");
 
         scope = new Scope(null);
