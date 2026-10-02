@@ -97,7 +97,7 @@
 
 ## 三、求值语义与 Java 相悖
 
-### 14. 🔴 `&&` / `||` 非短路 —— 待修（优先级最高的语义问题）
+### 14. ✅ `&&` / `||` 非短路 —— 已修复（短路 phi；t_shortcircuit + 回归 37/37）
 - 现象：两侧全部生成后再 `and i1`：`f && side()` 中 side 无条件执行；**`x != null && x.m()` 会崩**（Java 保护惯用法完全失效）。
 - 位置：`generateBinary`（约 2774-2791）。
 - 修复指引：标准短路 IR——左值算完 → `br` 到 rhs 块 / 短路块 → 两块汇合到 `phi i1`：
@@ -109,14 +109,14 @@
   ```
   注意：右操作数生成可能发射自己的 label（如嵌套短路、方法调用 null 检查），phi 前驱必须用生成后实际的"当前块"——用 `body` 追加位置构造标签名即可。三元 `?:`（约 3294）同样处理。
 
-### 15. 🔴 接收者/迭代对象重复求值 —— 待修
+### 15. ✅ 接收者/迭代对象重复求值 —— 已修复（generateMethodCall objCache 单次生成 + for-each iterable 复用）
 - 现象：`generateMethodCall` 为 List 探测、length 探测、正式分派对 `node.object` 各 `generateExpr` 一次（约 3731/3739/3818）→ `new File("x").getName()` 构造两次、`c.inc().show()` 中 inc 执行两次（副作用翻倍）；`generateForEach` 对 iterable 生成两次（约 2111+2127）。
 - 修复指引：
   - 方法调用：先 `LLVMValue objVal = generateExpr(node.object)` **一次**，List/length 探测改用缓存值判断（`listValue = objVal`），再进入正式路径。注意探测失败路径不能把已生成的 IR 作废（生成是追加式的，值缓存即可）。
   - for-each：同样先算 iterable 缓存复用。
   - 三元两支都生成（约 3294）：同 14 的分支方案。
 
-### 16. （并入 14/15）三元两支求值、foreach iterable 双生成 —— 见上。
+### 16. ✅ 三元两支求值、foreach iterable 双生成 —— 已修复（三元改分支+phi，仅命中支执行；见 14/15）
 
 ---
 
@@ -276,7 +276,7 @@
 3. ~~5 循环 alloca 栈溢出~~ ✅（stacksave/stackrestore，见第 5 条）
 4. ~~37 + 38 运行时数组分配 + 字段数组元素追踪~~ ✅（见第 37/38 条）
 5. ~~泛型多类型单态化（T71）+ 纯 Cang ArrayList（T72）~~ ✅：多具体类型每类一特化（重解析克隆 + 全键映射 + 钻石推断 + 未用模板跳过）；`stdlib/cang/lang/ArrayList.cang` 11 个方法，`t_arraylist` 29 断言（int+String 双类型同程序）全过，套件 35/35
-6. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
+6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
 8. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
 9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）

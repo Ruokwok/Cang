@@ -2311,7 +2311,7 @@ public class LLVMGen {
         loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
 
         // Evaluate iterable (get array pointer)
-        LLVMValue arrVal = generateExpr(stmt.iterable);
+        LLVMValue arrVal = iterable; // reuse: iterable was generated once (debug.md #16)
 
         // Load array length
         String lenVar = "%foreach.len." + tmpCount++;
@@ -3095,23 +3095,47 @@ public class LLVMGen {
 
     private LLVMValue generateBinary(BinaryExpr node) {
         LLVMValue left = generateExpr(node.left);
-        LLVMValue right = generateExpr(node.right);
 
         String op = node.op;
 
-        // Logical operators
-        if (op.equals("&&")) {
-            String result = "%and." + tmpCount++;
-            body.append("  ").append(result).append(" = and i1 ")
-                .append(ensureI1(left)).append(", ").append(ensureI1(right)).append("\n");
+        // Logical operators — short-circuit (debug.md #14): the right operand is only
+        // evaluated when the result is still undetermined. Right-side code may open its own
+        // blocks, so its value flows through a dedicated join-predecessor block for the phi.
+        if (op.equals("&&") || op.equals("||")) {
+            String l1 = ensureI1(left);
+            int id = labelCount++;
+            String rhsLabel = "sc.rhs." + id;
+            String shortLabel = "sc.short." + id;
+            String rhsDone = "sc.rhsdone." + id;
+            String joinLabel = "sc.join." + id;
+            if (op.equals("&&")) {
+                // left false → short-circuit false
+                body.append("  br i1 ").append(l1).append(", label %").append(rhsLabel)
+                     .append(", label %").append(shortLabel).append("\n\n");
+            } else {
+                // left true → short-circuit true
+                String lnot = "%sc.not." + tmpCount++;
+                body.append("  ").append(lnot).append(" = xor i1 ").append(l1).append(", 1\n");
+                body.append("  br i1 ").append(lnot).append(", label %").append(rhsLabel)
+                     .append(", label %").append(shortLabel).append("\n\n");
+            }
+            body.append(shortLabel).append(":\n");
+            body.append("  br label %").append(joinLabel).append("\n\n");
+            body.append(rhsLabel).append(":\n");
+            LLVMValue right = generateExpr(node.right);
+            String r1 = ensureI1(right);
+            body.append("  br label %").append(rhsDone).append("\n\n");
+            body.append(rhsDone).append(":\n");
+            body.append("  br label %").append(joinLabel).append("\n\n");
+            body.append(joinLabel).append(":\n");
+            String result = "%sc." + tmpCount++;
+            body.append("  ").append(result).append(" = phi i1 [ ")
+                 .append(op.equals("&&") ? "0" : "1").append(", %").append(shortLabel)
+                 .append(" ], [ ").append(r1).append(", %").append(rhsDone).append(" ]\n");
             return new LLVMValue(result, "i1");
         }
-        if (op.equals("||")) {
-            String result = "%or." + tmpCount++;
-            body.append("  ").append(result).append(" = or i1 ")
-                .append(ensureI1(left)).append(", ").append(ensureI1(right)).append("\n");
-            return new LLVMValue(result, "i1");
-        }
+
+        LLVMValue right = generateExpr(node.right);
 
         // Comparison operators
         if (op.equals("==") || op.equals("!=") || op.equals("<") || op.equals(">") ||
@@ -3667,14 +3691,30 @@ public class LLVMGen {
         LLVMValue cond = generateExpr(node.condition);
         String i1Cond = ensureI1(cond);
 
+        // Only the taken branch executes (debug.md #16): branch + phi instead of select.
+        int id = labelCount++;
+        String tLabel = "tern.t." + id;
+        String fLabel = "tern.f." + id;
+        String joinLabel = "tern.join." + id;
+        body.append("  br i1 ").append(i1Cond).append(", label %").append(tLabel)
+             .append(", label %").append(fLabel).append("\n\n");
+
+        body.append(tLabel).append(":\n");
         LLVMValue trueVal = generateExpr(node.trueExpr);
+        String tOp = castValue(trueVal, trueVal.type);
+        body.append("  br label %").append(joinLabel).append("\n\n");
+
+        body.append(fLabel).append(":\n");
         LLVMValue falseVal = generateExpr(node.falseExpr);
+        // Casts must be emitted inside their own block (phi has to be first in the join block).
+        String fOp = castValue(falseVal, trueVal.type);
+        body.append("  br label %").append(joinLabel).append("\n\n");
 
+        body.append(joinLabel).append(":\n");
         String result = "%ternary." + tmpCount++;
-        body.append("  ").append(result).append(" = select i1 ").append(i1Cond)
-             .append(", ").append(trueVal.type).append(" ").append(castValue(trueVal, trueVal.type))
-             .append(", ").append(falseVal.type).append(" ").append(castValue(falseVal, trueVal.type)).append("\n");
-
+        body.append("  ").append(result).append(" = phi ").append(trueVal.type)
+             .append(" [ ").append(tOp).append(", %").append(tLabel)
+             .append(" ], [ ").append(fOp).append(", %").append(fLabel).append(" ]\n");
         return new LLVMValue(result, trueVal.type);
     }
 
@@ -4069,8 +4109,12 @@ public class LLVMGen {
                 && node.method.equals("spawn")) {
             return generateThreadSpawn(node);
         }
+        // Receiver is generated at most once (debug.md #15): the join probe, the array-length
+        // probe and the regular instance path share the same value.
+        LLVMValue objCache = null;
         if (node.object != null && node.method.equals("join")) {
-            LLVMValue receiver = generateExpr(node.object);
+            objCache = generateExpr(node.object);
+            LLVMValue receiver = objCache;
             if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
                 if (!node.args.isEmpty()) throw new RuntimeException("Thread.join accepts no arguments (at line " + node.line + ")");
                 return generateThreadJoin(receiver, node.line);
@@ -4101,7 +4145,8 @@ public class LLVMGen {
 
         // Arrays expose length() as a built-in method. The length is stored in the i64 header.
         if (node.method.equals("length") && node.args.isEmpty()) {
-            LLVMValue arrayValue = generateExpr(node.object);
+            if (objCache == null) objCache = generateExpr(node.object);
+            LLVMValue arrayValue = objCache;
             if (arrayValue.semanticType != null && isArraySemanticType(arrayValue.semanticType)) {
                 String length64 = "%arr.length." + tmpCount++;
                 String length32 = "%arr.length.i32." + tmpCount++;
@@ -4181,7 +4226,8 @@ public class LLVMGen {
         }
 
         // Regular method call
-        LLVMValue objVal = generateExpr(node.object);
+        if (objCache == null) objCache = generateExpr(node.object);
+        LLVMValue objVal = objCache;
         if ("str".equals(objVal.semanticType)) {
             throw new RuntimeException("str is a primitive type and has no methods (at line " + node.line + ")");
         }
