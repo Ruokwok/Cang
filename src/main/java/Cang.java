@@ -456,7 +456,7 @@ public class Cang {
 
     /** Standard library files shipped as classpath resources inside the packaged jar (paths relative to stdlib/). */
     private static final String[] BUNDLED_STDLIB_FILES = {
-        "cang/lang/Object.cang", "cang/lang/Stdout.cang", "cang/lang/String.cang",
+        "cang/lang/Object.cang", "cang/lang/Stdout.cang", "cang/lang/Stderr.cang", "cang/lang/String.cang",
         "cang/lang/Math.cang", "cang/lang/System.cang", "cang/lang/Function.cang",
         "cang/lang/Void.cang", "cang/lang/Thread.cang", "cang/lang/Error.cang",
         "cang/lang/List.cang",

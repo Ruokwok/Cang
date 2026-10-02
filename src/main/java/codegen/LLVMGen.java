@@ -50,6 +50,7 @@ public class LLVMGen {
         boolean isConstructor;
         boolean isStatic;
         boolean isFinal;
+        boolean isNative;
     }
 
     static class LoopContext {
@@ -837,6 +838,12 @@ public class LLVMGen {
     private void collectFunction(FuncDecl decl, String className) {
         String funcName = (className != null ? className + "." : "") + decl.name;
         if (functions.containsKey(funcName)) {
+            // Native overload surface (Stdout.print/println, Stderr...): declaration-only docs
+            // for name-based builtin dispatch — first declaration wins instead of erroring,
+            // so `import cang/lang/Stdout` no longer crashes (was: Duplicate function).
+            if (functions.get(funcName).isNative && decl.isNative) {
+                return;
+            }
             String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
             String srcLine = readSourceLine(file, decl.line);
             throw new util.CompileError(
@@ -850,6 +857,7 @@ public class LLVMGen {
         info.className = className;
         info.isStatic = decl.isStatic;
         info.isFinal = decl.isFinal;
+        info.isNative = decl.isNative;
         for (Parameter p : decl.params) {
             info.paramTypes.add(p.type);
             info.paramNames.add(p.name);
@@ -892,6 +900,14 @@ public class LLVMGen {
         header.append("declare i8* @realloc(i8*, i64)\n");
         header.append("declare void @free(i8*)\n");
         header.append("declare i32 @printf(i8*, ...)\n");
+        header.append("declare i32 @fprintf(i8*, i8*, ...)\n");
+        if (targetPlatform.equals("windows")) {
+            // MinGW/UCRT stderr = __acrt_iob_func(2) (FILE* slot for STDERR; linkprobe-verified)
+            header.append("declare i8* @__acrt_iob_func(i32)\n");
+        } else {
+            // glibc: stderr is a global FILE* (darwin may need ___stderrp when compileMacOS lands)
+            header.append("@stderr = external global i8*\n");
+        }
         header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
         header.append("declare i64 @strlen(i8*)\n");
         header.append("declare i32 @strcmp(i8*, i8*)\n");
@@ -4192,6 +4208,12 @@ public class LLVMGen {
             if (objName.equals("Stdout") && node.method.equals("println")) {
                 return generateStdoutPrint(node.args, true);
             }
+            if (objName.equals("Stderr") && node.method.equals("print")) {
+                return generateStdoutPrint(node.args, false, true);
+            }
+            if (objName.equals("Stderr") && node.method.equals("println")) {
+                return generateStdoutPrint(node.args, true, true);
+            }
             if (objName.equals("Math")) {
                 return generateMathCall(node.method, node.args, node.line);
             }
@@ -4787,7 +4809,24 @@ public class LLVMGen {
     }
 
     private LLVMValue generateStdoutPrint(List<AST> args, boolean newline) {
-        if (args.isEmpty()) throw new RuntimeException("Stdout.print requires an argument");
+        return generateStdoutPrint(args, newline, false);
+    }
+
+    private LLVMValue generateStdoutPrint(List<AST> args, boolean newline, boolean toStderr) {
+        if (args.isEmpty()) throw new RuntimeException((toStderr ? "Stderr" : "Stdout") + ".print requires an argument");
+        // Call prefix: stdout uses printf(fmt, ...); stderr uses fprintf(stream, fmt, ...).
+        String callPre;
+        if (toStderr) {
+            String se = "%stderr." + tmpCount++;
+            if (targetPlatform.equals("windows")) {
+                body.append("  ").append(se).append(" = call i8* @__acrt_iob_func(i32 2)\n");
+            } else {
+                body.append("  ").append(se).append(" = load i8*, i8** @stderr\n");
+            }
+            callPre = "call i32 (i8*, i8*, ...) @fprintf(i8* " + se + ", i8* ";
+        } else {
+            callPre = "call i32 (i8*, ...) @printf(i8* ";
+        }
         LLVMValue argVal = generateExpr(args.get(0));
         String fmtType = cangTypeFromLLVM(argVal.type);
         // println uses fmtConstants (with \n), print uses fmtConstantsNoNL (without \n)
@@ -4810,17 +4849,17 @@ public class LLVMGen {
             // Null case: print "null" (with or without newline)
             body.append("print.null.").append(id).append(":\n");
             if (newline) {
-                body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([6 x i8], [6 x i8]* ")
+                body.append("  ").append(callPre).append("getelementptr ([6 x i8], [6 x i8]* ")
                      .append("@.str.null").append(", i32 0, i32 0))\n");
             } else {
-                body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([5 x i8], [5 x i8]* ")
+                body.append("  ").append(callPre).append("getelementptr ([5 x i8], [5 x i8]* ")
                      .append("@.str.null.p").append(", i32 0, i32 0))\n");
             }
             body.append("  br label %").append(endLabel).append("\n\n");
 
             // Not null: print normally
             body.append(notNullLabel).append(":\n");
-            body.append("  call i32 (i8*, ...) @printf(i8* ").append(fmtName)
+            body.append("  ").append(callPre).append(fmtName)
                  .append(", i8* ").append(argVal.value).append(")\n");
             body.append("  br label %").append(endLabel).append("\n\n");
 
@@ -4852,7 +4891,7 @@ public class LLVMGen {
             argType = argVal.type;
         }
 
-        body.append("  call i32 (i8*, ...) @printf(i8* ").append(fmtName)
+        body.append("  ").append(callPre).append(fmtName)
              .append(", ").append(argType).append(" ").append(argStr).append(")\n");
 
         return new LLVMValue("void", "void");

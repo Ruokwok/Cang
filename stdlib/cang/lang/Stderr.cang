@@ -1,0 +1,23 @@
+namespace cang/lang
+
+# Stderr - 标准错误输出
+# 编译器内置，无需 import；打印目标为标准错误（stderr），成员方法与 Stdout 一致
+class Stderr
+
+# 打印（不换行）
+static native func void print(int value)
+static native func void print(long value)
+static native func void print(float value)
+static native func void print(double value)
+static native func void print(bool value)
+static native func void print(String value)
+static native func void print(byte value)
+
+# 打印并换行（println）
+static native func void println(int value)
+static native func void println(long value)
+static native func void println(float value)
+static native func void println(double value)
+static native func void println(bool value)
+static native func void println(String value)
+static native func void println(byte value)

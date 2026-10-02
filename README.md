@@ -20,7 +20,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - `Function<R, ...>` 函数对象；
 - lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
-- `Math`、`System`、`Stdout`、`String` 等基础标准库；
+- `Math`、`System`、`Stdout`、`Stderr`、`String` 等基础标准库；
 - `try/catch/finally` 与 `Error` 的第一版实现；
 - Boehm GC 自动内存管理（默认）+ `free` 提前释放，`--no-gc` 可切回手动模式；
 - Windows、Linux、macOS 目标平台常量和基础交叉编译参数。
