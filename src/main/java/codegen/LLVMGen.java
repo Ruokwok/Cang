@@ -2829,6 +2829,24 @@ public class LLVMGen {
             default: throw new RuntimeException("Unknown operator: " + op);
         }
 
+        // Integer division/remainder by zero traps on x86 (#DE → SIGFPE) and is poison in
+        // LLVM semantics — raise a catchable error instead.
+        if (!isFloat && (irOp.equals("sdiv") || irOp.equals("srem") || irOp.equals("udiv") || irOp.equals("urem"))) {
+            int id = labelCount++;
+            String okLabel = "divok." + id;
+            String zeroLabel = "divzero." + id;
+            // Value name must not collide with the basic-block label: LLVM keeps values and
+            // labels in one namespace (%divzero.N vs label %divzero.N would be ambiguous).
+            String isZero = "%iszero." + tmpCount++;
+            body.append("  ").append(isZero).append(" = icmp eq ").append(commonType).append(" ")
+                 .append(r).append(", 0\n");
+            body.append("  br i1 ").append(isZero).append(", label %").append(zeroLabel)
+                 .append(", label %").append(okLabel).append("\n\n");
+            body.append(zeroLabel).append(":\n");
+            emitRuntimeError("Division by zero", node.line, okLabel);
+            body.append(okLabel).append(":\n");
+        }
+
         body.append("  ").append(result).append(" = ").append(irOp).append(" ")
             .append(commonType).append(" ").append(l).append(", ").append(r).append("\n");
 
@@ -2847,6 +2865,23 @@ public class LLVMGen {
         if (!right.type.equals("i8*")) {
             right = convertToString(right);
         }
+
+        // Java semantics: a null operand concatenates as the literal "null"
+        // (calling strlen on NULL would SEGV).
+        String nullStr = "%cat.nullp." + tmpCount++;
+        body.append("  ").append(nullStr).append(" = getelementptr [5 x i8], [5 x i8]* @.str.null.p, i32 0, i32 0\n");
+        String lNull = "%cat.ln." + tmpCount++;
+        body.append("  ").append(lNull).append(" = icmp eq i8* ").append(left.value).append(", null\n");
+        String lUse = "%cat.lu." + tmpCount++;
+        body.append("  ").append(lUse).append(" = select i1 ").append(lNull).append(", i8* ").append(nullStr)
+             .append(", i8* ").append(left.value).append("\n");
+        String rNull = "%cat.rn." + tmpCount++;
+        body.append("  ").append(rNull).append(" = icmp eq i8* ").append(right.value).append(", null\n");
+        String rUse = "%cat.ru." + tmpCount++;
+        body.append("  ").append(rUse).append(" = select i1 ").append(rNull).append(", i8* ").append(nullStr)
+             .append(", i8* ").append(right.value).append("\n");
+        left = new LLVMValue(lUse, "i8*");
+        right = new LLVMValue(rUse, "i8*");
 
         // Get lengths
         String lenLeft = "%len.l." + tmpCount++;
@@ -3202,6 +3237,20 @@ public class LLVMGen {
                 throw new RuntimeException("Cannot assign to final variable '" + fa.field + "' (at line " + node.line + ")");
             }
             LLVMValue objPtr = generateExprForPtr(fa.object);
+            // Null pointer check for field writes (store on null would SEGV).
+            if (objPtr.type.equals("i8*") || (objPtr.type.startsWith("%") && objPtr.type.endsWith("*"))) {
+                int id = labelCount++;
+                String notNullLabel = "nonnull." + id;
+                String nullLabel = "isnull." + id;
+                String isNull = "%null." + tmpCount++;
+                body.append("  ").append(isNull).append(" = icmp eq ").append(objPtr.type)
+                     .append(" ").append(objPtr.value).append(", null\n");
+                body.append("  br i1 ").append(isNull).append(", label %").append(nullLabel)
+                     .append(", label %").append(notNullLabel).append("\n\n");
+                body.append(nullLabel).append(":\n");
+                emitRuntimeError("Null pointer dereference", node.line, notNullLabel);
+                body.append(notNullLabel).append(":\n");
+            }
             String className = extractClassName(objPtr.type);
             ClassInfo ci = classes.get(className);
             if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
@@ -4471,6 +4520,22 @@ public class LLVMGen {
             throw new RuntimeException("Cannot access field '" + node.field + "' on '" + objDesc +
                 "' 閳?'this' is only valid inside class methods (line " + node.line + ")");
         }
+        // Null pointer check for field reads (same pattern as method calls): a GEP+load on
+        // null would SEGV instead of raising a catchable Error.
+        if (objPtr.type.equals("i8*") || (objPtr.type.startsWith("%") && objPtr.type.endsWith("*"))) {
+            int id = labelCount++;
+            String notNullLabel = "nonnull." + id;
+            String nullLabel = "isnull." + id;
+            String isNull = "%null." + tmpCount++;
+            body.append("  ").append(isNull).append(" = icmp eq ").append(objPtr.type)
+                 .append(" ").append(objPtr.value).append(", null\n");
+            body.append("  br i1 ").append(isNull).append(", label %").append(nullLabel)
+                 .append(", label %").append(notNullLabel).append("\n\n");
+            body.append(nullLabel).append(":\n");
+            emitRuntimeError("Null pointer dereference", node.line, notNullLabel);
+            body.append(notNullLabel).append(":\n");
+        }
+
         String className = extractClassName(objPtr.type);
         ClassInfo ci = classes.get(className);
         if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
@@ -4520,6 +4585,21 @@ public class LLVMGen {
             // For chained field access (obj.field.field2), we need the intermediate pointer
             FieldAccessExpr fa = (FieldAccessExpr) node;
             LLVMValue objPtr = generateExprForPtr(fa.object);
+            // Null check on the object being GEP'd: GEP on null yields a small non-null
+            // address, so the outer load/store would still SEGV without this check.
+            if (objPtr.type.equals("i8*") || (objPtr.type.startsWith("%") && objPtr.type.endsWith("*"))) {
+                int id = labelCount++;
+                String notNullLabel = "nonnull." + id;
+                String nullLabel = "isnull." + id;
+                String isNull = "%null." + tmpCount++;
+                body.append("  ").append(isNull).append(" = icmp eq ").append(objPtr.type)
+                     .append(" ").append(objPtr.value).append(", null\n");
+                body.append("  br i1 ").append(isNull).append(", label %").append(nullLabel)
+                     .append(", label %").append(notNullLabel).append("\n\n");
+                body.append(nullLabel).append(":\n");
+                emitRuntimeError("Null pointer dereference", node.line, notNullLabel);
+                body.append(notNullLabel).append(":\n");
+            }
             String className = extractClassName(objPtr.type);
             ClassInfo ci = classes.get(className);
             if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
@@ -6211,8 +6291,12 @@ public class LLVMGen {
 
     private String extractClassName(String llvmType) {
         // "%ClassName*" 閳?"ClassName"
+        // Strip every trailing '*' so pointer-to-pointer types ("%Inner**" from
+        // chained field access p.inner.value) also resolve to the class name.
         if (llvmType.startsWith("%") && llvmType.endsWith("*")) {
-            return llvmType.substring(1, llvmType.length() - 1);
+            String s = llvmType.substring(1);
+            while (s.endsWith("*")) s = s.substring(0, s.length() - 1);
+            return s;
         }
         if (llvmType.startsWith("%")) {
             return llvmType.substring(1);

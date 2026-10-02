@@ -1,0 +1,220 @@
+# Cang 已知问题与修复指引（debug.md）
+
+> 来源：全量代码审查（LLVMGen 崩溃向量 / 类型与求值一致性 / Parser 与入口 / 内存与线程，四路并行实测取证）。
+> 状态图例：🔴 崩溃或错误程序被静默接受 ｜ 🟡 行为不一致 / 体验差 ｜ ⚪ 已知设计取舍 ｜ ✅ 已修复
+> 注意：文中行号为审计时快照，后续编辑可能造成偏移，请以符号名/代码片段定位。
+
+---
+
+## 一、运行时裸崩溃（无友好报错，SEGV / SIGFPE）
+
+### 1. ✅ null 字段读 SEGV —— 已修复
+- 现象：`Person p = null; Stdout.println(p.age)` 对 null 直接 GEP+load → 写零页崩溃；方法调用有 null 检查，字段读没有。
+- 修复：`generateFieldAccess` 在 GEP 前插入与方法调用同款检查（icmp + `emitRuntimeError("Null pointer dereference")`，可被 catch 捕获）。
+- 验证：`test/t_nullfield.cang` → exit 1 + `error: Null pointer dereference at :3`。
+
+### 2. ✅ null 字段写 SEGV —— 已修复
+- 现象：`p.age = 1`（p 为 null）→ store 到零页。
+- 修复：`generateAssign` 字段分支同样插入 null 检查。
+- 验证：`test/t_nullfield_w.cang`。
+
+### 3. ✅ 字符串拼接 null SEGV —— 已修复
+- 现象：`"a" + s`（s 为 null，如 `f.readText()` 打不开返回 null）→ `strlen(NULL)` 崩溃。
+- 修复：`generateStringConcat` 对两侧做 `select` 守卫，null 操作数替换为 `"null"` 字面量，**对齐 Java 语义**（`"a"+null` → `anull`）。
+- 验证：`test/t_strnull.cang` → `anull / nullb / nullnull / [null]`。
+
+### 4. 🔴 深递归裸栈溢出 —— 待修
+- 现象：100 万层递归 → `0xC00000FD` 原生栈溢出，进程无任何提示；`@.stack_depth`（emitHeader 内）定义后从未使用；编译期无深度限制。
+- 修复指引（推荐：深度计数器）：
+  - 在 `emitHeader` 把 `@.stack_depth` 注释为深度计数器，配一个常量上限（如 10000，对齐 Java 帧数经验）。
+  - `generateFunction` 生成函数体前发 `enter`：`atomicrmw add` 自增（线程安全）→ load → `icmp ugt limit` → 超限走 `emitFatalError("Stack overflow: recursion too deep", ...)`（用 Fatal 不用 catchable，避免 catch 内递归无限循环）。
+  - 每个 `ret` 前发 `leave`：`atomicrmw sub`。注意 `generateReturn` 与 `generateFunction` 尾部隐式 ret 都要覆盖；用生成器侧的"当前函数是否有守卫"栈跟踪（lambda/嵌套 codegen 场景）。
+  - native 函数（无 body）与构造器首版可不加（递归几乎都经用户函数/方法）。
+  - 线程入口把计数器视为全局和即可：检查只可能出现保守误报（多线程深度之和超限提前报错），不会漏报（单线程深度 ≤ 全局计数）。
+- 验证：`func int f(int n){ return f(n+1) }` 应打印 `error: Stack overflow...` 退出 1，而非 ACCESS_VIOLATION。
+
+### 5. 🔴 循环内局部变量反复 alloca → 栈溢出 —— 待修
+- 现象：每次循环迭代对循环体内的局部变量重新 `alloca` 且从不恢复栈指针；300 万次 `int j = i` → 栈溢出；对照组（循环内无变量声明）正常。
+- 位置：`generateVarDecl` 的 alloca 路径（约 1700 行）；循环体 codegen 无栈帧回收概念。
+- 修复指引（二选一）：
+  - **循环外提升（推荐）**：进入循环前把循环体内所有声明的变量 alloca 一次（需在语句遍历时收集声明名），迭代内只 store。可只对 while/for 体做一趟声明收集。
+  - 或函数入口统一 alloca：所有局部变量在函数入口分配（名字编译期可确定），语句处只发 store。改动面更大但一劳永逸。
+- 验证：300 万次迭代循环体含 `int j = i` 应正常结束。
+
+### 6. 🔴 编译器自身深嵌套 StackOverflowError —— 待修
+- 现象：2 万层括号 → 未捕获 `java.lang.StackOverflowError` 裸栈回溯。
+- 位置：`Parser.java` 递归下降（约 833 行，表达式递归）。
+- 修复指引：顶层 parse 入口 `catch (StackOverflowError e)` → 转成 `CompileError("expression nesting too deep")`（带文件行列）；可选：给递归深度计数、超过阈值主动抛 CompileError（更可控）。
+
+---
+
+## 二、错误程序被静默接受（编译器该拦没拦）
+
+### 7. 🔴 赋值完全不查类型 —— 待修
+- 现象：`int q; q = "s"` 前端 EXIT 0，直到 clang 才报 `'%str.0' but expected 'i32'`（报错无源码定位）。
+- 位置：`generateAssign` 变量分支（约 3189）只 `castValue` 不校验。
+- 修复指引：仿照 `generateVarDecl`（约 1801）的检查：声明类型（scope 里存的 llvmType/cangType）与右值 `semanticType`/llvmType 比对，不兼容抛 `Cannot assign <X> to <Y> (at line N)`。注意 `castValue` 可能隐式拓宽——只拦"收窄/不相关"（i32→i8*、i8*→i32、double→int 等）。
+
+### 8. 🔴 字面量/收窄无范围检查 —— 待修
+- 现象：`int y = 9999999999` 编译链接成功，运行得 `1410065407`（静默环绕）；`byte b = 300` → 44（Java 拒）；`int m = doubleVar` 静默 `fptosi`。
+- 位置：`IntLit` codegen（约 2272）无范围检查；`castValue` 浮→整无告警。
+- 修复指引：
+  - 字面量：按声明目标类型检查（byte: -128..127、int: ±2^31、long: ±2^63），超范围编译错误（Java 语义）；无目标类型时按默认（超 int 用 long，再超报错）。
+  - `byte b = 300`：在 var-decl/assign 的类型检查里做常量范围校验。
+  - double→int：至少警告或报错（Java 是编译错误，`int m = 3.5` 拒；`int m = (int)3.5` 才行——若 Cang 暂无强转语法，可先只拦字面量、放行变量）。
+
+### 9. 🔴 str/String 检查绕过 —— 待修
+- 现象：方法返回值 `semanticType` 多为 null → `str s = 返回String的方法()`、`String s = 返回str的方法()`、甚至 `str t = 5` 全静默通过（后者直出非法 IR）；而字面量 `str s = "x"` 报错——标准倒挂。
+- 位置：`generateVarDecl`（约 1801）条件依赖 `val.semanticType != null`；`generateMethodCall` 返回值（约 3904）只对 Array 附 semanticType。
+- 修复指引：
+  - 短期（最小）：方法调用返回值按 `fi.returnType` 附 semanticType（String/str/bool/int... 都附）；同步检查既有测试是否依赖"方法返回可赋给 str"的宽松行为。
+  - 数值兜底：`str t = 5` 这类 llvmType 不匹配（i32 vs i8*）应硬报错，不依赖 semanticType。
+
+### 10. 🔴 数组写无边界检查（读有写无）—— 待修
+- 现象：`a[99] = 5; a[-1] = 7` 编译通过 → 堆越界写/内存破坏；读路径有 `Array index out of bounds` 检查。
+- 位置：`generateArrayAssign`（约 3235-3292）直接 store；读检查模板在约 4856-4870（`icmp slt/ge + emitRuntimeError`）。
+- 修复指引：写路径照抄读路径：负数 + `≥ length` 双检 → `emitRuntimeError("Array index out of bounds", line, ok)`。注意先 load 长度头再比较（读路径现有实现里数组为 null 时先 load 崩——顺手把 null 数组检查也补上，读写都要）。
+
+### 11. 🔴 重复定义三套标准不一致 —— 待修
+- 现象：重复函数报错（`Duplicate function`）；重复 class `classes.put` 静默覆盖（同文件两个 `class Main` EXIT 0，跨文件同名类字段不同 → 下游误导性 `Unknown field` 且定位错）；重复变量生成两个 `%v.x=alloca`，clang 才报 multiple definition。
+- 位置：`LLVMGen` `classes.put`（约 467）、`collectFunction`（约 743，有查重）、var-decl 无查重。
+- 修复指引：统一策略——`collectClass` 对已存在的同 fullName 抛 `Duplicate class`；`generateVarDecl` 在 scope.define 前查 `scope.lookup(name) != null`（限同层作用域，考虑 shadowing 规则是否允许内层遮蔽——若允许，只查同层）。
+
+### 12. 🔴 必返分析是 IR 文本匹配 —— 待修
+- 现象：对整个函数 IR 搜 `"\n  ret "`。漏报：`func int f(bool c){ if(c){ return 1 } }`、switch 全 return → 编译过但产无终止符 endLabel → clang `expected instruction opcode`；误报：`func int w(){ while(true){} }` 被拒（Java 合法）。
+- 位置：必返检查（约 1236-1259）；无终止符 label 发射点约 1893/1965。
+- 修复指引：
+  - 把"文本搜 ret"换成 AST 级控制流分析：`alwaysReturns(block)` 递归——Return 恒真；Block 看最后非空语句；If 两支都真且有 else；Switch 全 case+default 都真；While/For 循环体真且条件非常量 true 时假（`while(true)` 无 break → 真）；Try 看 try 块。
+  - 发射侧兜底：函数结束时若当前块还没有 terminator，按返回类型补默认 ret 或报"missing return"，保证 IR 永远有终结符（治标先于治本）。
+
+### 13. 🔴 return 在 try 内 → 跳过 finally + 无效 IR —— 待修（与 20/21 同域）
+- 现象：`try { return } finally { ... }` 跳过 finally 执行，且 `try.continue.N` 空块无终结符 → clang 编译失败（实测 `zz_fin_return`）。
+- 修复指引：见第五节 20 的统一方案。
+
+---
+
+## 三、求值语义与 Java 相悖
+
+### 14. 🔴 `&&` / `||` 非短路 —— 待修（优先级最高的语义问题）
+- 现象：两侧全部生成后再 `and i1`：`f && side()` 中 side 无条件执行；**`x != null && x.m()` 会崩**（Java 保护惯用法完全失效）。
+- 位置：`generateBinary`（约 2774-2791）。
+- 修复指引：标准短路 IR——左值算完 → `br` 到 rhs 块 / 短路块 → 两块汇合到 `phi i1`：
+  ```
+  lhs → br i1 %l, label %rhs, label %short   (&&; || 反向)
+  rhs: %r = <生成右操作数> → br label %join
+  short: br label %join
+  join: %res = phi i1 [ false/true, %short ], [ %r, %rhs ]
+  ```
+  注意：右操作数生成可能发射自己的 label（如嵌套短路、方法调用 null 检查），phi 前驱必须用生成后实际的"当前块"——用 `body` 追加位置构造标签名即可。三元 `?:`（约 3294）同样处理。
+
+### 15. 🔴 接收者/迭代对象重复求值 —— 待修
+- 现象：`generateMethodCall` 为 List 探测、length 探测、正式分派对 `node.object` 各 `generateExpr` 一次（约 3731/3739/3818）→ `new File("x").getName()` 构造两次、`c.inc().show()` 中 inc 执行两次（副作用翻倍）；`generateForEach` 对 iterable 生成两次（约 2111+2127）。
+- 修复指引：
+  - 方法调用：先 `LLVMValue objVal = generateExpr(node.object)` **一次**，List/length 探测改用缓存值判断（`listValue = objVal`），再进入正式路径。注意探测失败路径不能把已生成的 IR 作废（生成是追加式的，值缓存即可）。
+  - for-each：同样先算 iterable 缓存复用。
+  - 三元两支都生成（约 3294）：同 14 的分支方案。
+
+### 16. （并入 14/15）三元两支求值、foreach iterable 双生成 —— 见上。
+
+---
+
+## 四、内存（`--no-gc` 必现泄漏 + UAF）
+
+### 17. 🔴 readLines 行副本不可 free —— 待修
+- 现象：`String[] l = f.readLines(); free l` 只释放数组头；每行 `strndup` 副本与内部整文件缓冲永不可达（`generateFree` 拒 String）。实测 `--no-gc` 3.84MB×200 次峰值 1705MB（≈8.5MB/次），GC 模式 13MB。
+- 修复指引（择一）：
+  - `free` 数组时若是"字符串数组"（arrayElemTypes 可查到元素为 String/i8*）遍历释放各元素再释放头——需要在 free 处知道元素类型（`arrayElemCangTypes` 有记录 ✓）。
+  - 或 readLines 内部 `%text` 整文件缓冲用完即 `free`（它是临时 buffer，不是交付物），行副本仍不可 free → 至少减半泄漏；文档继续注明"推荐默认 GC 模式"。
+  - 终态建议：允许 `free` 带 semanticType String 的值（当前 generateFree 拒绝）→ 用户可逐个释放；需要同步文档。
+
+### 18. 🔴 List free 漏内部 `_data` 缓冲 —— 待修
+- 现象：`free l` 只 free 24B 对象头，`_data`（初 64B、realloc 扩容）无 free 路径。实测 200 万次 new+free 峰值 83MB（GC 5MB）。
+- 位置：`generateFree` 对 `%CangList*` 只 free 对象（约 4552/3561/1660 相关）。
+- 修复指引：`free` 分支识别 `%CangList*` → 先 load 字段 0（data 指针）`free`，再 free 对象本体。同样考虑递归释放元素？v1 只释放 data 缓冲（元素若是对象由 GC/no-gc 语义另行决定，文档注明）。
+
+### 19. 🟡 freedVars 按名全局污染 + 别名 UAF —— 待修
+- 现象：`g(){ free x }` 后 `h()` 同名 `x` 编译报 `Use of freed variable`（freedVars 是函数间共享的 Set）；`b = a; free a; print(b[0])` 编译通过（别名不查，UAF）。
+- 位置：`freedVars`（约 106 声明、1663 加入、2725 检查）。
+- 修复指引：
+  - freedVars 改为**按函数作用域**：`generateFunction` 入口快照/出口恢复（或直接 clear——函数间本就不应共享）。
+  - 别名追踪成本高（v1）：至少文档声明"free 后不得使用任何别名"；可选做保守版本——free 时把"同 llvmType 的指针变量"标记可疑（过度保守会误报，需权衡）。首版建议只修作用域污染。
+
+---
+
+## 五、try / catch / finally 语义缺口
+
+### 20. 🔴 try 内 break/continue 跳过 finally + 双终结符 IR —— 待修
+- 现象：try 内 `break`/`continue` 直接 br 到循环标签跳过 finally（实测 finally 无输出），且产生双终结符 IR。
+- 位置：`generateBreakContinue`（约 1303-1310）。
+### 21. 🟡 catch 内 throw 跳过 finally —— 待修
+- 位置：约 1463（pop handler）+ 1484（直跳外层）。
+### 13（并入）return 在 try 内跳过 finally + 空块无终结符 —— 约 2223/1501/1237。
+
+- **统一修复指引（三条同一机制）**：实现"finally 复制/跳板"——
+  1. break/continue/return/throw 若位于 try 内：先跳到 finally 执行块，finally 完成后再 br 到真实目标（用一个"pending 目标"局部变量或按目标复制 finally 体）。
+  2. toy 级简化方案：把 finally 体在每个退出点**内联重复生成**（代码膨胀但改动小、无新 IR 机制）——break/continue/return/正常落空/catch-throw 五个出口各插一份。
+  3. 每个出口点同时保证"当前块有且仅有一个终结符"（emit 后续代码前检查/切块），治 13 的无效 IR。
+
+---
+
+## 六、语句分隔不看行号（Parser 设计层）
+
+### 22. 🔴 分号可选但完全不比较行号 —— 待修（动静最大，改前需设计）
+- 现象：语句靠"下一个 token 不能续写表达式"分隔，从不看 NEWLINE：`x = y⏎-1` 被静默解析成 `x = y - 1`；`a = bb⏎(3).foo()` 跨行链式 → 误导报错且定位 1:1；`var t = s⏎[1,2]` 解析错乱。
+- 位置：`Parser.java` 语句循环（约 1076）只吃一个 `;`；无 NEWLINE token；token 有 `.line` 字段但未用于分隔判断。
+- 修复指引（推荐路径）：
+  1. Lexer 把换行保留为 `NEWLINE` token（或记录 token.line 即可，不需真 token）。
+  2. 表达式续写规则收紧为：**仅当下一 token 与当前 token 不同行时**才允许 `(`/`[`/`.`/一元减 续写（同行的 `a\n-1` 拆开；跨行 `x\n(1)` 拆开——代价是 fluent 风格跨行链式调用需行尾加 `.` 或括号包裹，需在 doc.md 明确）。
+  3. 语句结束判定：`;` 或 NEWLINE 或 `}`。
+  4. 分两步落地：先加 NEWLINE token + 只在语句边界消费（不改续写规则）跑全量回归，再收紧续写。
+- 回归要求：现有 23 项 + 全部 z_ 样例（修复时重建）。
+
+---
+
+## 七、体验 / 一致性问题
+
+### 23. 🟡 `+=` 词法有 Parser 不认 —— Lexer 产出 `PLUS_ASSIGN`（约 234）但 Parser 从不消费 → `x += 1` 报 `Unexpected token: PLUS_ASSIGN`。修复：Parser 赋值层识别 `PLUS_ASSIGN` 等复合算符，desugar 成 `x = x + 1`（注意先求值一次目标，数组元素下标同理）。### 24. 🟡 switch：重复 `case` 无检查（Java 报 duplicate case）；`case` 类型不匹配报错定位到 switch 行（应用 case 行）；`a[0]++` 报错行号错指第 1 行（Increment target 校验用错 line）。### 25. 🟡 数字字面量：无指数形式 `1e10`（拆成 `1`+`e10` 引发连锁错）、`.5` 不支持、`3.` 跨行链式；未知转义 `\q` 静默丢反斜杠（应报错）。修复位置：Lexer 数字循环（约 167-206）、字符串转义（约 108）。### 26. 🟡 词法错误吞文件 + 行号偏移 —— 未闭合 `"` 或 `#*` 不报错、静默吞掉整个文件直到 EOF 才在别处报误导错；字符串内换行不 `line++` → 后续所有行号偏移。修复：字符串/块注释遇到 EOF → 立即抛 `Unterminated string/comment at L:C`；字符串内换行 `line++`。### 27. 🟡 报错质量 —— 约 20 处 codegen 异常缺 `(at line N)` → 一律定位 1:1（逐个补行号）；**import 进来的文件词法错 → `Internal error` + Java 栈回溯**（`Cang.java` tokenize 不在 try 内，约 321/222）；Lexer `&` 先 advance 后 error 列号 +1（约 271）。### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1。### 29. 🟡 `Thread.spawn` 无 join 兜底 —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）。### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺。### 31. 🟡 `Stdout.print(对象)` 输出乱码 —— 对 `%CangX*` 走固定 `%s` 直接打结构体字节，可能越界读。修复：对象类型改打 `<ClassName@addr>`（取 className 标签 + ptrtoint）或调用 toString()（若有）。用户串含 `%` 是安全的（格式串为编译器常量）。### 32. 🟡 自由函数返回数组链式 `.length()` 报错 —— `Unknown method: i8*.length`：实例调用路径已附 Array semanticType，**独立函数调用路径**（`node.object == null` 分支）没附。修复：同 3904 处，独立函数返回 `Array<...>` 时附 semanticType。### 33. 🟡 `free f`（File 对象）不 free `path` 字段 —— path 为堆串（拼接而来）时 `--no-gc` 必漏。修复：free 对象时按 ClassInfo.fieldTypes 遍历 free 指针字段（字符串字段可 free；注意递归字段/环——v1 只 free 一层 String 字段，文档注明）。
+
+---
+
+## 八、审查过程中附带发现（本批已修 / 新增）
+
+### 34. ✅ LLVM 值/标签命名空间冲突（本批已修）
+- 现象：除零检查初版值名 `%divzero.N` 与标签 `divzero.N` 在 LLVM 是同一命名空间 → `'%divzero.2' is not a basic block`（靠两个计数器数值错开才侥幸通过，撞上必炸）。
+- 修复：值名前缀改 `%iszero.`。**经验：所有"值 + 标签"成对生成处，值/标签前缀必须不同**。
+
+### 35. ✅ `extractClassName("%Inner**")` 只剥一个 `*`（本批已修）
+- 现象：类字段链 `p.inner.value` 永远编译失败 `Unknown class: Inner*`（`generateExprForPtr` 字段分支返回 `toLLVMType(ft)+"*"` 双星类型，下游剥星不彻底）。
+- 修复：改为循环剥掉全部尾部 `*`。
+
+### 36. 🔴 语句挂在非入口类下被静默丢弃 —— 待修（新发现）
+- 现象：入口 = 文件**第一个** class；语句必须紧跟入口类。若写成 `class P(...)⏎class Main()⏎语句`，语句归属 Main（非入口）→ **既不执行也不报错**，main() 为空程序"成功"运行。
+- 位置：Parser 顶层节点组装（语句归最近 class 头）+ 入口选择（第一 class）。
+- 修复指引：非入口 class 头之后若出现语句（非 class/func 声明）→ 报错 `statements must appear right after the entry class (first class in file)`；或文档强约定 + 报错兜底。**优先报错，静默丢代码不可接受。**
+
+---
+
+## 九、已知且已文档化的限制（⚪ 不再展开）
+
+- String 的 native 实例方法无分发（`Unknown method: i8*.toUpper`）——i8* 接收者无 semanticType，独立任务待修。
+- 异常只支持同函数 handler，跨函数 propagate / landingpad 不在 v1。
+- `--no-gc` 模式下字符串类返回值不可 free（`generateFree` 拒绝 String/str）。
+- Linux/macOS 目标仅 IR 级验证（无 WSL/macOS 主机）；macOS `compileMacOS` 是 stub。
+- `Math.random()` 固定种子（跨平台确定性是特性，文档已注明）。
+- lambda / `thread{}` 无捕获（v1 设计）；Thread 参数类型白名单（无对象/数组跨线程）。
+- 单类文件 + class 位置决定函数语义（class 前 = 全局函数，class 后 = 方法）。
+- 并发边角：`@cang.current.error` 全局非线程局部、print 无锁、`thread{}` 单全局句柄槽并发覆盖丢 join、双 join 标志非原子——等 Channel/Mutex 任务一并处理。
+- 关键字全保留字（`var/free` 等不可作标识符）。
+
+---
+
+## 修复优先级建议（滚动更新）
+
+1. ~~1–3 裸崩溃三件套~~ ✅
+2. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
+3. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
+4. **4 + 5**（栈溢出两件套：递归深度计数器、循环 alloca 提升）
+5. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
+6. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）
+7. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
+8. 其余 🟡 按批次清理

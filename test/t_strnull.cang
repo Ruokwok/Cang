@@ -1,0 +1,10 @@
+import cang/io/File
+
+class Main()
+String s = null
+Stdout.println("a" + s)
+Stdout.println(s + "b")
+Stdout.println(s + s)
+File f = new File("target/no_such_file_xyz.txt")
+Stdout.println("[" + f.readText() + "]")
+Stdout.println("done")

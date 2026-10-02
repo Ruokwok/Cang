@@ -1,0 +1,7 @@
+class Main()
+P p = null
+Stdout.println(p.inner.value)
+Stdout.println("unreachable")
+
+class Inner(int value = 0)
+class P(Inner inner)

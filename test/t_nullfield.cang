@@ -1,0 +1,6 @@
+class Main()
+P p = null
+Stdout.println(p.age)
+Stdout.println("unreachable")
+
+class P(int age = 0)

@@ -1,0 +1,4 @@
+class Main()
+int d = 0
+Stdout.println(5 / d)
+Stdout.println("unreachable")
