@@ -1,0 +1,7 @@
+import cang/io/File
+
+class Main()
+File f = new File("a/b/c.txt")
+Stdout.println(f.getPath())
+Stdout.println(f.toSystemPath())
+Stdout.println(File.separator)

@@ -405,12 +405,13 @@ public class Cang {
      * Resolve import path to file path.
      * "cc/ruok/Apple" → "<baseDir>/cc/ruok/Apple.cang"
      * "cang/lang/Stdout" → "<projectDir>/stdlib/cang/lang/Stdout.cang"
+     * "cang/io/File" → "<projectDir>/stdlib/cang/io/File.cang"
      */
     private static String resolveImportFile(String baseDir, String importPath) {
         String relative = importPath.replace('/', java.io.File.separatorChar);
 
-        // Try stdlib directory first for cang.lang imports
-        if (importPath.startsWith("cang/lang/")) {
+        // Try stdlib directory first for cang/* imports (lang, io, ...)
+        if (importPath.startsWith("cang/")) {
             String stdlibDir = findStdlibDir();
             if (stdlibDir != null) {
                 String stdlibPath = stdlibDir + java.io.File.separator + relative + ".cang";
@@ -453,10 +454,13 @@ public class Cang {
         return extractBundledStdlib();
     }
 
-    /** Standard library files shipped as classpath resources inside the packaged jar. */
+    /** Standard library files shipped as classpath resources inside the packaged jar (paths relative to stdlib/). */
     private static final String[] BUNDLED_STDLIB_FILES = {
-        "Object.cang", "Stdout.cang", "String.cang", "Math.cang",
-        "System.cang", "Function.cang", "Void.cang", "Thread.cang", "Error.cang"
+        "cang/lang/Object.cang", "cang/lang/Stdout.cang", "cang/lang/String.cang",
+        "cang/lang/Math.cang", "cang/lang/System.cang", "cang/lang/Function.cang",
+        "cang/lang/Void.cang", "cang/lang/Thread.cang", "cang/lang/Error.cang",
+        "cang/lang/List.cang",
+        "cang/io/File.cang"
     };
 
     /**
@@ -466,18 +470,20 @@ public class Cang {
     private static String extractBundledStdlib() {
         if (bundledStdlibDir != null) return bundledStdlibDir;
         try {
-            File dir = new File(System.getProperty("java.io.tmpdir"), "cang-stdlib/cang/lang");
-            if (!dir.isDirectory() && !dir.mkdirs()) return null;
+            File root = new File(System.getProperty("java.io.tmpdir"), "cang-stdlib");
+            if (!root.isDirectory() && !root.mkdirs()) return null;
             boolean found = false;
-            for (String name : BUNDLED_STDLIB_FILES) {
-                try (java.io.InputStream in = Cang.class.getResourceAsStream("/stdlib/cang/lang/" + name)) {
+            for (String rel : BUNDLED_STDLIB_FILES) {
+                try (java.io.InputStream in = Cang.class.getResourceAsStream("/stdlib/" + rel)) {
                     if (in == null) continue;
                     found = true;
-                    Files.copy(in, Path.of(dir.getPath(), name), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    File out = new File(root, rel);
+                    if (out.getParentFile() != null) out.getParentFile().mkdirs();
+                    Files.copy(in, out.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                 }
             }
             if (!found) return null;
-            bundledStdlibDir = dir.getParentFile().getParentFile().getCanonicalPath();
+            bundledStdlibDir = root.getCanonicalPath();
             return bundledStdlibDir;
         } catch (IOException e) {
             return null;

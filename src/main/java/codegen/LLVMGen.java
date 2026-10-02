@@ -972,6 +972,7 @@ public class LLVMGen {
             }
         }
         header.append("\n");
+        emitFileRuntime();
     }
 
     private final Map<String, String> fmtConstants = new LinkedHashMap<>();
@@ -1715,6 +1716,9 @@ public class LLVMGen {
                 if (elem != null) {
                     trackArrayVar(decl.name, elem);
                 }
+            } else if (val.semanticType != null && isArraySemanticType(val.semanticType)) {
+                // var x = f.readLines(): element type comes from the call's Array<T> semantic type
+                trackArrayVar(decl.name, val.semanticType.substring(6, val.semanticType.length() - 1));
             }
             return;
         }
@@ -1770,7 +1774,11 @@ public class LLVMGen {
         String ptrName = "%v." + decl.name;
 
         body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
-        scope.define(decl.name, new LLVMValue(ptrName, llvmType, semanticKindOf(cangType)));
+        // Array<T> decl with a non-literal initializer (method call/alias) must keep its Array<T>
+        // semantic type so x.length() dispatches; semanticKindOf returns null for arrays.
+        String declSem = semanticKindOf(cangType);
+        if (declSem == null && isArraySemanticType(cangType)) declSem = cangType;
+        scope.define(decl.name, new LLVMValue(ptrName, llvmType, declSem));
         registerGcRoot(ptrName, llvmType);
 
         if (decl.init != null) {
@@ -2993,12 +3001,76 @@ public class LLVMGen {
      * strcmp returns 0 if equal, <0 if left<right, >0 if left>right
      */
     private LLVMValue generateStringCompare(LLVMValue left, String op, LLVMValue right) {
-        // Call strcmp
+        // Null-safe string comparison: strcmp(NULL, ...) is undefined behaviour, so branch when
+        // either operand may be null (File.getParent() == null, f.readText() == "x", ...).
+        // Ordering ops treat null as the smallest value.
+        int id = labelCount++;
+        String nullL = "%sc.ln." + tmpCount++;
+        String nullR = "%sc.rn." + tmpCount++;
+        String either = "%sc.e." + tmpCount++;
+        body.append("  ").append(nullL).append(" = icmp eq i8* ").append(left.value).append(", null\n");
+        body.append("  ").append(nullR).append(" = icmp eq i8* ").append(right.value).append(", null\n");
+        body.append("  ").append(either).append(" = or i1 ").append(nullL).append(", ").append(nullR).append("\n");
+        String nullLabel = "sc.null." + id;
+        String strLabel = "sc.str." + id;
+        String endLabel = "sc.end." + id;
+        body.append("  br i1 ").append(either).append(", label %").append(nullLabel)
+             .append(", label %").append(strLabel).append("\n\n");
+
+        // Null-case result (derived only from null-ness of both sides).
+        body.append(nullLabel).append(":\n");
+        String nullRes;
+        String rnot = "%sc.rn2." + tmpCount++;
+        String lnot = "%sc.ln2." + tmpCount++;
+        body.append("  ").append(rnot).append(" = xor i1 ").append(nullR).append(", 1\n");
+        body.append("  ").append(lnot).append(" = xor i1 ").append(nullL).append(", 1\n");
+        switch (op) {
+            case "==": { // true only when both null
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(nullRes).append(" = and i1 ").append(nullL).append(", ").append(nullR).append("\n");
+                break;
+            }
+            case "!=": { // true unless both null
+                String both = "%sc.b." + tmpCount++;
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(both).append(" = and i1 ").append(nullL).append(", ").append(nullR).append("\n");
+                body.append("  ").append(nullRes).append(" = xor i1 ").append(both).append(", 1\n");
+                break;
+            }
+            case "<": { // left null && right not-null
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(nullRes).append(" = and i1 ").append(nullL).append(", ").append(rnot).append("\n");
+                break;
+            }
+            case "<=": { // !(left not-null && right null)
+                String gtNull = "%sc.gt." + tmpCount++;
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(gtNull).append(" = and i1 ").append(lnot).append(", ").append(nullR).append("\n");
+                body.append("  ").append(nullRes).append(" = xor i1 ").append(gtNull).append(", 1\n");
+                break;
+            }
+            case ">": { // left not-null && right null
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(nullRes).append(" = and i1 ").append(lnot).append(", ").append(nullR).append("\n");
+                break;
+            }
+            case ">=": { // !(left null && right not-null)
+                String ltNull = "%sc.lt." + tmpCount++;
+                nullRes = "%sc.nr." + tmpCount++;
+                body.append("  ").append(ltNull).append(" = and i1 ").append(nullL).append(", ").append(rnot).append("\n");
+                body.append("  ").append(nullRes).append(" = xor i1 ").append(ltNull).append(", 1\n");
+                break;
+            }
+            default: throw new RuntimeException("Unknown string comparison: " + op);
+        }
+        body.append("  br label %").append(endLabel).append("\n\n");
+
+        // Neither side is null here: plain strcmp.
+        body.append(strLabel).append(":\n");
         String cmpResult = "%strcmp." + tmpCount++;
         body.append("  ").append(cmpResult).append(" = call i32 @strcmp(i8* ")
              .append(left.value).append(", i8* ").append(right.value).append(")\n");
-
-        String result = "%strcmp.cmp." + tmpCount++;
+        String strRes = "%strcmp.cmp." + tmpCount++;
         String predicate;
         switch (op) {
             case "==": predicate = "eq"; break;
@@ -3009,9 +3081,14 @@ public class LLVMGen {
             case ">=": predicate = "sge"; break;
             default: throw new RuntimeException("Unknown string comparison: " + op);
         }
-        body.append("  ").append(result).append(" = icmp ").append(predicate)
+        body.append("  ").append(strRes).append(" = icmp ").append(predicate)
              .append(" i32 ").append(cmpResult).append(", 0\n");
+        body.append("  br label %").append(endLabel).append("\n\n");
 
+        body.append(endLabel).append(":\n");
+        String result = "%sc.m." + tmpCount++;
+        body.append("  ").append(result).append(" = phi i1 [ ").append(nullRes).append(", %").append(nullLabel)
+             .append(" ], [ ").append(strRes).append(", %").append(strLabel).append(" ]\n");
         return new LLVMValue(result, "i1");
     }
 
@@ -3643,6 +3720,11 @@ public class LLVMGen {
             if (objName.equals("System")) {
                 return generateSystemCall(node.method, node.args, node.line);
             }
+            // File.separator() method-call form (field form handled in generateFieldAccess)
+            if (objName.equals("File") && node.method.equals("separator") && node.args.isEmpty()
+                    && classes.containsKey("cang_io_File")) {
+                return makeStringConstant(targetPlatform.equals("windows") ? "\\" : "/");
+            }
         }
 
         // List<T> is a compiler-built dynamic array.
@@ -3817,7 +3899,10 @@ public class LLVMGen {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(funcName).append("(").append(args).append(")\n");
-            return new LLVMValue(result, toLLVMType(fi.returnType));
+            // Array-returning calls (File.readLines/list) expose their Array<T> semantic type
+            // so chained .length() and var-decl element tracking work.
+            String retSem = isArraySemanticType(fi.returnType) ? fi.returnType : null;
+            return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
     }
 
@@ -4372,6 +4457,11 @@ public class LLVMGen {
         }
         if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Math")) {
             return generateSystemField(node);
+        }
+        // cang/io/File built-in static field: File.separator (platform-specific constant)
+        if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("File")
+                && node.field.equals("separator") && classes.containsKey("cang_io_File")) {
+            return makeStringConstant(targetPlatform.equals("windows") ? "\\" : "/");
         }
 
         LLVMValue objPtr = generateExprForPtr(node.object);
@@ -4970,6 +5060,878 @@ public class LLVMGen {
     // ==================== Type utilities ====================
 
     /** Cang semantic kind carried on LLVMValue for types sharing an LLVM representation. */
+    /**
+     * cang/io/File stdlib runtime: libc declares, intrinsic helper bodies, and wrapper defines
+     * for every native File method. The generic instance-call path emits
+     * `call @cang_io_File.&lt;m&gt;(%cang_io_File* %recv, ...)`; these defines satisfy those
+     * symbols so no dispatch interception is needed. Helpers are define-only (never declared —
+     * declare+define in one module is an invalid redefinition).
+     */
+    private void emitFileRuntime() {
+        ClassInfo fileCi = classes.get("cang_io_File");
+        if (fileCi == null || !imports.contains("cang/io/File")) return;
+        if (fileCi.fieldIndices.get("path") == null) return;
+
+        // --- string constants used by helpers ---
+        header.append("@.f.rb = private constant [3 x i8] c\"rb\\00\"\n");
+        header.append("@.f.wb = private constant [3 x i8] c\"wb\\00\"\n");
+        header.append("@.f.ab = private constant [3 x i8] c\"ab\\00\"\n");
+        header.append("@.f.dot = private constant [2 x i8] c\".\\00\"\n");
+        header.append("@.f.dotdot = private constant [3 x i8] c\"..\\00\"\n\n");
+
+        // --- libc declares (platform-specific names where the ABI differs) ---
+        header.append("declare i8* @fopen(i8*, i8*)\n");
+        header.append("declare i32 @fclose(i8*)\n");
+        header.append("declare i64 @fread(i8*, i64, i64, i8*)\n");
+        header.append("declare i64 @fwrite(i8*, i64, i64, i8*)\n");
+        header.append("declare i32 @remove(i8*)\n");
+        header.append("declare i32 @rename(i8*, i8*)\n");
+        header.append("declare i8* @opendir(i8*)\n");
+        header.append("declare i8* @readdir(i8*)\n");
+        header.append("declare i32 @closedir(i8*)\n");
+        header.append("declare i32 @access(i8*, i32)\n");
+        header.append("declare i8* @strrchr(i8*, i32)\n");
+        if (targetPlatform.equals("windows")) {
+            header.append("declare i8* @_getcwd(i8*, i32)\n");
+            header.append("declare i32 @_mkdir(i8*)\n");
+            header.append("declare i32 @_rmdir(i8*)\n");
+            header.append("declare i32 @_fseeki64(i8*, i64, i32)\n");
+            header.append("declare i64 @_ftelli64(i8*)\n");
+        } else {
+            header.append("declare i8* @getcwd(i8*, i64)\n");
+            header.append("declare i32 @mkdir(i8*, i32)\n");
+            header.append("declare i32 @rmdir(i8*)\n");
+            header.append("declare i32 @fseeko(i8*, i64, i32)\n");
+            header.append("declare i64 @ftello(i8*)\n");
+        }
+        header.append("\n");
+
+        emitFilePathHelpers();
+        emitFileIoHelpers();
+        emitFileWrappers();
+    }
+
+    /** Heap-string and path-string helpers for File (define-only). */
+    private void emitFilePathHelpers() {
+        boolean win = targetPlatform.equals("windows");
+        String alloc = allocFn();
+        int sepChar = win ? 92 : 47;
+
+        // strdup: heap copy of a whole NUL-terminated string (copies the terminator too).
+        header.append("define i8* @cang.f.strdup(i8* %s) {\n");
+        header.append("entry:\n");
+        header.append("  %len = call i64 @strlen(i8* %s)\n");
+        header.append("  %n1 = add i64 %len, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %n1)\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %buf, i8* %s, i64 %n1, i1 false)\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+
+        // strndup: heap copy of the first n bytes plus an explicit terminator.
+        header.append("define i8* @cang.f.strndup(i8* %s, i64 %n) {\n");
+        header.append("entry:\n");
+        header.append("  %n1 = add i64 %n, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %n1)\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %buf, i8* %s, i64 %n, i1 false)\n");
+        header.append("  %z = getelementptr i8, i8* %buf, i64 %n\n");
+        header.append("  store i8 0, i8* %z\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+
+        // lastsep: pointer to the last path separator, or null. Windows accepts both '/' and '\'.
+        if (win) {
+            header.append("define i8* @cang.f.lastsep(i8* %p) {\n");
+            header.append("entry:\n");
+            header.append("  %a = call i8* @strrchr(i8* %p, i32 47)\n");
+            header.append("  %b = call i8* @strrchr(i8* %p, i32 92)\n");
+            header.append("  %an = icmp eq i8* %a, null\n");
+            header.append("  br i1 %an, label %bonly, label %anext\n");
+            header.append("bonly:\n");
+            header.append("  ret i8* %b\n");
+            header.append("anext:\n");
+            header.append("  %bn = icmp eq i8* %b, null\n");
+            header.append("  br i1 %bn, label %aonly, label %both\n");
+            header.append("aonly:\n");
+            header.append("  ret i8* %a\n");
+            header.append("both:\n");
+            header.append("  %ai = ptrtoint i8* %a to i64\n");
+            header.append("  %bi = ptrtoint i8* %b to i64\n");
+            header.append("  %cmp = icmp ugt i64 %ai, %bi\n");
+            header.append("  %r = select i1 %cmp, i8* %a, i8* %b\n");
+            header.append("  ret i8* %r\n");
+            header.append("}\n\n");
+        } else {
+            header.append("define i8* @cang.f.lastsep(i8* %p) {\n");
+            header.append("entry:\n");
+            header.append("  %a = call i8* @strrchr(i8* %p, i32 47)\n");
+            header.append("  ret i8* %a\n");
+            header.append("}\n\n");
+        }
+
+        // getname: copy of the segment after the last separator; whole path when none.
+        header.append("define i8* @cang.f.getname(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %s = call i8* @cang.f.lastsep(i8* %p)\n");
+        header.append("  %n = icmp eq i8* %s, null\n");
+        header.append("  br i1 %n, label %whole, label %part\n");
+        header.append("whole:\n");
+        header.append("  %r0 = call i8* @cang.f.strdup(i8* %p)\n");
+        header.append("  ret i8* %r0\n");
+        header.append("part:\n");
+        header.append("  %after = getelementptr i8, i8* %s, i64 1\n");
+        header.append("  %r1 = call i8* @cang.f.strdup(i8* %after)\n");
+        header.append("  ret i8* %r1\n");
+        header.append("}\n\n");
+
+        // getparent: prefix before the last separator; null when there is none.
+        // A separator at index 0 means the parent is the root itself ("/" or "\").
+        header.append("define i8* @cang.f.getparent(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %s = call i8* @cang.f.lastsep(i8* %p)\n");
+        header.append("  %n = icmp eq i8* %s, null\n");
+        header.append("  br i1 %n, label %none, label %some\n");
+        header.append("none:\n");
+        header.append("  ret i8* null\n");
+        header.append("some:\n");
+        header.append("  %pi = ptrtoint i8* %p to i64\n");
+        header.append("  %si = ptrtoint i8* %s to i64\n");
+        header.append("  %idx = sub i64 %si, %pi\n");
+        header.append("  %isroot = icmp eq i64 %idx, 0\n");
+        header.append("  br i1 %isroot, label %root, label %prefix\n");
+        header.append("root:\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 2)\n");
+        header.append("  %c = load i8, i8* %s\n");
+        header.append("  store i8 %c, i8* %buf\n");
+        header.append("  %z = getelementptr i8, i8* %buf, i64 1\n");
+        header.append("  store i8 0, i8* %z\n");
+        header.append("  ret i8* %buf\n");
+        header.append("prefix:\n");
+        header.append("  %r = call i8* @cang.f.strndup(i8* %p, i64 %idx)\n");
+        header.append("  ret i8* %r\n");
+        header.append("}\n\n");
+
+        if (win) {
+            // Windows: leading '/' or '\', or <alpha> ':' + separator at index 2.
+            header.append("define i1 @cang.f.isabs(i8* %p) {\n");
+            header.append("entry:\n");
+            header.append("  %c0 = load i8, i8* %p\n");
+            header.append("  %s1 = icmp eq i8 %c0, 47\n");
+            header.append("  %s2 = icmp eq i8 %c0, 92\n");
+            header.append("  %lead = or i1 %s1, %s2\n");
+            header.append("  br i1 %lead, label %yes, label %drive\n");
+            header.append("drive:\n");
+            header.append("  %geA = icmp uge i8 %c0, 65\n");
+            header.append("  %leZ = icmp ule i8 %c0, 90\n");
+            header.append("  %up = and i1 %geA, %leZ\n");
+            header.append("  %gea = icmp uge i8 %c0, 97\n");
+            header.append("  %lez = icmp ule i8 %c0, 122\n");
+            header.append("  %lo = and i1 %gea, %lez\n");
+            header.append("  %alpha = or i1 %up, %lo\n");
+            header.append("  br i1 %alpha, label %cklen, label %no\n");
+            header.append("cklen:\n");
+            header.append("  %len = call i64 @strlen(i8* %p)\n");
+            header.append("  %ge3 = icmp uge i64 %len, 3\n");
+            header.append("  br i1 %ge3, label %ckcolon, label %no\n");
+            header.append("ckcolon:\n");
+            header.append("  %p1 = getelementptr i8, i8* %p, i64 1\n");
+            header.append("  %c1 = load i8, i8* %p1\n");
+            header.append("  %colon = icmp eq i8 %c1, 58\n");
+            header.append("  br i1 %colon, label %cksep, label %no\n");
+            header.append("cksep:\n");
+            header.append("  %p2 = getelementptr i8, i8* %p, i64 2\n");
+            header.append("  %c2 = load i8, i8* %p2\n");
+            header.append("  %q1 = icmp eq i8 %c2, 47\n");
+            header.append("  %q2 = icmp eq i8 %c2, 92\n");
+            header.append("  %ok = or i1 %q1, %q2\n");
+            header.append("  br i1 %ok, label %yes, label %no\n");
+            header.append("yes:\n");
+            header.append("  ret i1 true\n");
+            header.append("no:\n");
+            header.append("  ret i1 false\n");
+            header.append("}\n\n");
+        } else {
+            header.append("define i1 @cang.f.isabs(i8* %p) {\n");
+            header.append("entry:\n");
+            header.append("  %c0 = load i8, i8* %p\n");
+            header.append("  %r = icmp eq i8 %c0, 47\n");
+            header.append("  ret i1 %r\n");
+            header.append("}\n\n");
+        }
+
+        // abspath: already-absolute paths are copied as-is; relative paths get cwd prepended.
+        header.append("define i8* @cang.f.abspath(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %cw = alloca [4096 x i8]\n");
+        header.append("  %abs = call i1 @cang.f.isabs(i8* %p)\n");
+        header.append("  br i1 %abs, label %done, label %join\n");
+        header.append("done:\n");
+        header.append("  %copy = call i8* @cang.f.strdup(i8* %p)\n");
+        header.append("  ret i8* %copy\n");
+        header.append("join:\n");
+        header.append("  %cb = getelementptr [4096 x i8], [4096 x i8]* %cw, i32 0, i32 0\n");
+        if (win) {
+            header.append("  %g = call i8* @_getcwd(i8* %cb, i32 4096)\n");
+        } else {
+            header.append("  %g = call i8* @getcwd(i8* %cb, i64 4096)\n");
+        }
+        header.append("  %gn = icmp eq i8* %g, null\n");
+        header.append("  br i1 %gn, label %fail, label %concat\n");
+        header.append("fail:\n");
+        header.append("  %fb = call i8* @cang.f.strdup(i8* %p)\n");
+        header.append("  ret i8* %fb\n");
+        header.append("concat:\n");
+        header.append("  %clen = call i64 @strlen(i8* %g)\n");
+        header.append("  %plen = call i64 @strlen(i8* %p)\n");
+        header.append("  %last = sub i64 %clen, 1\n");
+        header.append("  %lp = getelementptr i8, i8* %g, i64 %last\n");
+        header.append("  %lc = load i8, i8* %lp\n");
+        header.append("  %e1 = icmp eq i8 %lc, 47\n");
+        String endsep;
+        if (win) {
+            header.append("  %e2 = icmp eq i8 %lc, 92\n");
+            header.append("  %es = or i1 %e1, %e2\n");
+            endsep = "%es";
+        } else {
+            endsep = "%e1";
+        }
+        header.append("  %extra = select i1 ").append(endsep).append(", i64 0, i64 1\n");
+        header.append("  %tot0 = add i64 %clen, %extra\n");
+        header.append("  %tot1 = add i64 %tot0, %plen\n");
+        header.append("  %tot = add i64 %tot1, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %tot)\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %buf, i8* %g, i64 %clen, i1 false)\n");
+        header.append("  br i1 ").append(endsep).append(", label %nosep, label %withsep\n");
+        header.append("withsep:\n");
+        header.append("  %sp = getelementptr i8, i8* %buf, i64 %clen\n");
+        header.append("  store i8 ").append(sepChar).append(", i8* %sp\n");
+        header.append("  %offw = add i64 %clen, 1\n");
+        header.append("  br label %copypart\n");
+        header.append("nosep:\n");
+        header.append("  br label %copypart\n");
+        header.append("copypart:\n");
+        header.append("  %off = phi i64 [ %clen, %nosep ], [ %offw, %withsep ]\n");
+        header.append("  %dst = getelementptr i8, i8* %buf, i64 %off\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %dst, i8* %p, i64 %plen, i1 false)\n");
+        header.append("  %zi = add i64 %off, %plen\n");
+        header.append("  %zp = getelementptr i8, i8* %buf, i64 %zi\n");
+        header.append("  store i8 0, i8* %zp\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+
+        // tosystem: rewrite every separator to the platform separator.
+        int fromChar = win ? 47 : 92;
+        int toChar = win ? 92 : 47;
+        header.append("define i8* @cang.f.tosystem(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %len = call i64 @strlen(i8* %p)\n");
+        header.append("  %n1 = add i64 %len, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %n1)\n");
+        header.append("  %i = alloca i64\n");
+        header.append("  store i64 0, i64* %i\n");
+        header.append("  br label %loop\n");
+        header.append("loop:\n");
+        header.append("  %iv = load i64, i64* %i\n");
+        header.append("  %go = icmp ult i64 %iv, %len\n");
+        header.append("  br i1 %go, label %body, label %done\n");
+        header.append("body:\n");
+        header.append("  %sp = getelementptr i8, i8* %p, i64 %iv\n");
+        header.append("  %ch = load i8, i8* %sp\n");
+        header.append("  %is = icmp eq i8 %ch, ").append(fromChar).append("\n");
+        header.append("  %ch2 = select i1 %is, i8 ").append(toChar).append(", i8 %ch\n");
+        header.append("  %dp = getelementptr i8, i8* %buf, i64 %iv\n");
+        header.append("  store i8 %ch2, i8* %dp\n");
+        header.append("  %i2 = add i64 %iv, 1\n");
+        header.append("  store i64 %i2, i64* %i\n");
+        header.append("  br label %loop\n");
+        header.append("done:\n");
+        header.append("  %zp = getelementptr i8, i8* %buf, i64 %len\n");
+        header.append("  store i8 0, i8* %zp\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+    }
+
+    /** Filesystem and text-IO helper bodies for File (define-only). */
+    private void emitFileIoHelpers() {
+        boolean win = targetPlatform.equals("windows");
+        String alloc = allocFn();
+        String fseekFn = win ? "_fseeki64" : "fseeko";
+        String ftellFn = win ? "_ftelli64" : "ftello";
+        String mkdirFn = win ? "_mkdir" : "mkdir";
+        String rmdirFn = win ? "_rmdir" : "rmdir";
+        int dnameOff = win ? 8 : 19; // offsetof(struct dirent, d_name)
+
+        // exists: access(path, F_OK=0) == 0
+        header.append("define i1 @cang.f.exists(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %r = call i32 @access(i8* %p, i32 0)\n");
+        header.append("  %ok = icmp eq i32 %r, 0\n");
+        header.append("  ret i1 %ok\n");
+        header.append("}\n\n");
+
+        // isdir: opendir succeeds (works for dirs, fails for files and missing paths).
+        header.append("define i1 @cang.f.isdir(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %d = call i8* @opendir(i8* %p)\n");
+        header.append("  %n = icmp eq i8* %d, null\n");
+        header.append("  br i1 %n, label %no, label %yes\n");
+        header.append("yes:\n");
+        header.append("  %c = call i32 @closedir(i8* %d)\n");
+        header.append("  ret i1 true\n");
+        header.append("no:\n");
+        header.append("  ret i1 false\n");
+        header.append("}\n\n");
+
+        // isfile: exists && !isdir (avoids fopen on directories, which succeeds on Linux).
+        header.append("define i1 @cang.f.isfile(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %e = call i1 @cang.f.exists(i8* %p)\n");
+        header.append("  br i1 %e, label %chk, label %no\n");
+        header.append("chk:\n");
+        header.append("  %d = call i1 @cang.f.isdir(i8* %p)\n");
+        header.append("  %r = xor i1 %d, 1\n");
+        header.append("  ret i1 %r\n");
+        header.append("no:\n");
+        header.append("  ret i1 false\n");
+        header.append("}\n\n");
+
+        // length: size of a regular file via seek-to-end; 0 for dirs/missing/unseekable.
+        header.append("define i64 @cang.f.length(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %f = call i1 @cang.f.isfile(i8* %p)\n");
+        header.append("  br i1 %f, label %open, label %zero\n");
+        header.append("open:\n");
+        header.append("  %mrb = getelementptr [3 x i8], [3 x i8]* @.f.rb, i32 0, i32 0\n");
+        header.append("  %h = call i8* @fopen(i8* %p, i8* %mrb)\n");
+        header.append("  %hn = icmp eq i8* %h, null\n");
+        header.append("  br i1 %hn, label %zero, label %seek\n");
+        header.append("seek:\n");
+        header.append("  %s1 = call i32 @").append(fseekFn).append("(i8* %h, i64 0, i32 2)\n");
+        header.append("  %sz = call i64 @").append(ftellFn).append("(i8* %h)\n");
+        header.append("  %c = call i32 @fclose(i8* %h)\n");
+        header.append("  %neg = icmp slt i64 %sz, 0\n");
+        header.append("  %z = select i1 %neg, i64 0, i64 %sz\n");
+        header.append("  ret i64 %z\n");
+        header.append("zero:\n");
+        header.append("  ret i64 0\n");
+        header.append("}\n\n");
+
+        // delete: rmdir for directories, remove for files.
+        header.append("define i1 @cang.f.delete(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %d = call i1 @cang.f.isdir(i8* %p)\n");
+        header.append("  br i1 %d, label %dir, label %file\n");
+        header.append("dir:\n");
+        header.append("  %r1 = call i32 @").append(rmdirFn).append("(i8* %p)\n");
+        header.append("  %ok1 = icmp eq i32 %r1, 0\n");
+        header.append("  ret i1 %ok1\n");
+        header.append("file:\n");
+        header.append("  %r2 = call i32 @remove(i8* %p)\n");
+        header.append("  %ok2 = icmp eq i32 %r2, 0\n");
+        header.append("  ret i1 %ok2\n");
+        header.append("}\n\n");
+
+        // mkdir: single-level creation. Windows takes one argument; POSIX wants a mode.
+        header.append("define i1 @cang.f.mkdir(i8* %p) {\n");
+        header.append("entry:\n");
+        if (win) {
+            header.append("  %r = call i32 @_mkdir(i8* %p)\n");
+        } else {
+            header.append("  %r = call i32 @mkdir(i8* %p, i32 511)\n"); // 0777
+        }
+        header.append("  %ok = icmp eq i32 %r, 0\n");
+        header.append("  ret i1 %ok\n");
+        header.append("}\n\n");
+
+        // mkdirs: copy the path, strip trailing separators, mkdir() every prefix (ignore
+        // errors: they are usually EEXIST), then mkdir() the full path for the result.
+        header.append("define i1 @cang.f.mkdirs(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %len0 = call i64 @strlen(i8* %p)\n");
+        header.append("  %n1 = add i64 %len0, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %n1)\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %buf, i8* %p, i64 %n1, i1 false)\n");
+        header.append("  %L = alloca i64\n");
+        header.append("  store i64 %len0, i64* %L\n");
+        header.append("  %i = alloca i64\n");
+        header.append("  br label %trimchk\n");
+        header.append("trimchk:\n");
+        header.append("  %lv = load i64, i64* %L\n");
+        header.append("  %tg = icmp ugt i64 %lv, 1\n");
+        header.append("  br i1 %tg, label %trimbody, label %walk\n");
+        header.append("trimbody:\n");
+        header.append("  %li = sub i64 %lv, 1\n");
+        header.append("  %tp = getelementptr i8, i8* %buf, i64 %li\n");
+        header.append("  %tc = load i8, i8* %tp\n");
+        header.append("  %t1 = icmp eq i8 %tc, 47\n");
+        if (win) {
+            header.append("  %t2 = icmp eq i8 %tc, 92\n");
+            header.append("  %ts = or i1 %t1, %t2\n");
+        } else {
+            header.append("  %ts = icmp eq i8 %tc, 47\n");
+        }
+        header.append("  br i1 %ts, label %trimdec, label %walk\n");
+        header.append("trimdec:\n");
+        header.append("  store i64 %li, i64* %L\n");
+        header.append("  store i8 0, i8* %tp\n");
+        header.append("  br label %trimchk\n");
+        header.append("walk:\n");
+        header.append("  store i64 1, i64* %i\n");
+        header.append("  br label %wloop\n");
+        header.append("wloop:\n");
+        header.append("  %iv = load i64, i64* %i\n");
+        header.append("  %wl = load i64, i64* %L\n");
+        header.append("  %go = icmp ult i64 %iv, %wl\n");
+        header.append("  br i1 %go, label %wbody, label %final\n");
+        header.append("wbody:\n");
+        header.append("  %wp = getelementptr i8, i8* %buf, i64 %iv\n");
+        header.append("  %wc = load i8, i8* %wp\n");
+        header.append("  %w1 = icmp eq i8 %wc, 47\n");
+        if (win) {
+            header.append("  %w2 = icmp eq i8 %wc, 92\n");
+            header.append("  %ws = or i1 %w1, %w2\n");
+        } else {
+            header.append("  %ws = icmp eq i8 %wc, 47\n");
+        }
+        header.append("  br i1 %ws, label %wsep, label %wnext\n");
+        header.append("wsep:\n");
+        header.append("  store i8 0, i8* %wp\n");
+        header.append("  %mr = call i1 @cang.f.mkdir(i8* %buf)\n");
+        header.append("  store i8 %wc, i8* %wp\n");
+        header.append("  br label %wnext\n");
+        header.append("wnext:\n");
+        header.append("  %i2 = add i64 %iv, 1\n");
+        header.append("  store i64 %i2, i64* %i\n");
+        header.append("  br label %wloop\n");
+        header.append("final:\n");
+        header.append("  %fr = call i1 @cang.f.mkdir(i8* %buf)\n");
+        header.append("  ret i1 %fr\n");
+        header.append("}\n\n");
+
+        // create: createNewFile — false when it exists, fopen("wb") to create.
+        header.append("define i1 @cang.f.create(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %e = call i1 @cang.f.exists(i8* %p)\n");
+        header.append("  br i1 %e, label %no, label %mk\n");
+        header.append("no:\n");
+        header.append("  ret i1 false\n");
+        header.append("mk:\n");
+        header.append("  %mwb = getelementptr [3 x i8], [3 x i8]* @.f.wb, i32 0, i32 0\n");
+        header.append("  %h = call i8* @fopen(i8* %p, i8* %mwb)\n");
+        header.append("  %hn = icmp eq i8* %h, null\n");
+        header.append("  br i1 %hn, label %fail, label %ok\n");
+        header.append("fail:\n");
+        header.append("  ret i1 false\n");
+        header.append("ok:\n");
+        header.append("  %c = call i32 @fclose(i8* %h)\n");
+        header.append("  ret i1 true\n");
+        header.append("}\n\n");
+
+        // rename: POSIX rename(2) semantics (same-volume move).
+        header.append("define i1 @cang.f.rename(i8* %a, i8* %b) {\n");
+        header.append("entry:\n");
+        header.append("  %r = call i32 @rename(i8* %a, i8* %b)\n");
+        header.append("  %ok = icmp eq i32 %r, 0\n");
+        header.append("  ret i1 %ok\n");
+        header.append("}\n\n");
+
+        // readtext: whole file into a heap string; null when the file cannot be opened.
+        header.append("define i8* @cang.f.readtext(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %mrb = getelementptr [3 x i8], [3 x i8]* @.f.rb, i32 0, i32 0\n");
+        header.append("  %h = call i8* @fopen(i8* %p, i8* %mrb)\n");
+        header.append("  %hn = icmp eq i8* %h, null\n");
+        header.append("  br i1 %hn, label %fail, label %size\n");
+        header.append("fail:\n");
+        header.append("  ret i8* null\n");
+        header.append("size:\n");
+        header.append("  %s1 = call i32 @").append(fseekFn).append("(i8* %h, i64 0, i32 2)\n");
+        header.append("  %sz = call i64 @").append(ftellFn).append("(i8* %h)\n");
+        header.append("  %s2 = call i32 @").append(fseekFn).append("(i8* %h, i64 0, i32 0)\n");
+        header.append("  %neg = icmp slt i64 %sz, 0\n");
+        header.append("  br i1 %neg, label %failclose, label %alloc\n");
+        header.append("failclose:\n");
+        header.append("  %c0 = call i32 @fclose(i8* %h)\n");
+        header.append("  ret i8* null\n");
+        header.append("alloc:\n");
+        header.append("  %n1 = add i64 %sz, 1\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 %n1)\n");
+        header.append("  %rd = call i64 @fread(i8* %buf, i64 1, i64 %sz, i8* %h)\n");
+        header.append("  %zp = getelementptr i8, i8* %buf, i64 %rd\n");
+        header.append("  store i8 0, i8* %zp\n");
+        header.append("  %c = call i32 @fclose(i8* %h)\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+
+        // write: mode 0 = overwrite ("wb"), 1 = append ("ab"); null content writes nothing.
+        header.append("define i1 @cang.f.write(i8* %p, i8* %content, i32 %mode) {\n");
+        header.append("entry:\n");
+        header.append("  %isab = icmp eq i32 %mode, 1\n");
+        header.append("  %mwb = getelementptr [3 x i8], [3 x i8]* @.f.wb, i32 0, i32 0\n");
+        header.append("  %mab = getelementptr [3 x i8], [3 x i8]* @.f.ab, i32 0, i32 0\n");
+        header.append("  %m = select i1 %isab, i8* %mab, i8* %mwb\n");
+        header.append("  %h = call i8* @fopen(i8* %p, i8* %m)\n");
+        header.append("  %hn = icmp eq i8* %h, null\n");
+        header.append("  br i1 %hn, label %fail, label %chk\n");
+        header.append("fail:\n");
+        header.append("  ret i1 false\n");
+        header.append("chk:\n");
+        header.append("  %cn = icmp eq i8* %content, null\n");
+        header.append("  br i1 %cn, label %empty, label %calc\n");
+        header.append("calc:\n");
+        header.append("  %len = call i64 @strlen(i8* %content)\n");
+        header.append("  %nw = call i64 @fwrite(i8* %content, i64 1, i64 %len, i8* %h)\n");
+        header.append("  %c1 = call i32 @fclose(i8* %h)\n");
+        header.append("  %ok = icmp eq i64 %nw, %len\n");
+        header.append("  ret i1 %ok\n");
+        header.append("empty:\n");
+        header.append("  %c2 = call i32 @fclose(i8* %h)\n");
+        header.append("  ret i1 true\n");
+        header.append("}\n\n");
+
+        emitFileReadLines(alloc);
+        emitFileList(alloc);
+    }
+
+    /** readlines: split a whole file into a heap array of heap strings (never null — empty on IO failure). */
+    private void emitFileReadLines(String alloc) {
+        header.append("define i8* @cang.f.readlines(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %text = call i8* @cang.f.readtext(i8* %p)\n");
+        header.append("  %isnull = icmp eq i8* %text, null\n");
+        header.append("  br i1 %isnull, label %emptyall, label %count\n");
+        header.append("emptyall:\n");
+        header.append("  %ea = call i8* @").append(alloc).append("(i64 8)\n");
+        header.append("  store i64 0, i64* %ea\n");
+        header.append("  ret i8* %ea\n");
+        header.append("count:\n");
+        header.append("  %len = call i64 @strlen(i8* %text)\n");
+        header.append("  %n = alloca i64\n");
+        header.append("  store i64 0, i64* %n\n");
+        header.append("  %i = alloca i64\n");
+        header.append("  store i64 0, i64* %i\n");
+        header.append("  br label %cloop\n");
+        header.append("cloop:\n");
+        header.append("  %iv = load i64, i64* %i\n");
+        header.append("  %go = icmp ult i64 %iv, %len\n");
+        header.append("  br i1 %go, label %cbody, label %cdone\n");
+        header.append("cbody:\n");
+        header.append("  %cp = getelementptr i8, i8* %text, i64 %iv\n");
+        header.append("  %ch = load i8, i8* %cp\n");
+        header.append("  %isnl = icmp eq i8 %ch, 10\n");
+        header.append("  br i1 %isnl, label %cinc, label %cnext\n");
+        header.append("cinc:\n");
+        header.append("  %nv = load i64, i64* %n\n");
+        header.append("  %n2 = add i64 %nv, 1\n");
+        header.append("  store i64 %n2, i64* %n\n");
+        header.append("  br label %cnext\n");
+        header.append("cnext:\n");
+        header.append("  %i2 = add i64 %iv, 1\n");
+        header.append("  store i64 %i2, i64* %i\n");
+        header.append("  br label %cloop\n");
+        header.append("cdone:\n");
+        header.append("  %z = icmp eq i64 %len, 0\n");
+        header.append("  br i1 %z, label %mkarr, label %checklast\n");
+        header.append("checklast:\n");
+        header.append("  %lm1 = sub i64 %len, 1\n");
+        header.append("  %lp = getelementptr i8, i8* %text, i64 %lm1\n");
+        header.append("  %lc = load i8, i8* %lp\n");
+        header.append("  %notnl = icmp ne i8 %lc, 10\n");
+        header.append("  br i1 %notnl, label %tailinc, label %mkarr\n");
+        header.append("tailinc:\n");
+        header.append("  %n3 = load i64, i64* %n\n");
+        header.append("  %n4 = add i64 %n3, 1\n");
+        header.append("  store i64 %n4, i64* %n\n");
+        header.append("  br label %mkarr\n");
+        header.append("mkarr:\n");
+        header.append("  %cnt = load i64, i64* %n\n");
+        header.append("  %dsz = shl i64 %cnt, 3\n");
+        header.append("  %tsz = add i64 %dsz, 8\n");
+        header.append("  %arr = call i8* @").append(alloc).append("(i64 %tsz)\n");
+        header.append("  store i64 %cnt, i64* %arr\n");
+        header.append("  %data = getelementptr i8, i8* %arr, i64 8\n");
+        header.append("  %typed = bitcast i8* %data to i8**\n");
+        header.append("  %start = alloca i64\n");
+        header.append("  store i64 0, i64* %start\n");
+        header.append("  %j = alloca i64\n");
+        header.append("  store i64 0, i64* %j\n");
+        header.append("  %slot = alloca i64\n");
+        header.append("  store i64 0, i64* %slot\n");
+        header.append("  br label %floop\n");
+        header.append("floop:\n");
+        header.append("  %jv = load i64, i64* %j\n");
+        header.append("  %fgo = icmp ult i64 %jv, %len\n");
+        header.append("  br i1 %fgo, label %fbody, label %tail\n");
+        header.append("fbody:\n");
+        header.append("  %jp = getelementptr i8, i8* %text, i64 %jv\n");
+        header.append("  %jc = load i8, i8* %jp\n");
+        header.append("  %jisnl = icmp eq i8 %jc, 10\n");
+        header.append("  br i1 %jisnl, label %emit, label %fnext\n");
+        header.append("emit:\n");
+        header.append("  %sv = load i64, i64* %start\n");
+        header.append("  %ll0 = sub i64 %jv, %sv\n");
+        header.append("  %gtpos = icmp ugt i64 %ll0, 0\n");
+        header.append("  br i1 %gtpos, label %chkcr, label %donestr\n");
+        header.append("chkcr:\n");
+        header.append("  %last = sub i64 %jv, 1\n");
+        header.append("  %pp = getelementptr i8, i8* %text, i64 %last\n");
+        header.append("  %pc = load i8, i8* %pp\n");
+        header.append("  %iscr = icmp eq i8 %pc, 13\n");
+        header.append("  br i1 %iscr, label %crtrim, label %donestr\n");
+        header.append("crtrim:\n");
+        header.append("  %ll = sub i64 %ll0, 1\n");
+        header.append("  br label %storeline\n");
+        header.append("donestr:\n");
+        header.append("  br label %storeline\n");
+        header.append("storeline:\n");
+        header.append("  %l = phi i64 [ %ll0, %donestr ], [ %ll, %crtrim ]\n");
+        header.append("  %src = getelementptr i8, i8* %text, i64 %sv\n");
+        header.append("  %line = call i8* @cang.f.strndup(i8* %src, i64 %l)\n");
+        header.append("  %sl = load i64, i64* %slot\n");
+        header.append("  %ep = getelementptr i8*, i8** %typed, i64 %sl\n");
+        header.append("  store i8* %line, i8** %ep\n");
+        header.append("  %sl2 = add i64 %sl, 1\n");
+        header.append("  store i64 %sl2, i64* %slot\n");
+        header.append("  %ns = add i64 %jv, 1\n");
+        header.append("  store i64 %ns, i64* %start\n");
+        header.append("  br label %fnext\n");
+        header.append("fnext:\n");
+        header.append("  %j2 = add i64 %jv, 1\n");
+        header.append("  store i64 %j2, i64* %j\n");
+        header.append("  br label %floop\n");
+        header.append("tail:\n");
+        header.append("  %sv2 = load i64, i64* %start\n");
+        header.append("  %has = icmp ult i64 %sv2, %len\n");
+        header.append("  br i1 %has, label %emitlast, label %fin\n");
+        header.append("emitlast:\n");
+        header.append("  %ll1 = sub i64 %len, %sv2\n");
+        header.append("  %gt1 = icmp ugt i64 %ll1, 0\n");
+        header.append("  br i1 %gt1, label %chkcr1, label %donestr1\n");
+        header.append("chkcr1:\n");
+        header.append("  %last1 = sub i64 %len, 1\n");
+        header.append("  %pp1 = getelementptr i8, i8* %text, i64 %last1\n");
+        header.append("  %pc1 = load i8, i8* %pp1\n");
+        header.append("  %iscr1 = icmp eq i8 %pc1, 13\n");
+        header.append("  br i1 %iscr1, label %crtrim1, label %donestr1\n");
+        header.append("crtrim1:\n");
+        header.append("  %ll1b = sub i64 %ll1, 1\n");
+        header.append("  br label %storelast\n");
+        header.append("donestr1:\n");
+        header.append("  br label %storelast\n");
+        header.append("storelast:\n");
+        header.append("  %l1 = phi i64 [ %ll1, %donestr1 ], [ %ll1b, %crtrim1 ]\n");
+        header.append("  %src1 = getelementptr i8, i8* %text, i64 %sv2\n");
+        header.append("  %line1 = call i8* @cang.f.strndup(i8* %src1, i64 %l1)\n");
+        header.append("  %sl1 = load i64, i64* %slot\n");
+        header.append("  %ep1 = getelementptr i8*, i8** %typed, i64 %sl1\n");
+        header.append("  store i8* %line1, i8** %ep1\n");
+        header.append("  %sl1b = add i64 %sl1, 1\n");
+        header.append("  store i64 %sl1b, i64* %slot\n");
+        header.append("  br label %fin\n");
+        header.append("fin:\n");
+        header.append("  ret i8* %arr\n");
+        header.append("}\n\n");
+    }
+
+    /** list: two readdir passes (count, then copy names); null when the path is not a directory. */
+    private void emitFileList(String alloc) {
+        boolean win = targetPlatform.equals("windows");
+        int dnameOff = win ? 8 : 19;
+        header.append("define i8* @cang.f.list(i8* %p) {\n");
+        header.append("entry:\n");
+        header.append("  %d = call i8* @opendir(i8* %p)\n");
+        header.append("  %dn = icmp eq i8* %d, null\n");
+        header.append("  br i1 %dn, label %retnull, label %count\n");
+        header.append("retnull:\n");
+        header.append("  ret i8* null\n");
+        header.append("count:\n");
+        header.append("  %n = alloca i64\n");
+        header.append("  store i64 0, i64* %n\n");
+        header.append("  br label %cloop\n");
+        header.append("cloop:\n");
+        header.append("  %de = call i8* @readdir(i8* %d)\n");
+        header.append("  %en = icmp eq i8* %de, null\n");
+        header.append("  br i1 %en, label %cdone, label %cbody\n");
+        header.append("cbody:\n");
+        header.append("  %nm = getelementptr i8, i8* %de, i64 ").append(dnameOff).append("\n");
+        header.append("  %c1 = call i32 @strcmp(i8* %nm, i8* @.f.dot)\n");
+        header.append("  %e1 = icmp eq i32 %c1, 0\n");
+        header.append("  br i1 %e1, label %cloop, label %chkdot\n");
+        header.append("chkdot:\n");
+        header.append("  %c2 = call i32 @strcmp(i8* %nm, i8* @.f.dotdot)\n");
+        header.append("  %e2 = icmp eq i32 %c2, 0\n");
+        header.append("  br i1 %e2, label %cloop, label %cinc\n");
+        header.append("cinc:\n");
+        header.append("  %nv = load i64, i64* %n\n");
+        header.append("  %n2 = add i64 %nv, 1\n");
+        header.append("  store i64 %n2, i64* %n\n");
+        header.append("  br label %cloop\n");
+        header.append("cdone:\n");
+        header.append("  %cc1 = call i32 @closedir(i8* %d)\n");
+        header.append("  %cnt = load i64, i64* %n\n");
+        header.append("  %dsz = shl i64 %cnt, 3\n");
+        header.append("  %tsz = add i64 %dsz, 8\n");
+        header.append("  %arr = call i8* @").append(alloc).append("(i64 %tsz)\n");
+        header.append("  store i64 %cnt, i64* %arr\n");
+        header.append("  %data = getelementptr i8, i8* %arr, i64 8\n");
+        header.append("  %typed = bitcast i8* %data to i8**\n");
+        header.append("  %d2 = call i8* @opendir(i8* %p)\n");
+        header.append("  %d2n = icmp eq i8* %d2, null\n");
+        header.append("  br i1 %d2n, label %resempty, label %fill\n");
+        header.append("resempty:\n");
+        header.append("  store i64 0, i64* %arr\n");
+        header.append("  ret i8* %arr\n");
+        header.append("fill:\n");
+        header.append("  %slot = alloca i64\n");
+        header.append("  store i64 0, i64* %slot\n");
+        header.append("  br label %floop\n");
+        header.append("floop:\n");
+        header.append("  %de2 = call i8* @readdir(i8* %d2)\n");
+        header.append("  %en2 = icmp eq i8* %de2, null\n");
+        header.append("  br i1 %en2, label %fdone, label %fbody\n");
+        header.append("fbody:\n");
+        header.append("  %nm2 = getelementptr i8, i8* %de2, i64 ").append(dnameOff).append("\n");
+        header.append("  %f1 = call i32 @strcmp(i8* %nm2, i8* @.f.dot)\n");
+        header.append("  %fe1 = icmp eq i32 %f1, 0\n");
+        header.append("  br i1 %fe1, label %floop, label %fchk\n");
+        header.append("fchk:\n");
+        header.append("  %f2 = call i32 @strcmp(i8* %nm2, i8* @.f.dotdot)\n");
+        header.append("  %fe2 = icmp eq i32 %f2, 0\n");
+        header.append("  br i1 %fe2, label %floop, label %fpush\n");
+        header.append("fpush:\n");
+        header.append("  %sl = load i64, i64* %slot\n");
+        header.append("  %cap = icmp ult i64 %sl, %cnt\n");
+        header.append("  br i1 %cap, label %dostore, label %fdone\n");
+        header.append("dostore:\n");
+        header.append("  %dup = call i8* @cang.f.strdup(i8* %nm2)\n");
+        header.append("  %ep = getelementptr i8*, i8** %typed, i64 %sl\n");
+        header.append("  store i8* %dup, i8** %ep\n");
+        header.append("  %sl2 = add i64 %sl, 1\n");
+        header.append("  store i64 %sl2, i64* %slot\n");
+        header.append("  br label %floop\n");
+        header.append("fdone:\n");
+        header.append("  %cc2 = call i32 @closedir(i8* %d2)\n");
+        header.append("  %fin = load i64, i64* %slot\n");
+        header.append("  store i64 %fin, i64* %arr\n");
+        header.append("  ret i8* %arr\n");
+        header.append("}\n\n");
+    }
+
+    /** Emit `define ... @cang_io_File.<name>(...)` plus the path-field load; returns the path value. */
+    private String fileMethodPrologue(String retType, String name, String params, int pathIdx) {
+        header.append("define ").append(retType).append(" @cang_io_File.").append(name)
+              .append("(").append(params).append(") {\n");
+        header.append("entry:\n");
+        String pp = "%f.pp." + tmpCount++;
+        String path = "%f.path." + tmpCount++;
+        header.append("  ").append(pp).append(" = getelementptr %cang_io_File, %cang_io_File* %this, i32 0, i32 ")
+              .append(pathIdx).append("\n");
+        header.append("  ").append(path).append(" = load i8*, i8** ").append(pp).append("\n");
+        return path;
+    }
+
+    /** Wrapper defines for all 20 native File methods — these satisfy the generic call sites. */
+    private void emitFileWrappers() {
+        ClassInfo fileCi = classes.get("cang_io_File");
+        if (fileCi == null) return;
+        Integer pIdx = fileCi.fieldIndices.get("path");
+        if (pIdx == null) return;
+        int pathIdx = pIdx;
+        String thisParam = "%cang_io_File* %this";
+
+        // getPath: the stored path string itself (no copy).
+        String p0 = fileMethodPrologue("i8*", "getPath", thisParam, pathIdx);
+        header.append("  ret i8* ").append(p0).append("\n}\n\n");
+
+        // getName / getParent / getAbsolutePath / toSystemPath
+        String[][] strHelpers = {
+            { "getName", "cang.f.getname" },
+            { "getParent", "cang.f.getparent" },
+            { "getAbsolutePath", "cang.f.abspath" },
+            { "toSystemPath", "cang.f.tosystem" },
+        };
+        for (String[] m : strHelpers) {
+            String path = fileMethodPrologue("i8*", m[0], thisParam, pathIdx);
+            String r = "%r." + tmpCount++;
+            header.append("  ").append(r).append(" = call i8* @").append(m[1]).append("(i8* ").append(path).append(")\n");
+            header.append("  ret i8* ").append(r).append("\n}\n\n");
+        }
+
+        // bool-returning single-arg helpers
+        String[][] boolHelpers = {
+            { "isAbsolute", "cang.f.isabs" },
+            { "exists", "cang.f.exists" },
+            { "isFile", "cang.f.isfile" },
+            { "isDirectory", "cang.f.isdir" },
+            { "delete", "cang.f.delete" },
+            { "mkdir", "cang.f.mkdir" },
+            { "mkdirs", "cang.f.mkdirs" },
+            { "createNewFile", "cang.f.create" },
+        };
+        for (String[] m : boolHelpers) {
+            String path = fileMethodPrologue("i1", m[0], thisParam, pathIdx);
+            String r = "%r." + tmpCount++;
+            header.append("  ").append(r).append(" = call i1 @").append(m[1]).append("(i8* ").append(path).append(")\n");
+            header.append("  ret i1 ").append(r).append("\n}\n\n");
+        }
+
+        // length -> i64
+        String lp = fileMethodPrologue("i64", "length", thisParam, pathIdx);
+        String lr = "%r." + tmpCount++;
+        header.append("  ").append(lr).append(" = call i64 @cang.f.length(i8* ").append(lp).append(")\n");
+        header.append("  ret i64 ").append(lr).append("\n}\n\n");
+
+        // renameTo(File dest): load both path fields.
+        {
+            header.append("define i1 @cang_io_File.renameTo(%cang_io_File* %this, %cang_io_File* %dest) {\n");
+            header.append("entry:\n");
+            String pp1 = "%f.pp." + tmpCount++;
+            String pa = "%f.path." + tmpCount++;
+            header.append("  ").append(pp1).append(" = getelementptr %cang_io_File, %cang_io_File* %this, i32 0, i32 ")
+                  .append(pathIdx).append("\n");
+            header.append("  ").append(pa).append(" = load i8*, i8** ").append(pp1).append("\n");
+            String pp2 = "%f.dpp." + tmpCount++;
+            String pb = "%f.dpath." + tmpCount++;
+            header.append("  ").append(pp2).append(" = getelementptr %cang_io_File, %cang_io_File* %dest, i32 0, i32 ")
+                  .append(pathIdx).append("\n");
+            header.append("  ").append(pb).append(" = load i8*, i8** ").append(pp2).append("\n");
+            String r = "%r." + tmpCount++;
+            header.append("  ").append(r).append(" = call i1 @cang.f.rename(i8* ").append(pa)
+                  .append(", i8* ").append(pb).append(")\n");
+            header.append("  ret i1 ").append(r).append("\n}\n\n");
+        }
+
+        // readText -> i8*
+        String rp = fileMethodPrologue("i8*", "readText", thisParam, pathIdx);
+        String rr = "%r." + tmpCount++;
+        header.append("  ").append(rr).append(" = call i8* @cang.f.readtext(i8* ").append(rp).append(")\n");
+        header.append("  ret i8* ").append(rr).append("\n}\n\n");
+
+        // writeText / appendText: mode 0 = overwrite, 1 = append.
+        String[][] ioMethods = {
+            { "writeText", "0" },
+            { "appendText", "1" },
+        };
+        for (String[] m : ioMethods) {
+            String path = fileMethodPrologue("i1", m[0], thisParam + ", i8* %content", pathIdx);
+            String r = "%r." + tmpCount++;
+            header.append("  ").append(r).append(" = call i1 @cang.f.write(i8* ").append(path)
+                  .append(", i8* %content, i32 ").append(m[1]).append(")\n");
+            header.append("  ret i1 ").append(r).append("\n}\n\n");
+        }
+
+        // readLines / list -> i8* (Array<String> at the call site)
+        String[][] arrayMethods = {
+            { "readLines", "cang.f.readlines" },
+            { "list", "cang.f.list" },
+        };
+        for (String[] m : arrayMethods) {
+            String path = fileMethodPrologue("i8*", m[0], thisParam, pathIdx);
+            String r = "%r." + tmpCount++;
+            header.append("  ").append(r).append(" = call i8* @").append(m[1]).append("(i8* ").append(path).append(")\n");
+            header.append("  ret i8* ").append(r).append("\n}\n\n");
+        }
+    }
+
     private String semanticKindOf(String cangType) {
         return cangType != null && (cangType.equals("str") || cangType.equals("String") || isFunctionType(cangType) || isListType(cangType) || isThreadType(cangType))
             ? cangType : null;

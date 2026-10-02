@@ -1,0 +1,84 @@
+import cang/io/File
+
+class Main()
+# ---- setup: clean leftovers from previous runs ----
+File dir = new File("target/ftest")
+File txt = new File("target/ftest/hello.txt")
+if (txt.exists()) { txt.delete() }
+if (dir.exists()) { dir.delete() }
+
+# ---- directory creation ----
+Stdout.println(dir.mkdirs())            # true
+Stdout.println(dir.isDirectory())       # true
+Stdout.println(dir.exists())            # true
+Stdout.println(dir.isFile())            # false
+
+# ---- file creation + basic state ----
+Stdout.println(txt.createNewFile())     # true
+Stdout.println(txt.createNewFile())     # false (already exists)
+Stdout.println(txt.exists())            # true
+Stdout.println(txt.isFile())            # true
+
+# ---- write / read ----
+Stdout.println(txt.writeText("hello"))  # true
+Stdout.println(txt.length())            # 5
+Stdout.println(txt.readText() == "hello") # true
+Stdout.println(txt.appendText("!"))     # true
+Stdout.println(txt.readText())          # hello!
+Stdout.println(txt.length())            # 6
+
+# ---- path info ----
+Stdout.println(txt.getPath())           # target/ftest/hello.txt
+Stdout.println(txt.getName())           # hello.txt
+Stdout.println(txt.getParent())         # target/ftest
+Stdout.println(dir.getParent())         # target
+Stdout.println(txt.isAbsolute())        # false
+Stdout.println(txt.toSystemPath())      # target/ftest/hello.txt (already system style)
+Stdout.println(File.separator)          # \ on windows, / on linux
+Stdout.println(txt.getAbsolutePath())   # absolute (cwd-dependent, printed only)
+
+# ---- null semantics ----
+File bare = new File("bare.txt")
+Stdout.println(bare.getParent())        # null
+Stdout.println(bare.getParent() == null)  # true
+Stdout.println(bare.getParent() != null)  # false
+Stdout.println(txt.getParent() == null)   # false
+Stdout.println(bare.getName())          # bare.txt
+
+# ---- readLines (CRLF stripping + line count) ----
+File multi = new File("target/ftest/multi.txt")
+multi.writeText("a\nb\r\nc")
+String[] lines = multi.readLines()
+Stdout.println(lines.length())          # 3
+for (String s : lines) {
+    Stdout.println(s)                   # a / b / c
+}
+Stdout.println(multi.readLines().length()) # 3 (chained)
+
+# ---- list ----
+File another = new File("target/ftest/another.txt")
+another.writeText("x")
+String[] names = dir.list()
+Stdout.println(names.length())          # 3 (hello.txt, multi.txt, another.txt)
+for (String n : names) {
+    Stdout.println(n)
+}
+
+# ---- renameTo / delete ----
+File moved = new File("target/ftest/moved.txt")
+Stdout.println(txt.renameTo(moved))     # true
+Stdout.println(moved.exists())          # true
+Stdout.println(txt.exists())            # false (source gone)
+Stdout.println(moved.delete())          # true
+Stdout.println(another.delete())        # true
+Stdout.println(multi.delete())          # true
+Stdout.println(dir.delete())            # true (now empty)
+Stdout.println(dir.exists())            # false
+
+# ---- missing file / unreadable ----
+File ghost = new File("target/ftest/ghost.txt")
+Stdout.println(ghost.exists())          # false
+Stdout.println(ghost.readText() == null) # true
+Stdout.println(ghost.readLines().length()) # 0 (empty array, not null)
+Stdout.println(ghost.length())          # 0
+Stdout.println(ghost.delete())          # false
