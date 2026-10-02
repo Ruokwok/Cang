@@ -194,6 +194,43 @@
 - 位置：Parser 顶层节点组装（语句归最近 class 头）+ 入口选择（第一 class）。
 - 修复指引：非入口 class 头之后若出现语句（非 class/func 声明）→ 报错 `statements must appear right after the entry class (first class in file)`；或文档强约定 + 报错兜底。**优先报错，静默丢代码不可接受。**
 
+### 37. ✅ 缺运行时尺寸数组分配（纯 Cang 动态数组的根本前提）—— 已修复
+- 原现象：`T[N]` 只收正整型字面量，无 `new T[expr]` → 纯 Cang 无法实现可扩容动态数组。
+- 修复：新增 **`new T[sizeExpr]` 数组创建表达式**（AST `NewArrayExpr`，字段名 `type` 使单态化可替换其中的 T）：
+  - Parser `new` 分支先解析 base type 再判 `[`（类创建/数组创建分流）；
+  - codegen：负数运行时检查（`Negative array size`，可 catch）→ `allocFn(8 + n*elemBytes)` → 长度头存 n → `memset` 零填充（Java `new int[8]` 语义）→ 返回带 `Array<T>` 语义类型（链式 `.length()` 可用）。
+- 验证：`new int[cap]` → `8 | 42 | 0 | 100000`（零填充/百万级分配）✓；回归 33/33。
+
+### 38. ✅ 字段数组的元素类型追踪缺失 —— 已修复
+- 原现象：`elemCangOf` 不识别 FieldAccessExpr → `this.data[i]` 回落 i32，String/对象元素报 `Array element type mismatch`；字段 `.length()` 报 `Unknown method: i8*.length`。
+- 修复三件套：
+  1. `elemCangOf` 增加 FieldAccess 分支：新增纯查询 `pureClassName`（ThisExpr/Identifier/嵌套 FieldAccess 递归解析接收者类）→ fieldIndices 反查 `Array<T>` 内层元素类型；
+  2. `generateFieldAccess` 对 `Array<...>` 类型字段附 semanticType → 字段链式 `.length()` 分派成功；
+  3. 单态化 `rewriteAstTypes` 支持**复合类型替换**（`Array<T>` → `Array<int>`，原实现只替换整串相等）——泛型 `T[]` 字段的前置。
+- 验证：String 元素字段数组 `this.data[i]` 读写 ✓（poc_strlist `hello`）、泛型 `Box<int>` 字段数组全链 ✓（poc_mono `7|4|99`）；回归 33/33。
+
+### 39. ✅ 带命名空间类的私有 `_` 方法/字段检查失败 —— 已修复
+- 原现象：`class ArrayList<T>`（namespace cang/lang）内调用 `this._grow()` 报 `Method '_grow' is private and cannot be accessed from 'cang_lang_ArrayList_int'`——`isSameOrParentClass` 用 `currentClassName`（fullName）与 `ownerClass.simpleName` 直接字符串等值比较，命名空间类两侧形态不一致。私有字段检查（generateFieldAccess）同病，非命名空间类（fullName==simpleName）从未触发。
+- 修复：`isSameOrParentClass` 入口把 currentClass 经 `classes` 表归一化为 simpleName 再比较/走父链（单点修复，方法与字段两处私有检查同时覆盖）。
+- 验证：`t_arraylist` 的 `_grow` 私有调用 ✓；回归 35/35。
+
+### 40. 🟡 泛型参数默认值 `null` 不随具体类型适配 —— 待修
+- 现象：`class Box<T>(T v = null)` 实例化 `Box<int>` → 默认值 NullLit 原样生成 → IR `store i8* null, i32* ...` → clang `null must be a pointer type` 编译失败（在 clang 层报错而非编译器友好提示）。引用类型 T（String/类）默认 null 正常；值类型（int 等）必炸。
+- 根因：单态化 `rewriteAstTypes` 只改类型字符串，不改默认值 AST；`generateNew` 缺参路径直接 `generateExpr(defaultVal)`。
+- 修复指引（择一）：① `rewriteAstTypes` 遇到值类型 concrete 且 default 为 NullLit 时替换为对应零值字面量（IntLit 0 / false / 0.0）；② `generateNew` 缺参路径检测 `NullLit` + 目标为非引用 llvmType → 发零值。推荐 ①（一次改在单态化处）。
+- 影响面：仅"值类型 T + null 默认值"组合；`T[] data = null`（数组恒为引用）与无默认值参数不受影响。ArrayList 已用 `new T[10]` 规避。
+- 附注：跨函数 `throw` 不进入调用方 `catch`（实测未捕获→报错退出）已由第九节"异常只支持同函数 handler"覆盖，不另立条目。
+
+### 41. ✅ List 内建 `%CangList` → 纯 Cang 实现迁移（用户定名，参考 ArrayList）—— 已完成
+- 决策：`List` 正名回归 `cang/lang/List`（替换原 native 壳文件），实现存储/扩容参考 java.util.ArrayList；内建分派与纯 Cang 实现同名无法共存，故**移除内建**。
+- 变更清单：
+  - `stdlib/cang/lang/List.cang`：纯 Cang `class List<T>(T[] data = new T[10], int size = 0)`，11 个方法（size/isEmpty/get/set/add/insertAt/remove/contains/indexOf/clear/toArray + 私有 `_grow`）；**add 返回新元素下标**（与历史行为一致），remove 按下标返回元素；越界抛 Error 带行号。
+  - LLVMGen 移除内建路径：generateMethodCall 的 List 分派、generateNew 的 %CangList 分配、generateVarDecl 的 List 归一化、toLLVMType 的 `%CangList*` 分支、单态化对 List 的两处豁免（现与普通泛型类一致走多类型特化）。
+  - `generateListForEach` 重写为**方法调用式迭代**（`size()` 快照 + `get(i)`，与 ABI 无关，保留 break/continue + stacksave 回收）。
+  - 符号注意：for-each 必须用 `ci.fullName`（`cang_lang_List_int.get`）而非 semanticType 短名——首次实现踩坑实测。
+- 兼容性：list_demo/list_int/list_methods 输出与内建版**逐字节一致**（含 `add` 返回下标、`remove` 返回元素）；`import cang/lang/List` 测试原本就有；t_feloop 补了 import。
+- 残留（记录不修）：`%CangList` 类型定义与 `generateListMethod` 等成为死代码（保留无害）；`new List<>(单元素)` 旧便捷构造不再支持（测试未用）；`free l` 不释放 `_data` 缓冲（同 #18，GC 默认模式无感）；解析器泛型实参只收 base type，`List<int[]>` 不支持（既有）。
+
 ---
 
 ## 九、已知且已文档化的限制（⚪ 不再展开）
@@ -215,9 +252,11 @@
 1. ~~1–3 裸崩溃三件套~~ ✅
 2. ~~4 深递归裸栈溢出~~ ✅（SP 探测 + thread_local 栈基址，见第 4 条）
 3. ~~5 循环 alloca 栈溢出~~ ✅（stacksave/stackrestore，见第 5 条）
-4. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
-5. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
-6. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
-7. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）
-8. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
-9. 其余 🟡 按批次清理
+4. ~~37 + 38 运行时数组分配 + 字段数组元素追踪~~ ✅（见第 37/38 条）
+5. ~~泛型多类型单态化（T71）+ 纯 Cang ArrayList（T72）~~ ✅：多具体类型每类一特化（重解析克隆 + 全键映射 + 钻石推断 + 未用模板跳过）；`stdlib/cang/lang/ArrayList.cang` 11 个方法，`t_arraylist` 29 断言（int+String 双类型同程序）全过，套件 35/35
+6. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
+7. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
+8. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
+9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
+10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
+11. 其余 🟡 按批次清理

@@ -2,6 +2,9 @@ package codegen;
 
 import parser.AST.*;
 import parser.AST;
+import lexer.Lexer;
+import lexer.Token;
+import parser.Parser;
 
 import java.util.*;
 
@@ -259,6 +262,10 @@ public class LLVMGen {
                 if (!cd.genericParams.isEmpty()) {
                     if (cd.genericParams.size() != 1) throw new RuntimeException("Generic class '" + cd.name + "' must have exactly one type parameter");
                     genericTemplates.put(cd.name, cd);
+                    // Un-specialized template: never collected nor generated — its method bodies
+                    // still reference the unsubstituted type parameter (invalid IR like %T*).
+                    // prepareGenericMonomorphization materializes one member per used type argument.
+                    continue;
                 }
                 // Classes without explicit parent inherit from Object (but Object itself has no parent)
                 if (cd.superClass == null && !cd.name.equals("Object")) {
@@ -343,25 +350,74 @@ public class LLVMGen {
     // ==================== Pass 1: Collection ====================
 
     private void prepareGenericMonomorphization(List<AST> members) {
-        Map<String, String> chosen = new LinkedHashMap<>();
-        for (AST root : members) collectGenericUses(root, chosen);
-        for (AST root : members) {
+        // Multi-specialization (T71): record every concrete argument per generic owner, then
+        // materialize one ClassDecl per (generic, arg) pair — first arg reuses the original
+        // decl, further args get a fresh copy re-parsed from the same source file.
+        Map<String, Set<String>> allArgs = new LinkedHashMap<>();
+        for (AST root : members) collectGenericUses(root, allArgs);
+
+        List<ClassDecl> materialized = new ArrayList<>();
+        for (AST root : new ArrayList<>(members)) {
             if (!(root instanceof ClassDecl)) continue;
             ClassDecl cd = (ClassDecl) root;
-            if (cd.genericParams.isEmpty() || cd.name.equals("List") || cd.name.equals("Thread")) continue;
-            String arg = chosen.get(cd.name);
-            if (arg == null) throw new RuntimeException("Generic class '" + cd.name + "' has no concrete type argument");
-            if (arg.contains("<") || arg.contains(">") || arg.contains(",")) throw new RuntimeException("Nested generic types are not supported");
-            String specialized = cd.name + "_" + arg;
-            genericTypeOwners.put(cd.name, specialized);
-            rewriteAstTypes(cd, cd.genericParams.get(0), arg);
-            cd.name = specialized;
-            cd.genericParams.clear();
+            if (cd.genericParams.isEmpty() || cd.name.equals("Thread")) continue;
+            String baseName = cd.name;
+            String param = cd.genericParams.get(0);
+            Set<String> args = allArgs.get(baseName);
+            if (args == null || args.isEmpty()) {
+                // Generic template that is never used (e.g. auto-loaded stdlib): keep it as an
+                // un-specialized template; the member loop skips templates entirely.
+                continue;
+            }
+            boolean first = true;
+            for (String arg : args) {
+                if (arg.contains("<") || arg.contains(">") || arg.contains(",")) {
+                    throw new RuntimeException("Nested generic types are not supported");
+                }
+                ClassDecl spec = cd;
+                if (!first) {
+                    spec = reparseClassDecl(cd, baseName);
+                    if (spec == null) {
+                        throw new RuntimeException("Cannot create specialization '" + baseName + "_" + arg + "' (source file unavailable: '" + cd.sourceFile + "')");
+                    }
+                    materialized.add(spec);
+                }
+                first = false;
+                rewriteAstTypes(spec, param, arg);
+                String specName = baseName + "_" + arg;
+                genericTypeOwners.put(baseName + "<" + arg + ">", specName);
+                spec.name = specName;
+                spec.genericParams.clear();
+            }
         }
+        members.addAll(materialized);
         for (AST root : members) rewriteGenericNames(root);
     }
 
-    private void collectGenericUses(AST node, Map<String, String> chosen) {
+    /** Deep-copy a generic class by re-parsing its source file (multi-specialization, T71). */
+    private ClassDecl reparseClassDecl(ClassDecl cd, String baseName) {
+        String file = cd.sourceFile;
+        if (file == null || file.isEmpty()) return null;
+        try {
+            String text = java.nio.file.Files.readString(java.nio.file.Path.of(file));
+            Lexer lexer = new Lexer(text);
+            List<Token> tokens = lexer.tokenize();
+            Parser parser = new Parser(tokens);
+            AST.Program prog = parser.parse();
+            prog.setSourceFile(file);
+            for (AST root : prog.members) {
+                if (root instanceof ClassDecl) {
+                    ClassDecl c = (ClassDecl) root;
+                    if (c.name.equals(baseName) && !c.genericParams.isEmpty()) return c;
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void collectGenericUses(AST node, Map<String, Set<String>> allArgs) {
         if (node == null) return;
         if (node instanceof VarDecl) {
             String t = ((VarDecl) node).type;
@@ -369,26 +425,23 @@ public class LLVMGen {
             if (lt > 0 && gt > lt) {
                 String owner = t.substring(0, lt);
                 // Array<T> and Function<...> are built-in internal types, not generic classes.
-                if (owner.equals("Array") || owner.equals("Function") || owner.equals("List") || owner.equals("Thread")) {
-                    // Continue walking child AST nodes without recording a class specialization.
-                } else {
-                String arg = t.substring(lt + 1, gt);
-                String previous = chosen.putIfAbsent(owner, arg);
-                if (previous != null && !previous.equals(arg)) {
-                    throw new RuntimeException("Generic class '" + owner + "' is used with conflicting type arguments '" + previous + "' and '" + arg + "'");
-                }
+                if (!owner.equals("Array") && !owner.equals("Function") && !owner.equals("Thread")) {
+                    String arg = t.substring(lt + 1, gt);
+                    allArgs.computeIfAbsent(owner, k -> new LinkedHashSet<>()).add(arg);
                 }
             }
         }
         if (node instanceof NewExpr) {
             NewExpr n = (NewExpr) node;
-            if (!n.typeArgs.isEmpty()) chosen.put(n.className, n.typeArgs.get(0));
+            if (!n.typeArgs.isEmpty()) {
+                allArgs.computeIfAbsent(n.className, k -> new LinkedHashSet<>()).add(n.typeArgs.get(0));
+            }
         }
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
             try {
                 Object v = f.get(node);
-                if (v instanceof AST) collectGenericUses((AST) v, chosen);
-                else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) collectGenericUses((AST) x, chosen);
+                if (v instanceof AST) collectGenericUses((AST) v, allArgs);
+                else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) collectGenericUses((AST) x, allArgs);
             } catch (IllegalAccessException ignored) { }
         }
     }
@@ -398,7 +451,13 @@ public class LLVMGen {
             try {
                 Object v = f.get(node);
                 if (v instanceof String && (f.getName().equals("type") || f.getName().equals("returnType"))) {
-                    if (v.equals(parameter)) f.set(node, concrete);
+                    String s = (String) v;
+                    if (s.equals(parameter)) {
+                        f.set(node, concrete);
+                    } else if (s.contains("<" + parameter + ">")) {
+                        // Composite types: Array<T> -> Array<int> (needed for generic T[] fields)
+                        f.set(node, s.replace("<" + parameter + ">", "<" + concrete + ">"));
+                    }
                 } else if (v instanceof AST) rewriteAstTypes((AST) v, parameter, concrete);
                 else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) rewriteAstTypes((AST) x, parameter, concrete);
             } catch (IllegalAccessException ignored) { }
@@ -408,12 +467,31 @@ public class LLVMGen {
     private void rewriteGenericNames(AST node) {
         if (node instanceof VarDecl) {
             VarDecl v = (VarDecl) node;
-            for (Map.Entry<String, String> e : genericTypeOwners.entrySet())
-                if (!e.getKey().equals("List") && v.type.startsWith(e.getKey() + "<")) v.type = e.getValue();
+            String replaced = replaceGenericKeys(v.type);
+            if (!replaced.equals(v.type)) {
+                String owner = v.type.substring(0, v.type.indexOf('<'));
+                v.type = replaced;
+                // Diamond `Box<int> b = new Box<>()`: infer the specialization from the decl.
+                if (v.init instanceof NewExpr) {
+                    NewExpr n = (NewExpr) v.init;
+                    if (n.typeArgs.isEmpty() && n.className.equals(owner)) n.className = replaced;
+                }
+            }
         } else if (node instanceof NewExpr) {
             NewExpr n = (NewExpr) node;
-            String owner = genericTypeOwners.get(n.className);
-            if (owner != null && !n.className.equals("List")) n.className = owner;
+            if (!n.typeArgs.isEmpty()) {
+                String spec = genericTypeOwners.get(n.className + "<" + n.typeArgs.get(0) + ">");
+                if (spec != null) n.className = spec;
+            }
+        } else if (node instanceof FuncDecl) {
+            FuncDecl f = (FuncDecl) node;
+            f.returnType = replaceGenericKeys(f.returnType);
+        } else if (node instanceof Parameter) {
+            Parameter p = (Parameter) node;
+            p.type = replaceGenericKeys(p.type);
+        } else if (node instanceof NewArrayExpr) {
+            NewArrayExpr na = (NewArrayExpr) node;
+            na.type = replaceGenericKeys(na.type);
         }
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
             try {
@@ -422,6 +500,15 @@ public class LLVMGen {
                 else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) rewriteGenericNames((AST) x);
             } catch (IllegalAccessException ignored) { }
         }
+    }
+
+    /** Rewrite every recorded "Owner<arg>" key inside a type string to its specialization. */
+    private String replaceGenericKeys(String t) {
+        if (t == null) return null;
+        for (Map.Entry<String, String> e : genericTypeOwners.entrySet()) {
+            if (t.contains(e.getKey())) t = t.replace(e.getKey(), e.getValue());
+        }
+        return t;
     }
 
     private void collectClass(ClassDecl decl) {
@@ -570,9 +657,14 @@ public class LLVMGen {
      */
     private boolean isSameOrParentClass(String currentClass, String targetClass) {
         if (currentClass == null) return false;
-        if (currentClass.equals(targetClass)) return true;
+        // Normalize the current class to its simple name: callers pass either the full name
+        // (currentClassName from generateFunction, e.g. "cang_lang_ArrayList_int") or a simple
+        // name, while targetClass is always simple — string equality needs like-for-like.
+        ClassInfo cur = classes.get(currentClass);
+        String curName = cur != null ? cur.simpleName : currentClass;
+        if (curName.equals(targetClass)) return true;
         // currentClass is a parent of targetClass (target extends current)
-        return isSubclass(targetClass, currentClass);
+        return isSubclass(targetClass, curName);
     }
 
     /**
@@ -1851,14 +1943,6 @@ public class LLVMGen {
         registerGcRoot(ptrName, llvmType);
 
         if (decl.init != null) {
-            if (isListType(cangType) && decl.init instanceof NewExpr) {
-                NewExpr newExpr = (NewExpr) decl.init;
-                if (newExpr.typeArgs.isEmpty()) {
-                    String elemType = listElementType(cangType);
-                    newExpr.typeArgs.add(elemType);
-                }
-                newExpr.className = "List";
-            }
             String savedExpected = expectedFunctionType;
             expectedFunctionType = isFunctionType(cangType) ? cangType : null;
             LLVMValue val;
@@ -2156,46 +2240,42 @@ public class LLVMGen {
      */
     private void generateListForEach(ForEachStmt stmt, LLVMValue list, String elemCang) {
         String elemLLVM = toLLVMType(elemCang);
+        // Function symbols use the FULL class name (namespace-qualified): semanticType is the
+        // short "List_int" key while collectFunction registers "cang_lang_List_int.get".
+        ClassInfo listCi = classes.get(list.semanticType);
+        String cls = listCi != null ? listCi.fullName : list.semanticType;
         int id = labelCount++;
         String cond = "list.foreach.cond." + id;
         String bodyLabel = "list.foreach.body." + id;
         String cleanup = "list.foreach.cleanup." + id;
         String update = "list.foreach.update." + id;
         String end = "list.foreach.end." + id;
-        String sizePtr = "%list.foreach.sizeptr." + tmpCount++;
-        String dataPtr = "%list.foreach.dataptr." + tmpCount++;
         String indexPtr = "%list.foreach.indexptr." + tmpCount++;
+        String varPtr = "%list.foreach.var." + id;
 
-        // break/continue support (previously missing here — silently no-opped) + stack reclaim
+        // break/continue support + per-iteration stack reclaim (debug.md #5)
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = end;
         loopStack.get(loopStack.size() - 1).continueLabel = cleanup;
 
-        body.append("  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
-        body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n");
-        body.append("  ").append(indexPtr).append(" = alloca i64\n  store i64 0, i64* ").append(indexPtr).append("\n");
+        // Method-based iteration over the pure-Cang List (no %CangList ABI): snapshot size once.
+        String recv = list.type + " " + list.value;
+        String sizeRes = "%list.foreach.size." + tmpCount++;
+        body.append("  ").append(sizeRes).append(" = call i32 @").append(cls).append(".size(").append(recv).append(")\n");
+
+        // Invariant allocas BEFORE stacksave so they survive per-iteration restores.
+        body.append("  ").append(indexPtr).append(" = alloca i32\n  store i32 0, i32* ").append(indexPtr).append("\n");
+        body.append("  ").append(varPtr).append(" = alloca ").append(elemLLVM).append("\n");
         String stackSave = emitStackSave();
         body.append("  br label %").append(cond).append("\n").append(cond).append(":\n");
         String index = "%list.foreach.index." + tmpCount++;
-        String size = "%list.foreach.size." + tmpCount++;
         String cmp = "%list.foreach.cmp." + tmpCount++;
-        body.append("  ").append(index).append(" = load i64, i64* ").append(indexPtr).append("\n");
-        body.append("  ").append(size).append(" = load i64, i64* ").append(sizePtr).append("\n");
-        body.append("  ").append(cmp).append(" = icmp ult i64 ").append(index).append(", ").append(size).append("\n");
+        body.append("  ").append(index).append(" = load i32, i32* ").append(indexPtr).append("\n");
+        body.append("  ").append(cmp).append(" = icmp slt i32 ").append(index).append(", ").append(sizeRes).append("\n");
         body.append("  br i1 ").append(cmp).append(", label %").append(bodyLabel).append(", label %").append(end).append("\n").append(bodyLabel).append(":\n");
-        String data = "%list.foreach.data." + tmpCount++;
-        long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
-        String byteOffset = "%list.foreach.offset." + tmpCount++;
-        String slot = "%list.foreach.slot." + tmpCount++;
-        String typed = "%list.foreach.typed." + tmpCount++;
         String value = "%list.foreach.value." + tmpCount++;
-        body.append("  ").append(data).append(" = load i8*, i8** ").append(dataPtr).append("\n");
-        body.append("  ").append(byteOffset).append(" = mul i64 ").append(index).append(", ").append(elemBytes).append("\n");
-        body.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(data).append(", i64 ").append(byteOffset).append("\n");
-        body.append("  ").append(typed).append(" = bitcast i8* ").append(slot).append(" to ").append(elemLLVM).append("*\n");
-        body.append("  ").append(value).append(" = load ").append(elemLLVM).append(", ").append(elemLLVM).append("* ").append(typed).append("\n");
-        String varPtr = "%list.foreach.var." + id;
-        body.append("  ").append(varPtr).append(" = alloca ").append(elemLLVM).append("\n");
+        body.append("  ").append(value).append(" = call ").append(elemLLVM).append(" @").append(cls)
+             .append(".get(").append(recv).append(", i32 ").append(index).append(")\n");
         body.append("  store ").append(elemLLVM).append(" ").append(value).append(", ").append(elemLLVM).append("* ").append(varPtr).append("\n");
         scope.define(stmt.varName, new LLVMValue(varPtr, elemLLVM, elemCang));
         int start = body.length();
@@ -2206,7 +2286,7 @@ public class LLVMGen {
         body.append("  br label %").append(update).append("\n");
         body.append(update).append(":\n");
         String next = "%list.foreach.next." + tmpCount++;
-        body.append("  ").append(next).append(" = add i64 ").append(index).append(", 1\n  store i64 ").append(next).append(", i64* ").append(indexPtr).append("\n  br label %").append(cond).append("\n");
+        body.append("  ").append(next).append(" = add i32 ").append(index).append(", 1\n  store i32 ").append(next).append(", i32* ").append(indexPtr).append("\n  br label %").append(cond).append("\n");
         body.append(end).append(":\n");
         emitStackRestore(stackSave);
 
@@ -2461,6 +2541,9 @@ public class LLVMGen {
         }
         if (node instanceof NewExpr) {
             return generateNew((NewExpr) node);
+        }
+        if (node instanceof NewArrayExpr) {
+            return generateNewArray((NewArrayExpr) node);
         }
         if (node instanceof ArrayLit) {
             return generateArrayLit((ArrayLit) node);
@@ -3892,14 +3975,6 @@ public class LLVMGen {
             }
         }
 
-        // List<T> is a compiler-built dynamic array.
-        if (node.object != null) {
-            LLVMValue listValue = generateExpr(node.object);
-            if (listValue.semanticType != null && isListType(listValue.semanticType)) {
-                return generateListMethod(listValue, listValue.semanticType, node.method, node.args, node.line);
-            }
-        }
-
         // Arrays expose length() as a built-in method. The length is stored in the i64 header.
         if (node.method.equals("length") && node.args.isEmpty()) {
             LLVMValue arrayValue = generateExpr(node.object);
@@ -4677,7 +4752,10 @@ public class LLVMGen {
         String loaded = "%fld." + tmpCount++;
         body.append("  ").append(loaded).append(" = load ").append(toLLVMType(fieldType))
              .append(", ").append(toLLVMType(fieldType)).append("* ").append(fieldPtr).append("\n");
-        return new LLVMValue(loaded, toLLVMType(fieldType));
+        // Array-typed fields carry their Array<T> semantic type so chained .length() works
+        // (debug.md #38): e.g. this.items.length().
+        String fldSem = isArraySemanticType(fieldType) ? fieldType : null;
+        return new LLVMValue(loaded, toLLVMType(fieldType), fldSem);
     }
 
     private LLVMValue generateExprForPtr(AST node) {
@@ -4735,36 +4813,58 @@ public class LLVMGen {
         return generateExpr(node);
     }
 
-    private LLVMValue generateNew(NewExpr node) {
-        if (node.className.equals("List") || isListType(node.className)) {
-            String elemCang = !node.typeArgs.isEmpty() ? node.typeArgs.get(0) : listElementType(node.className);
-            if (elemCang == null) throw new RuntimeException("List requires one concrete element type (at line " + node.line + ")");
-            String elemLLVM = toLLVMType(elemCang);
-            String raw = "%list.new.raw." + tmpCount++;
-            String obj = "%list.new." + tmpCount++;
-            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
-            body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangList*\n");
-            String data = "%list.new.data." + tmpCount++;
-            long elemBytes = llvmTypeBits(elemLLVM) <= 0 ? 8 : (llvmTypeBits(elemLLVM) + 7) / 8;
-            long initialBytes = 8L * elemBytes;
-            body.append("  ").append(data).append(" = call i8* @").append(allocFn()).append("(i64 ").append(initialBytes).append(")\n");
-            String dataField = "%list.new.datafield." + tmpCount++;
-            String sizeField = "%list.new.sizefield." + tmpCount++;
-            String capField = "%list.new.capfield." + tmpCount++;
-            body.append("  ").append(dataField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 0\n");
-            body.append("  store i8* ").append(data).append(", i8** ").append(dataField).append("\n");
-            body.append("  ").append(sizeField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 1\n");
-            body.append("  store i64 0, i64* ").append(sizeField).append("\n");
-            body.append("  ").append(capField).append(" = getelementptr %CangList, %CangList* ").append(obj).append(", i32 0, i32 2\n");
-            body.append("  store i64 8, i64* ").append(capField).append("\n");
-            LLVMValue result = new LLVMValue(obj, "%CangList*", "List<" + elemCang + ">");
-            if (node.args.size() == 1) {
-                generateListMethod(result, result.semanticType, "add", node.args, node.line);
-            } else if (!node.args.isEmpty()) {
-                throw new RuntimeException("List constructor accepts zero or one initial element (at line " + node.line + ")");
-            }
-            return result;
+    /**
+     * Runtime-sized array creation `new T[size]` (debug.md #37): length-prefixed heap block
+     * with a zero-filled data region — same layout as array literals, size evaluated at runtime.
+     */
+    private LLVMValue generateNewArray(NewArrayExpr node) {
+        if (node.type.equals("var") || node.type.equals("void")) {
+            throw new RuntimeException("'var'/'void' cannot be an array element type (at line " + node.line + ")");
         }
+        LLVMValue sizeV = generateExpr(node.size);
+        if (!isNumericLLVM(sizeV.type)) {
+            throw new RuntimeException("Array size must be numeric (at line " + node.line + ")");
+        }
+        String n = castValue(sizeV, "i64");
+
+        // Negative sizes are a runtime error (Java: NegativeArraySizeException).
+        int id = labelCount++;
+        String okL = "arrsize.ok." + id;
+        String negL = "arrsize.neg." + id;
+        // Value prefix must differ from the label prefix (LLVM values/labels share one
+        // namespace — third recurrence of debug.md #34, keep prefixes disjoint!).
+        String neg = "%isneg." + tmpCount++;
+        body.append("  ").append(neg).append(" = icmp slt i64 ").append(n).append(", 0\n");
+        body.append("  br i1 ").append(neg).append(", label %").append(negL)
+             .append(", label %").append(okL).append("\n\n");
+        body.append(negL).append(":\n");
+        emitRuntimeError("Negative array size", node.line, okL);
+        body.append(okL).append(":\n");
+
+        String elemLLVM = toLLVMType(node.type);
+        long elemBits = llvmTypeBits(elemLLVM);
+        if (elemBits <= 0) elemBits = 64; // pointers occupy 8 bytes (same rule as array literals)
+        long elemBytes = (elemBits + 7) / 8;
+
+        String bytes = "%arr.bytes." + tmpCount++;
+        body.append("  ").append(bytes).append(" = mul i64 ").append(n).append(", ").append(elemBytes).append("\n");
+        String total = "%arr.total." + tmpCount++;
+        body.append("  ").append(total).append(" = add i64 ").append(bytes).append(", 8\n");
+        String ptr = "%arr.new." + tmpCount++;
+        body.append("  ").append(ptr).append(" = call i8* @").append(allocFn()).append("(i64 ").append(total).append(")\n");
+        registerRegionAllocation(ptr);
+        body.append("  store i64 ").append(n).append(", i64* ").append(ptr).append("\n");
+
+        // Zero-fill the data region (Java `new int[8]` semantics: elements start as 0/null).
+        String data = "%arr.data." + tmpCount++;
+        body.append("  ").append(data).append(" = getelementptr i8, i8* ").append(ptr).append(", i64 8\n");
+        body.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(data)
+             .append(", i8 0, i64 ").append(bytes).append(", i1 false)\n");
+
+        return new LLVMValue(ptr, "i8*", "Array<" + node.type + ">");
+    }
+
+    private LLVMValue generateNew(NewExpr node) {
         // Boxing a primitive str into the immutable String reference wrapper.
         if (node.className.equals("String") && node.args.size() == 1) {
             LLVMValue value = generateExpr(node.args.get(0));
@@ -4825,7 +4925,8 @@ public class LLVMGen {
             body.append("  call void @").append(ctorName).append("(").append(args).append(")\n");
         }
 
-        return new LLVMValue(obj, ci.llvmName + "*");
+        return new LLVMValue(obj, ci.llvmName + "*",
+            isListType(node.className) ? node.className : null);
     }
 
     // ==================== Array generation ====================
@@ -4860,6 +4961,53 @@ public class LLVMGen {
         }
         if (expr instanceof ArrayAccessExpr) {
             return innerElemCang(elemCangOf(((ArrayAccessExpr) expr).array));
+        }
+        if (expr instanceof FieldAccessExpr) {
+            // Field arrays: resolve the receiver class and read the declared Array<T> element
+            // type out of its field table (debug.md #38). Covers `this.data[i]` / `obj.buf[i]`.
+            FieldAccessExpr fa = (FieldAccessExpr) expr;
+            String cn = pureClassName(fa.object);
+            while (cn != null) {
+                ClassInfo ci = classes.get(cn);
+                if (ci == null) return null;
+                Integer idx = ci.fieldIndices.get(fa.field);
+                if (idx != null) {
+                    String ft = ci.fieldTypes.get(idx - 1);
+                    if (ft != null && ft.startsWith("Array<") && ft.endsWith(">")) {
+                        return ft.substring(6, ft.length() - 1);
+                    }
+                    return null;
+                }
+                cn = ci.parentName;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** Pure (no IR emission) resolver: AST -> its Cang class name, or null. */
+    private String pureClassName(AST expr) {
+        if (expr instanceof ThisExpr) return currentClassName;
+        if (expr instanceof Identifier) {
+            LLVMValue v = scope != null ? scope.lookup(((Identifier) expr).name) : null;
+            if (v == null) return null;
+            String cn = extractClassName(v.type);
+            return classes.containsKey(cn) ? cn : null;
+        }
+        if (expr instanceof FieldAccessExpr) {
+            FieldAccessExpr fa = (FieldAccessExpr) expr;
+            String recv = pureClassName(fa.object);
+            while (recv != null) {
+                ClassInfo ci = classes.get(recv);
+                if (ci == null) return null;
+                Integer idx = ci.fieldIndices.get(fa.field);
+                if (idx != null) {
+                    String ft = ci.fieldTypes.get(idx - 1);
+                    return ft != null && classes.containsKey(ft) ? ft : null;
+                }
+                recv = ci.parentName;
+            }
+            return null;
         }
         return null;
     }
@@ -6250,9 +6398,6 @@ public class LLVMGen {
         // Function values are uniform { code, receiver } structs.
         if (isFunctionType(cangType)) {
             return "%CangFunction";
-        }
-        if (isListType(cangType)) {
-            return "%CangList*";
         }
         if (isThreadType(cangType)) {
             return "%CangThreadHandle*";

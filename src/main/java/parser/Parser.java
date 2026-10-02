@@ -942,13 +942,26 @@ public class Parser {
 
         if (check(TokenType.NEW)) {
             advance();
-            String className;
-            if (check(TokenType.IDENT, TokenType.T_STRING)) {
-                className = advance().value;
+            // Array creation `new T[size]` vs object creation `new Class(...)`.
+            // parseBaseType covers IDENT class names and all primitive keywords.
+            String elemOrClass;
+            if (check(TokenType.IDENT, TokenType.T_STRING, TokenType.T_BYTE, TokenType.T_INT,
+                    TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STR)) {
+                elemOrClass = parseBaseType();
             } else {
                 error("Expected class name after 'new'");
-                className = "unknown";
+                elemOrClass = "unknown";
             }
+            if (check(TokenType.LBRACKET)) {
+                if (elemOrClass.equals("var") || elemOrClass.equals("void")) {
+                    error("'var'/'void' cannot be an array element type");
+                }
+                advance(); // '['
+                AST size = parseExpression();
+                expect(TokenType.RBRACKET);
+                return new NewArrayExpr(elemOrClass, size, line);
+            }
+            String className = elemOrClass;
             List<String> typeArgs = new ArrayList<>();
             if (check(TokenType.LT)) {
                 advance();

@@ -1,31 +1,138 @@
 namespace cang/lang
 
-# List<T> - 编译器内建动态数组。
-# 字段和方法用于 IDE/类型提示；运行时实现由 LLVMGen 内建生成。
-class List<T>()
+# List<T> - 泛型动态数组（纯 Cang 实现，存储结构与扩容策略参考 java.util.ArrayList）
+# 存储：T[] data + int size；容量不足时扩容为 1.5 倍（oldCap + oldCap / 2）。
+# 说明：
+# - 构造默认 new T[10]（对应 Java ArrayList 的 DEFAULT_CAPACITY）；
+# - add 返回新元素下标（与历史 List 行为一致）；
+# - Cang 不支持方法重载，按位置插入命名为 insertAt（Java add(int, E)）；
+# - 越界访问抛 Error（带本文件行号）。
 
-# 内部存储字段（由编译器内建实现管理）
-T[] _data
-int _size
-int _capacity
+import cang/lang/Error
 
-# 当前元素数量
-native func int size()
+class List<T>(T[] data = new T[10], int size = 0)
 
-# 按下标读取元素
-native func T get(int index)
-
-# 追加元素，必要时自动扩容，返回新元素的下标
-native func int add(T value)
-
-# 删除指定下标的元素，返回被删除的元素
-native func T remove(int index)
-
-# 判断列表是否包含指定元素
-native func bool contains(T value)
-
-# 清空列表
-native func void clear()
+# 元素个数
+func int size() {
+    return this.size
+}
 
 # 是否为空
-native func bool isEmpty()
+func bool isEmpty() {
+    return this.size == 0
+}
+
+# 下标取值；越界抛 Error
+func T get(int index) {
+    if (index < 0 || index >= this.size) {
+        throw new Error("List index out of bounds: " + index)
+    }
+    return this.data[index]
+}
+
+# 下标赋值；越界抛 Error
+func void set(int index, T value) {
+    if (index < 0 || index >= this.size) {
+        throw new Error("List index out of bounds: " + index)
+    }
+    this.data[index] = value
+}
+
+# 末尾追加，容量不足时扩容；返回新元素下标
+func int add(T value) {
+    if (this.data == null) {
+        this.data = new T[10]
+    }
+    if (this.size == this.data.length()) {
+        this._grow()
+    }
+    this.data[this.size] = value
+    this.size = this.size + 1
+    return this.size - 1
+}
+
+# 在指定下标插入（Java add(int, E) 的无重载命名）
+func void insertAt(int index, T value) {
+    if (index < 0 || index > this.size) {
+        throw new Error("List index out of bounds: " + index)
+    }
+    if (this.data == null) {
+        this.data = new T[10]
+    }
+    if (this.size == this.data.length()) {
+        this._grow()
+    }
+    int i = this.size
+    while (i > index) {
+        this.data[i] = this.data[i - 1]
+        i = i - 1
+    }
+    this.data[index] = value
+    this.size = this.size + 1
+}
+
+# 删除指定下标元素并返回（与历史 List remove(int) 行为一致）
+func T remove(int index) {
+    if (index < 0 || index >= this.size) {
+        throw new Error("List index out of bounds: " + index)
+    }
+    T old = this.data[index]
+    int i = index
+    int last = this.size - 1
+    while (i < last) {
+        this.data[i] = this.data[i + 1]
+        i = i + 1
+    }
+    this.size = last
+    return old
+}
+
+# 是否包含指定元素（String 按内容比较，与 Java equals 语义一致）
+func bool contains(T value) {
+    return this.indexOf(value) >= 0
+}
+
+# 首次出现的下标；未找到返回 -1
+func int indexOf(T value) {
+    int i = 0
+    while (i < this.size) {
+        if (this.data[i] == value) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# 清空（容量保留，与 Java 一致）
+func void clear() {
+    this.size = 0
+}
+
+# 拷贝为新数组，长度等于 size
+func T[] toArray() {
+    T[] out = new T[this.size]
+    int i = 0
+    while (i < this.size) {
+        out[i] = this.data[i]
+        i = i + 1
+    }
+    return out
+}
+
+# 扩容为 1.5 倍；_ 前缀 = 类私有（外部不可调用）
+func void _grow() {
+    int oldCap = this.data.length()
+    int newCap = oldCap + oldCap / 2
+    if (newCap <= oldCap) {
+        # 容量为 0/1 时兜底，保证一定增长（避免死循环）
+        newCap = oldCap + 10
+    }
+    T[] bigger = new T[newCap]
+    int i = 0
+    while (i < this.size) {
+        bigger[i] = this.data[i]
+        i = i + 1
+    }
+    this.data = bigger
+}

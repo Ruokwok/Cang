@@ -178,6 +178,16 @@ public abstract class AST {
         }
     }
 
+    /** Runtime-sized array creation: new T[sizeExpr] (debug.md #37). Field is named
+     *  `type` so generic monomorphization (rewriteAstTypes) substitutes T inside it. */
+    public static class NewArrayExpr extends AST {
+        public String type;   // element Cang type (int, String, T, ...)
+        public AST size;      // runtime size expression
+        public NewArrayExpr(String type, AST size, int line) {
+            super(line); this.type = type; this.size = size;
+        }
+    }
+
     // ==================== Statements ====================
 
     public static class Block extends AST {
