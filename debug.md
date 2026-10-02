@@ -33,13 +33,15 @@
 - 验证：`test/t_stackoverflow.cang`（1 亿层）→ `error: Stack overflow: recursion too deep at :1` 退出 1；`test/t_rec_ok.cang`（10000 层）→ 正常输出退出 0；回归 31/31。
 - 教训（复发！）：初版值名 `%stk.ovf.N` 与标签 `stk.ovf.N` 同名撞上 #34 同款 LLVM 命名空间冲突，`function_full`（多函数才触发计数器巧合）才暴露——**值/标签成对生成处前缀必须不同，且要用多函数用例回归**。
 
-### 5. 🔴 循环内局部变量反复 alloca → 栈溢出 —— 待修
-- 现象：每次循环迭代对循环体内的局部变量重新 `alloca` 且从不恢复栈指针；300 万次 `int j = i` → 栈溢出；对照组（循环内无变量声明）正常。
-- 位置：`generateVarDecl` 的 alloca 路径（约 1700 行）；循环体 codegen 无栈帧回收概念。
-- 修复指引（二选一）：
-  - **循环外提升（推荐）**：进入循环前把循环体内所有声明的变量 alloca 一次（需在语句遍历时收集声明名），迭代内只 store。可只对 while/for 体做一趟声明收集。
-  - 或函数入口统一 alloca：所有局部变量在函数入口分配（名字编译期可确定），语句处只发 store。改动面更大但一劳永逸。
-- 验证：300 万次迭代循环体含 `int j = i` 应正常结束。
+### 5. ✅ 循环内局部变量反复 alloca → 栈溢出 —— 已修复
+- 现象：循环体内局部变量的 `alloca` 指令位于循环块内，每次迭代重新执行且从不回收；300 万次 `int j = i` → 栈溢出。List for-each 的循环变量 alloca 同样在体内（无需用户声明即增长）。
+- 修复（`llvm.stacksave/stackrestore` 方案）：
+  - 四个循环发射器（while / for / 数组 for-each / List for-each）统一：**入口 save**（for 在 init 之后，保证 `int i` 初始化变量存活）、**cleanup 标签**（restore + 跳 update/cond）、**出口 restore**（覆盖 break 直跳）；`LoopContext.continueLabel` 改指 cleanup → break/continue 发射逻辑零改动。
+  - List for-each 原先**没有 push loopStack** → 循环内 break/continue 是静默空操作，本次顺带补上（t_feloop 断言 break=3）。
+- 附带修复 1（同批暴露）：**同函数同名局部变量 IR 冲突**（两个循环各声明 `int j` → 两个 `%v.j` → clang `multiple definition`，既有问题首次被测试命中）→ 四处 VarDecl alloca 名统一加 `tmpCount` 后缀（`%v.j.N`），顺带使作用域遮蔽合法化。
+- 附带修复 2：**`emitBranchIfNeeded` 终结符检测过窄**（只认 ret 和"恰好跳向自身 target 的 br"，`while(...){ break }` 这种以 br 结尾的体追加第二终结符）→ 改为检查**最后一行**是否为任意终结符（ret/br/switch/unreachable/indirectbr）。
+- 验证：`t_loopalloc`（300 万 while + 200 万 for 循环体声明 + break/continue=9）✓、`t_feloop`（数组/List for-each 各 10 万 + list 内 break=3）✓；回归 33/33。
+- 已知残留（可接受）：循环体内 throw 跳出时未 restore（同函数 handler 场景栈帧泄漏一次，有界）；循环内 `return` 无需 restore（函数帧整体释放）。
 
 ### 6. 🔴 编译器自身深嵌套 StackOverflowError —— 待修
 - 现象：2 万层括号 → 未捕获 `java.lang.StackOverflowError` 裸栈回溯。
@@ -212,9 +214,10 @@
 
 1. ~~1–3 裸崩溃三件套~~ ✅
 2. ~~4 深递归裸栈溢出~~ ✅（SP 探测 + thread_local 栈基址，见第 4 条）
-3. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
-4. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
-5. **5**（循环 alloca 栈溢出）→ 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
-6. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）
-7. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
-8. 其余 🟡 按批次清理
+3. ~~5 循环 alloca 栈溢出~~ ✅（stacksave/stackrestore，见第 5 条）
+4. **14–16 短路求值 + 重复求值**（`x!=null && x.m()` 失效是语义级硬伤）
+5. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
+6. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
+7. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）
+8. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
+9. 其余 🟡 按批次清理

@@ -850,7 +850,9 @@ public class LLVMGen {
             header.append("declare i32 @CloseHandle(i8*)\n");
         }
         header.append("declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)\n");
-        header.append("declare void @llvm.memset.p0i8.p0i8.i64(i8*, i8, i64, i1)\n\n");
+        header.append("declare void @llvm.memset.p0i8.p0i8.i64(i8*, i8, i64, i1)\n");
+        header.append("declare i8* @llvm.stacksave()\n");
+        header.append("declare void @llvm.stackrestore(i8*)\n\n");
 
         // Runtime stack trace support
         header.append("@.str.errprefix = private constant [11 x i8] c\"error: %s\\0A\\00\"\n");
@@ -1367,6 +1369,19 @@ public class LLVMGen {
         sb.append("  store i64 ").append(v).append(", i64* @.stack.base\n");
     }
 
+    /** Capture SP at loop entry so per-iteration allocas can be reclaimed (debug.md #5). */
+    private String emitStackSave() {
+        String sv = "%stacksave." + tmpCount++;
+        body.append("  ").append(sv).append(" = call i8* @llvm.stacksave()\n");
+        return sv;
+    }
+
+    /** Restore SP to a previous emitStackSave point (idempotent when already at that level). */
+    private void emitStackRestore(String sv) {
+        if (sv == null) return;
+        body.append("  call void @llvm.stackrestore(i8* ").append(sv).append(")\n");
+    }
+
     /**
      * Stack-overflow guard at function entry (debug.md #4): probe this frame's address and
      * raise a friendly fatal error when the thread has used more than STACK_BUDGET bytes.
@@ -1750,7 +1765,7 @@ public class LLVMGen {
                 if (lastArrayElemCangType != null) {
                     arrayElemCangTypes.put(decl.name, lastArrayElemCangType);
                 }
-                String ptrName = "%v." + decl.name;
+                String ptrName = "%v." + decl.name + "." + tmpCount++;
                 body.append("  ").append(ptrName).append(" = alloca i8*\n");
                 scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + lastArrayElemCangType + ">"));
                 registerGcRoot(ptrName, "i8*");
@@ -1759,7 +1774,7 @@ public class LLVMGen {
             }
             LLVMValue val = generateExpr(decl.init);
             llvmType = val.type;
-            String ptrName = "%v." + decl.name;
+            String ptrName = "%v." + decl.name + "." + tmpCount++;
             body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
             scope.define(decl.name, new LLVMValue(ptrName, llvmType, val.semanticType));
             body.append("  store ").append(llvmType).append(" ").append(val.value)
@@ -1814,7 +1829,7 @@ public class LLVMGen {
             }
 
             if (arrVal != null) {
-                String ptrName = "%v." + decl.name;
+                String ptrName = "%v." + decl.name + "." + tmpCount++;
                 body.append("  ").append(ptrName).append(" = alloca i8*\n");
                 scope.define(decl.name, new LLVMValue(ptrName, "i8*", "Array<" + elemCangType + ">"));
                 registerGcRoot(ptrName, "i8*");
@@ -1825,7 +1840,7 @@ public class LLVMGen {
         }
 
         llvmType = toLLVMType(cangType);
-        String ptrName = "%v." + decl.name;
+        String ptrName = "%v." + decl.name + "." + tmpCount++;
 
         body.append("  ").append(ptrName).append(" = alloca ").append(llvmType).append("\n");
         // Array<T> decl with a non-literal initializer (method call/alias) must keep its Array<T>
@@ -2021,10 +2036,13 @@ public class LLVMGen {
 
     private void emitBranchIfNeeded(String targetLabel, int sinceOffset) {
         String recent = body.substring(sinceOffset).trim();
-        boolean hasTerminator = recent.contains("\n  ret ") ||
-            recent.startsWith("ret ") ||
-            recent.startsWith("\nret ") ||
-            recent.endsWith("\n  br label %" + targetLabel);
+        // Terminator detection looks at the LAST line only: a trailing label opens a fresh
+        // block (needs the branch), while any terminator (ret/br/switch/unreachable — even to
+        // a different label, e.g. `break`) already closes the current block.
+        String lastLine = recent.contains("\n") ? recent.substring(recent.lastIndexOf('\n') + 1) : recent;
+        boolean hasTerminator = lastLine.startsWith("ret") || lastLine.startsWith("br ")
+            || lastLine.startsWith("switch") || lastLine.startsWith("unreachable")
+            || lastLine.startsWith("indirectbr");
         if (!hasTerminator) {
             body.append("  br label %").append(targetLabel).append("\n");
         }
@@ -2034,11 +2052,16 @@ public class LLVMGen {
         int id = labelCount++;
         String condLabel = "while.cond." + id;
         String bodyLabel = "while.body." + id;
+        String cleanupLabel = "while.cleanup." + id;
         String endLabel = "while.end." + id;
 
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
-        loopStack.get(loopStack.size() - 1).continueLabel = condLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
+
+        // Reclaim per-iteration allocas (debug.md #5): save SP before the loop; restore on
+        // every back-edge/continue (cleanup) and at the exit (covers break out of the body).
+        String stackSave = emitStackSave();
 
         body.append("  br label %").append(condLabel).append("\n\n");
 
@@ -2051,10 +2074,15 @@ public class LLVMGen {
         body.append(bodyLabel).append(":\n");
         int whileBodyStart = body.length();
         generateStmt(stmt.body);
-        emitBranchIfNeeded(condLabel, whileBodyStart);
+        emitBranchIfNeeded(cleanupLabel, whileBodyStart);
         body.append("\n");
 
+        body.append(cleanupLabel).append(":\n");
+        emitStackRestore(stackSave);
+        body.append("  br label %").append(condLabel).append("\n\n");
+
         body.append(endLabel).append(":\n");
+        emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
     }
@@ -2063,12 +2091,13 @@ public class LLVMGen {
         int id = labelCount++;
         String condLabel = "for.cond." + id;
         String bodyLabel = "for.body." + id;
+        String cleanupLabel = "for.cleanup." + id;
         String updateLabel = "for.update." + id;
         String endLabel = "for.end." + id;
 
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
-        loopStack.get(loopStack.size() - 1).continueLabel = updateLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
 
         // Init
         if (stmt.init != null) {
@@ -2078,6 +2107,9 @@ public class LLVMGen {
                 generateExpr(stmt.init);
             }
         }
+
+        // Save AFTER init so the init variable (e.g. `for (int i = 0; ...)`) survives restores.
+        String stackSave = emitStackSave();
 
         body.append("  br label %").append(condLabel).append("\n\n");
 
@@ -2096,8 +2128,13 @@ public class LLVMGen {
         body.append(bodyLabel).append(":\n");
         int forBodyStart = body.length();
         generateStmt(stmt.body);
-        emitBranchIfNeeded(updateLabel, forBodyStart);
+        emitBranchIfNeeded(cleanupLabel, forBodyStart);
         body.append("\n");
+
+        // Cleanup: reclaim this iteration's allocas before continue/update (debug.md #5)
+        body.append(cleanupLabel).append(":\n");
+        emitStackRestore(stackSave);
+        body.append("  br label %").append(updateLabel).append("\n\n");
 
         // Update
         body.append(updateLabel).append(":\n");
@@ -2108,6 +2145,7 @@ public class LLVMGen {
 
         // End
         body.append(endLabel).append(":\n");
+        emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
     }
@@ -2121,14 +2159,22 @@ public class LLVMGen {
         int id = labelCount++;
         String cond = "list.foreach.cond." + id;
         String bodyLabel = "list.foreach.body." + id;
+        String cleanup = "list.foreach.cleanup." + id;
         String update = "list.foreach.update." + id;
         String end = "list.foreach.end." + id;
         String sizePtr = "%list.foreach.sizeptr." + tmpCount++;
         String dataPtr = "%list.foreach.dataptr." + tmpCount++;
         String indexPtr = "%list.foreach.indexptr." + tmpCount++;
+
+        // break/continue support (previously missing here — silently no-opped) + stack reclaim
+        loopStack.add(new LoopContext());
+        loopStack.get(loopStack.size() - 1).breakLabel = end;
+        loopStack.get(loopStack.size() - 1).continueLabel = cleanup;
+
         body.append("  ").append(sizePtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 1\n");
         body.append("  ").append(dataPtr).append(" = getelementptr %CangList, %CangList* ").append(list.value).append(", i32 0, i32 0\n");
         body.append("  ").append(indexPtr).append(" = alloca i64\n  store i64 0, i64* ").append(indexPtr).append("\n");
+        String stackSave = emitStackSave();
         body.append("  br label %").append(cond).append("\n").append(cond).append(":\n");
         String index = "%list.foreach.index." + tmpCount++;
         String size = "%list.foreach.size." + tmpCount++;
@@ -2154,11 +2200,17 @@ public class LLVMGen {
         scope.define(stmt.varName, new LLVMValue(varPtr, elemLLVM, elemCang));
         int start = body.length();
         generateStmt(stmt.body);
-        emitBranchIfNeeded(update, start);
+        emitBranchIfNeeded(cleanup, start);
+        body.append(cleanup).append(":\n");
+        emitStackRestore(stackSave);
+        body.append("  br label %").append(update).append("\n");
         body.append(update).append(":\n");
         String next = "%list.foreach.next." + tmpCount++;
         body.append("  ").append(next).append(" = add i64 ").append(index).append(", 1\n  store i64 ").append(next).append(", i64* ").append(indexPtr).append("\n  br label %").append(cond).append("\n");
         body.append(end).append(":\n");
+        emitStackRestore(stackSave);
+
+        loopStack.remove(loopStack.size() - 1);
     }
 
     private void generateForEach(ForEachStmt stmt) {
@@ -2170,12 +2222,13 @@ public class LLVMGen {
         int id = labelCount++;
         String condLabel = "foreach.cond." + id;
         String bodyLabel = "foreach.body." + id;
+        String cleanupLabel = "foreach.cleanup." + id;
         String updateLabel = "foreach.update." + id;
         String endLabel = "foreach.end." + id;
 
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
-        loopStack.get(loopStack.size() - 1).continueLabel = updateLabel;
+        loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
 
         // Evaluate iterable (get array pointer)
         LLVMValue arrVal = generateExpr(stmt.iterable);
@@ -2211,6 +2264,9 @@ public class LLVMGen {
         }
         body.append("  ").append(varPtr).append(" = alloca ").append(varLLVMType).append("\n");
         registerGcRoot(varPtr, varLLVMType);
+
+        // Save AFTER the invariant allocas (idx/var) so they survive per-iteration restores.
+        String stackSave = emitStackSave();
 
         // Determine element type from tracked info
         String elemType = varLLVMType;
@@ -2258,8 +2314,13 @@ public class LLVMGen {
 
         int bodyStart = body.length();
         generateStmt(stmt.body);
-        emitBranchIfNeeded(updateLabel, bodyStart);
+        emitBranchIfNeeded(cleanupLabel, bodyStart);
         body.append("\n");
+
+        // Cleanup: reclaim this iteration's allocas before continue/update (debug.md #5)
+        body.append(cleanupLabel).append(":\n");
+        emitStackRestore(stackSave);
+        body.append("  br label %").append(updateLabel).append("\n\n");
 
         // Update: idx++
         body.append(updateLabel).append(":\n");
@@ -2270,6 +2331,7 @@ public class LLVMGen {
 
         // End
         body.append(endLabel).append(":\n");
+        emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
     }
