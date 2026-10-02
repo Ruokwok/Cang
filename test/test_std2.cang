@@ -1,9 +1,0 @@
-namespace test
-
-import cang/lang/Stdout
-import cang/lang/Math
-import cang/lang/String
-
-class Test()
-
-Stdout.print("imported Math and String")

@@ -1,8 +1,0 @@
-namespace cc/ruok
-
-import cang/lang/Object
-
-class Main
-
-
-Stdout.print(Math.random())

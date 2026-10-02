@@ -1,9 +1,0 @@
-class Main()
-
-Box<String> box = new Box<>("hello")
-Stdout.println(box.get(0))
-
-class Box<T>(T value)
-func T get(int index) {
-    return this.value
-}

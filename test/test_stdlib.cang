@@ -1,7 +1,0 @@
-namespace test
-
-import cang/lang/Stdout
-
-class Test()
-
-Stdout.print("stdlib works")

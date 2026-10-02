@@ -1,4 +1,0 @@
-namespace cc/demo
-
-# NotFound - Error 子类，演示异常继承
-class NotFound(String message = "", String[] stack = []) : Error(message)

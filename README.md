@@ -224,11 +224,13 @@ Cang/
 │   └── util/        # 编译错误和工具类
 ├── stdlib/
 │   └── cang/lang/   # Cang 标准库源码
-├── test/             # 测试和示例
-├── working/          # 多文件工作示例
+├── test/             # 测试和示例（仅本地，不入库）
+├── working/          # 多文件工作示例（仅本地，不入库）
 ├── doc.md            # 详细开发文档
 └── README.md
 ```
+
+详细开发文档见 **[doc.md](doc.md)**。
 
 ## 当前限制
 
