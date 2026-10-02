@@ -40,7 +40,7 @@ Stdout.println("main continues")
 - 块被编译成一个独立的无参 `void` 函数，并通过 `Thread.spawn` 启动（继承 `Thread` 的 GC 语义与跨平台路径）；
 - 当前线程不等待，继续执行后面的语句；
 - 程序返回前会自动 join 所有 `thread { }` 创建的线程，保证块内输出不会因进程退出而丢失；
-- 与无捕获 lambda 相同，**不允许捕获外部变量或 `this`**（报 `Thread block cannot capture ...`）；
+- **不允许捕获外部变量或 `this`**（报 `Thread block cannot capture ...`；与 lambda 不同，线程块保持无捕获）；
 - 暂不支持写在循环体内（编译期报错）。
 
 > 文档基于当前编译器实现。部分高级功能仍在开发中，文末列出了已知限制。
@@ -584,7 +584,7 @@ var main = new Main()
 Stdout.println(main.apply(main::inc, 41))
 ```
 
-### 9.3 无捕获 lambda
+### 9.3 lambda 捕获外部变量
 
 ```cang
 class Main()
@@ -593,8 +593,9 @@ func void call(Function<Void, int> f) {
     f(123)
 }
 
+int x = 41
 call((i) -> void {
-    Stdout.println(i)
+    Stdout.println(i + x)     # 按值捕获 x
 })
 ```
 
@@ -603,18 +604,26 @@ call((i) -> void {
 - 一个参数；
 - 显式写返回类型 `void`；
 - 必须出现在已知 `Function<...>` 类型上下文中；
-- 不允许捕获外部变量。
+- **可以捕获外部变量与 `this`，按值捕获**（创建时快照，与 Java 一致）。
 
-以下写法会报错：
+捕获语义：
+
+- 快照发生在 lambda **创建时**，之后对外部变量的修改不影响已创建的实例：
 
 ```cang
-func void bad() {
-    int x = 10
-    call((i) -> void {
-        Stdout.println(x)       # 不允许捕获 x
-    })
+int x = 41
+Function<Void, int> f = (i) -> void {
+    Stdout.println(i + x)
 }
+f(1)        # 42
+x = 100
+f(2)        # 43（仍是创建时的 41）
 ```
+
+- lambda 内对被捕获变量赋值只修改**副本**，不影响外部变量；
+- lambda 内声明的同名局部变量会遮蔽捕获（同名局部优先）；
+- 捕获数组、List 或类实例只快照引用本身，对象内容仍共享（对 List 的 add/remove 外部可见）；
+- 线程块 `thread { }` 仍然**禁止捕获**（见文档开头 Thread 章节）。
 
 ### 9.4 this 方法引用
 
@@ -689,8 +698,7 @@ ClassName::staticMethod
 - 返回类型；
 - 参数数量；
 - 参数类型；
-- 静态方法/实例方法使用方式；
-- lambda 是否捕获外部变量。
+- 静态方法/实例方法使用方式。
 
 `Class::instanceMethod`、`obj::staticMethod` 等错误引用会被拒绝。
 
@@ -1391,19 +1399,12 @@ Stdout.println(main.add(1, 2))
 当前支持：
 
 - 普通函数引用；
-- 无捕获 lambda；
+- lambda（单参数、`void` 返回，按值捕获外部变量与 `this`）；
 - `this::method`；
 - `object::method`；
 - `Class::staticMethod`。
 
-当前不支持普通 lambda 捕获外部变量：
-
-```cang
-int x = 1
-var f = (i) -> void {
-    Stdout.println(x)       # 不支持捕获 x
-}
-```
+lambda 仅支持 `Function<Void, T>` 形式（见 9.3）；线程块 `thread { }` 仍禁止捕获。
 
 ### 22.4 内存管理
 
@@ -1521,7 +1522,7 @@ call((i) -> void {
 })
 ```
 
-> 说明：当前 lambda 仅支持 `Function<Void, T>` 形式的无捕获 void lambda，因此上面的 lambda 需要配合 `func void call(Function<Void, int> f)` 使用，不能作为 `Function<int, int>` 的参数。
+> 说明：当前 lambda 仅支持 `Function<Void, T>` 形式的单参数 void lambda（可按值捕获外部变量），因此上面的 lambda 需要配合 `func void call(Function<Void, int> f)` 使用，不能作为 `Function<int, int>` 的参数。
 
 ---
 

@@ -2603,11 +2603,18 @@ public class LLVMGen {
         if (!parts[0].equals("void") && !parts[0].equals("Void")) {
             throw new RuntimeException("Lambdas return void, but expected " + expected + " (at line " + node.line + ")");
         }
-        validateLambdaNoCapture(node.body, node.parameter, node.line);
+        // By-value closure capture: resolve free variables against the ENCLOSING scope BEFORE
+        // the scope swap. Values are snapshotted into a heap env at creation (Java semantics:
+        // later mutations of the outer variable are not visible inside the lambda).
+        List<String> captures = collectLambdaCaptures(node);
+        List<LLVMValue> captureVals = new ArrayList<>();
+        for (String capName : captures) captureVals.add(scope.lookup(capName));
 
         String paramCang = parts[1];
         String paramLLVM = toLLVMType(paramCang);
-        String fnName = "@cang.lambda." + lambdaCount++;
+        int lambdaId = lambdaCount++;
+        String fnName = "@cang.lambda." + lambdaId;
+        String envType = "%cang.env." + lambdaId;
         String codeType = "void (i8*, " + paramLLVM + ")*";
 
         Scope savedScope = scope;
@@ -2631,6 +2638,38 @@ public class LLVMGen {
              .append(", ").append(paramLLVM).append("* ").append(allocaName).append("\n");
         scope.define(node.parameter, new LLVMValue(allocaName, paramLLVM, paramCang));
 
+        // Unpack env slots into lambda-local scope entries. Shape-compatible with regular
+        // declarations (alloca + value type) so generateIdentifier works unchanged; `this`
+        // keeps its raw-pointer shape (matches generateExprForPtr(ThisExpr)).
+        if (!captures.isEmpty()) {
+            StringBuilder shape = new StringBuilder();
+            for (LLVMValue v : captureVals) {
+                if (shape.length() > 0) shape.append(", ");
+                shape.append(v.type);
+            }
+            header.append(envType).append(" = type { ").append(shape).append(" }\n");
+            String envCast = "%env.c." + tmpCount++;
+            body.append("  ").append(envCast).append(" = bitcast i8* %env to ").append(envType).append("*\n");
+            for (int i = 0; i < captures.size(); i++) {
+                LLVMValue v = captureVals.get(i);
+                String slot = "%cap.slot." + tmpCount++;
+                body.append("  ").append(slot).append(" = getelementptr ").append(envType).append(", ")
+                     .append(envType).append("* ").append(envCast).append(", i32 0, i32 ").append(i).append("\n");
+                String loaded = "%cap.v." + tmpCount++;
+                body.append("  ").append(loaded).append(" = load ").append(v.type).append(", ")
+                     .append(v.type).append("* ").append(slot).append("\n");
+                if (captures.get(i).equals("this")) {
+                    scope.define("this", new LLVMValue(loaded, v.type, v.semanticType));
+                } else {
+                    String capAlloca = "%cap.a." + tmpCount++;
+                    body.append("  ").append(capAlloca).append(" = alloca ").append(v.type).append("\n");
+                    body.append("  store ").append(v.type).append(" ").append(loaded).append(", ")
+                         .append(v.type).append("* ").append(capAlloca).append("\n");
+                    scope.define(captures.get(i), new LLVMValue(capAlloca, v.type, v.semanticType));
+                }
+            }
+        }
+
         generateBlockBody((Block) node.body);
 
         String trimmed = body.substring(start).trim();
@@ -2650,6 +2689,43 @@ public class LLVMGen {
         exceptionHandlers.clear();
         exceptionHandlers.addAll(savedHandlers);
 
+        // Creation site (outer function): snapshot the captured values into a heap env struct.
+        String envRaw = "null";
+        if (!captures.isEmpty()) {
+            String sizePtr = "%env.gep." + tmpCount++;
+            body.append("  ").append(sizePtr).append(" = getelementptr ").append(envType).append(", ")
+                 .append(envType).append("* null, i32 1\n");
+            String size = "%env.sz." + tmpCount++;
+            body.append("  ").append(size).append(" = ptrtoint ").append(envType).append("* ")
+                 .append(sizePtr).append(" to i64\n");
+            String alloc = "%env.alloc." + tmpCount++;
+            body.append("  ").append(alloc).append(" = call i8* @").append(allocFn())
+                 .append("(i64 ").append(size).append(")\n");
+            registerRegionAllocation(alloc);
+            String envP = "%env.p." + tmpCount++;
+            body.append("  ").append(envP).append(" = bitcast i8* ").append(alloc).append(" to ")
+                 .append(envType).append("*\n");
+            for (int i = 0; i < captures.size(); i++) {
+                LLVMValue v = captureVals.get(i);
+                String src;
+                if (captures.get(i).equals("this")) {
+                    // `this` is a raw SSA parameter in scope, not an alloca — use the value
+                    // itself (loading through it would dereference the object header).
+                    src = v.value;
+                } else {
+                    src = "%cap.src." + tmpCount++;
+                    body.append("  ").append(src).append(" = load ").append(v.type).append(", ")
+                         .append(v.type).append("* ").append(v.value).append("\n");
+                }
+                String slot = "%env.slot." + tmpCount++;
+                body.append("  ").append(slot).append(" = getelementptr ").append(envType).append(", ")
+                     .append(envType).append("* ").append(envP).append(", i32 0, i32 ").append(i).append("\n");
+                body.append("  store ").append(v.type).append(" ").append(src).append(", ")
+                     .append(v.type).append("* ").append(slot).append("\n");
+            }
+            envRaw = alloc;
+        }
+
         String code = "%fn.code." + tmpCount++;
         body.append("  ").append(code).append(" = bitcast ").append(codeType).append(" ")
              .append(fnName).append(" to i8*\n");
@@ -2657,15 +2733,8 @@ public class LLVMGen {
         body.append("  ").append(v0).append(" = insertvalue %CangFunction undef, i8* ").append(code).append(", 0\n");
         String v1 = "%fn.v1." + tmpCount++;
         body.append("  ").append(v1).append(" = insertvalue %CangFunction ").append(v0)
-             .append(", i8* null, 1\n");
+             .append(", i8* ").append(envRaw).append(", 1\n");
         return new LLVMValue(v1, "%CangFunction", expected);
-    }
-
-    /** Walk a lambda body and reject any reference to an outer variable (no-capture mode). */
-    private void validateLambdaNoCapture(AST node, String parameter, int line) {
-        java.util.Set<String> bound = new java.util.HashSet<>();
-        bound.add(parameter);
-        validateLambdaCapture(node, bound, line, "Lambda");
     }
 
     private void validateLambdaCapture(AST node, java.util.Set<String> bound, int line, String context) {
@@ -2703,6 +2772,61 @@ public class LLVMGen {
                     if (item instanceof AST) validateLambdaCapture((AST) item, bound, line, context);
                 }
             }
+        }
+    }
+
+    /** Free variables of a lambda: referenced identifiers (plus `this`) that resolve in the
+     *  enclosing scope and are not declared/shadowed inside the lambda. */
+    private List<String> collectLambdaCaptures(LambdaExpr node) {
+        java.util.Set<String> declared = new java.util.LinkedHashSet<>();
+        collectDeclaredNames(node.body, declared);
+        declared.add(node.parameter);
+        List<String> refs = new ArrayList<>();
+        collectFreeRefs(node.body, declared, refs);
+        List<String> caps = new ArrayList<>();
+        boolean thisRef = false;
+        for (String n : refs) {
+            if (n.equals("this")) { thisRef = true; continue; }
+            if (!caps.contains(n) && scope.lookup(n) != null) caps.add(n);
+        }
+        if (thisRef && scope.lookup("this") != null) caps.add("this");
+        return caps;
+    }
+
+    /** All names declared inside a subtree: locals, for-each vars, catch params, lambda params. */
+    private void collectDeclaredNames(AST node, java.util.Set<String> out) {
+        if (node == null) return;
+        if (node instanceof VarDecl) out.add(((VarDecl) node).name);
+        else if (node instanceof ForEachStmt) out.add(((ForEachStmt) node).varName);
+        else if (node instanceof LambdaExpr) out.add(((LambdaExpr) node).parameter);
+        else if (node instanceof CatchClause) out.add(((CatchClause) node).name);
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) collectDeclaredNames((AST) v, out);
+                else if (v instanceof List) for (Object x : (List) v) if (x instanceof AST) collectDeclaredNames((AST) x, out);
+            } catch (IllegalAccessException ignored) { }
+        }
+    }
+
+    /** Referenced identifiers (first-occurrence order) + `this`, skipping shadow declarations. */
+    private void collectFreeRefs(AST node, java.util.Set<String> declared, List<String> refs) {
+        if (node == null) return;
+        if (node instanceof Identifier) {
+            String n = ((Identifier) node).name;
+            if (!declared.contains(n) && !refs.contains(n)) refs.add(n);
+            return;
+        }
+        if (node instanceof ThisExpr) {
+            if (!refs.contains("this")) refs.add("this");
+            return;
+        }
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) collectFreeRefs((AST) v, declared, refs);
+                else if (v instanceof List) for (Object x : (List) v) if (x instanceof AST) collectFreeRefs((AST) x, declared, refs);
+            } catch (IllegalAccessException ignored) { }
         }
     }
 
@@ -4050,7 +4174,9 @@ public class LLVMGen {
                 String result = "%call." + tmpCount++;
                 body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                      .append(" @").append(node.method).append("(").append(args).append(")\n");
-                return new LLVMValue(result, toLLVMType(fi.returnType));
+                String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+                    ? fi.returnType : null;
+                return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
             }
         }
 
@@ -4140,8 +4266,10 @@ public class LLVMGen {
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(funcName).append("(").append(args).append(")\n");
             // Array-returning calls (File.readLines/list) expose their Array<T> semantic type
-            // so chained .length() and var-decl element tracking work.
-            String retSem = isArraySemanticType(fi.returnType) ? fi.returnType : null;
+            // so chained .length() and var-decl element tracking work; Function returns need
+            // their signature semantic for checkFunctionValue.
+            String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+                ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
     }
@@ -4544,7 +4672,9 @@ public class LLVMGen {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(funcName).append("(").append(args).append(")\n");
-            return new LLVMValue(result, toLLVMType(fi.returnType));
+            String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+                ? fi.returnType : null;
+            return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
     }
 

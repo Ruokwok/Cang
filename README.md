@@ -18,7 +18,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - 数组、定长数组、多维数组和 `length()`；
 - 数组边界检查；
 - `Function<R, ...>` 函数对象；
-- 无捕获 lambda；
+- lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
 - `Math`、`System`、`Stdout`、`String` 等基础标准库；
 - `try/catch/finally` 与 `Error` 的第一版实现；
@@ -55,17 +55,18 @@ call((i) -> void {
 })
 ```
 
-当前 lambda 不支持捕获外部变量：
+lambda 按值捕获外部变量（创建时快照，与 Java 一致）：
 
 ```cang
 class Main()
 
-func void example() {
-    int x = 1
-    call((i) -> void {
-        Stdout.println(x)   # 不支持捕获 x
-    })
+int x = 41
+Function<Void, int> f = (i) -> void {
+    Stdout.println(i + x)   # 按值捕获 x
 }
+f(1)                       # 42
+x = 100
+f(2)                       # 43（仍是创建时的 41）
 ```
 
 ## 数组示例
@@ -239,7 +240,7 @@ Cang 目前不应被视为稳定语言或生产级编译器，主要限制包括
 - 编译器缺少完整的自动化测试、持续集成和模糊测试体系；
 - 错误恢复和诊断能力仍有限；
 - 标准库规模较小，缺少成熟的集合、文件、网络、JSON 等 API；
-- lambda 不支持捕获外部变量；
+- lambda 仅支持单参数 `Function<Void, T>` 形式（可按值捕获）；
 - 异常系统目前只覆盖第一版同函数控制流场景；
 - 数组越界和空指针等部分运行时错误仍可能直接终止程序；
 - 在别名场景下提前 `free` 存在 use-after-free 风险；

@@ -175,7 +175,29 @@
 
 ## 七、体验 / 一致性问题
 
-### 23. 🟡 `+=` 词法有 Parser 不认 —— Lexer 产出 `PLUS_ASSIGN`（约 234）但 Parser 从不消费 → `x += 1` 报 `Unexpected token: PLUS_ASSIGN`。修复：Parser 赋值层识别 `PLUS_ASSIGN` 等复合算符，desugar 成 `x = x + 1`（注意先求值一次目标，数组元素下标同理）。### 24. 🟡 switch：重复 `case` 无检查（Java 报 duplicate case）；`case` 类型不匹配报错定位到 switch 行（应用 case 行）；`a[0]++` 报错行号错指第 1 行（Increment target 校验用错 line）。### 25. 🟡 数字字面量：无指数形式 `1e10`（拆成 `1`+`e10` 引发连锁错）、`.5` 不支持、`3.` 跨行链式；未知转义 `\q` 静默丢反斜杠（应报错）。修复位置：Lexer 数字循环（约 167-206）、字符串转义（约 108）。### 26. 🟡 词法错误吞文件 + 行号偏移 —— 未闭合 `"` 或 `#*` 不报错、静默吞掉整个文件直到 EOF 才在别处报误导错；字符串内换行不 `line++` → 后续所有行号偏移。修复：字符串/块注释遇到 EOF → 立即抛 `Unterminated string/comment at L:C`；字符串内换行 `line++`。### 27. 🟡 报错质量 —— 约 20 处 codegen 异常缺 `(at line N)` → 一律定位 1:1（逐个补行号）；**import 进来的文件词法错 → `Internal error` + Java 栈回溯**（`Cang.java` tokenize 不在 try 内，约 321/222）；Lexer `&` 先 advance 后 error 列号 +1（约 271）。### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1。### 29. 🟡 `Thread.spawn` 无 join 兜底 —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）。### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺。### 31. 🟡 `Stdout.print(对象)` 输出乱码 —— 对 `%CangX*` 走固定 `%s` 直接打结构体字节，可能越界读。修复：对象类型改打 `<ClassName@addr>`（取 className 标签 + ptrtoint）或调用 toString()（若有）。用户串含 `%` 是安全的（格式串为编译器常量）。### 32. 🟡 自由函数返回数组链式 `.length()` 报错 —— `Unknown method: i8*.length`：实例调用路径已附 Array semanticType，**独立函数调用路径**（`node.object == null` 分支）没附。修复：同 3904 处，独立函数返回 `Array<...>` 时附 semanticType。### 33. 🟡 `free f`（File 对象）不 free `path` 字段 —— path 为堆串（拼接而来）时 `--no-gc` 必漏。修复：free 对象时按 ClassInfo.fieldTypes 遍历 free 指针字段（字符串字段可 free；注意递归字段/环——v1 只 free 一层 String 字段，文档注明）。
+### 23. 🟡 `+=` 词法有 Parser 不认 —— Lexer 产出 `PLUS_ASSIGN`（约 234）但 Parser 从不消费 → `x += 1` 报 `Unexpected token: PLUS_ASSIGN`。修复：Parser 赋值层识别 `PLUS_ASSIGN` 等复合算符，desugar 成 `x = x + 1`（注意先求值一次目标，数组元素下标同理）
+
+### 24. 🟡 switch：重复 `case` 无检查（Java 报 duplicate case）；`case` 类型不匹配报错定位到 switch 行（应用 case 行）；`a[0]++` 报错行号错指第 1 行（Increment target 校验用错 line）
+
+### 25. 🟡 数字字面量：无指数形式 `1e10`（拆成 `1`+`e10` 引发连锁错）、`.5` 不支持、`3.` 跨行链式；未知转义 `\q` 静默丢反斜杠（应报错）。修复位置：Lexer 数字循环（约 167-206）、字符串转义（约 108）
+
+### 26. 🟡 词法错误吞文件 + 行号偏移 —— 未闭合 `"` 或 `#*` 不报错、静默吞掉整个文件直到 EOF 才在别处报误导错；字符串内换行不 `line++` → 后续所有行号偏移。修复：字符串/块注释遇到 EOF → 立即抛 `Unterminated string/comment at L:C`；字符串内换行 `line++`
+
+### 27. 🟡 报错质量 —— 约 20 处 codegen 异常缺 `(at line N)` → 一律定位 1:1（逐个补行号）；**import 进来的文件词法错 → `Internal error` + Java 栈回溯**（`Cang.java` tokenize 不在 try 内，约 321/222）；Lexer `&` 先 advance 后 error 列号 +1（约 271）
+
+### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1
+
+### 29. 🟡 `Thread.spawn` 无 join 兜底 —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）
+
+### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺
+
+### 31. 🟡 `Stdout.print(对象)` 输出乱码 —— 对 `%CangX*` 走固定 `%s` 直接打结构体字节，可能越界读。修复：对象类型改打 `<ClassName@addr>`（取 className 标签 + ptrtoint）或调用 toString()（若有）。用户串含 `%` 是安全的（格式串为编译器常量）
+
+### 32. ✅ 自由/静态函数返回数组链式 `.length()` 报错 —— 已修复
+- 原现象：实例调用路径附了 Array semanticType，独立/静态调用路径没附 → `Unknown method: i8*.length`。
+- 修复（lambda 捕获批次顺带）：三处方法/函数调用返回点统一 `retSem = (isArraySemanticType || isFunctionType) ? returnType : null` —— 同时解决"方法返回 `Function<...>` 赋值报 `found object`"（checkFunctionValue 依赖 semanticType）
+
+### 33. 🟡 `free f`（File 对象）不 free `path` 字段 —— path 为堆串（拼接而来）时 `--no-gc` 必漏。修复：free 对象时按 ClassInfo.fieldTypes 遍历 free 指针字段（字符串字段可 free；注意递归字段/环——v1 只 free 一层 String 字段，文档注明）。
 
 ---
 
@@ -240,7 +262,7 @@
 - `--no-gc` 模式下字符串类返回值不可 free（`generateFree` 拒绝 String/str）。
 - Linux/macOS 目标仅 IR 级验证（无 WSL/macOS 主机）；macOS `compileMacOS` 是 stub。
 - `Math.random()` 固定种子（跨平台确定性是特性，文档已注明）。
-- lambda / `thread{}` 无捕获（v1 设计）；Thread 参数类型白名单（无对象/数组跨线程）。
+- lambda 已支持按值捕获外部变量与 this（本批落地，doc.md 9.3 已更新）；`thread{}` 仍无捕获（v1 设计）；Thread 参数类型白名单（无对象/数组跨线程）。
 - 单类文件 + class 位置决定函数语义（class 前 = 全局函数，class 后 = 方法）。
 - 并发边角：`@cang.current.error` 全局非线程局部、print 无锁、`thread{}` 单全局句柄槽并发覆盖丢 join、双 join 标志非原子——等 Channel/Mutex 任务一并处理。
 - 关键字全保留字（`var/free` 等不可作标识符）。
