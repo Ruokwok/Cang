@@ -52,7 +52,9 @@
 
 ## 二、错误程序被静默接受（编译器该拦没拦）
 
-### 7. 🔴 赋值完全不查类型 —— 待修
+### 7. ✅ 赋值完全不查类型 —— 已修复
+- 修复：新增 `assignableTo(target, val)`（类型相等 / 数值拓宽 / 指针互认 / null 字面量仅对指针与 `%CangFunction` 槽）→ 三处入库前检查：`generateAssign` 变量路径、字段路径、`generateVarDecl` 通用路径。实测 `q = "s"` → `Cannot assign String to int`（编译期拦截，不再落到 clang）；回归 40/40。
+- 原现象：
 - 现象：`int q; q = "s"` 前端 EXIT 0，直到 clang 才报 `'%str.0' but expected 'i32'`（报错无源码定位）。
 - 位置：`generateAssign` 变量分支（约 3189）只 `castValue` 不校验。
 - 修复指引：仿照 `generateVarDecl`（约 1801）的检查：声明类型（scope 里存的 llvmType/cangType）与右值 `semanticType`/llvmType 比对，不兼容抛 `Cannot assign <X> to <Y> (at line N)`。注意 `castValue` 可能隐式拓宽——只拦"收窄/不相关"（i32→i8*、i8*→i32、double→int 等）。
@@ -65,14 +67,18 @@
   - `byte b = 300`：在 var-decl/assign 的类型检查里做常量范围校验。
   - double→int：至少警告或报错（Java 是编译错误，`int m = 3.5` 拒；`int m = (int)3.5` 才行——若 Cang 暂无强转语法，可先只拦字面量、放行变量）。
 
-### 9. 🔴 str/String 检查绕过 —— 待修
+### 9. ✅ str/String 检查绕过 —— 已修复
+- 修复：① 三处调用返回点统一经 `callResultCarriesSemantic` 附 semanticType（String/str/Array/Function——String 方法返回终于带上类型，`str s = String方法` 与 `String s = str方法` 报错，与字面量标准对齐）；② `assignableTo` 兜住 LLVM 类型级错配（`str t = 5` → `Cannot assign int to str`，此前直出非法 IR）。存量测试无 `str` 变量声明，零回归。
+- 原现象：
 - 现象：方法返回值 `semanticType` 多为 null → `str s = 返回String的方法()`、`String s = 返回str的方法()`、甚至 `str t = 5` 全静默通过（后者直出非法 IR）；而字面量 `str s = "x"` 报错——标准倒挂。
 - 位置：`generateVarDecl`（约 1801）条件依赖 `val.semanticType != null`；`generateMethodCall` 返回值（约 3904）只对 Array 附 semanticType。
 - 修复指引：
   - 短期（最小）：方法调用返回值按 `fi.returnType` 附 semanticType（String/str/bool/int... 都附）；同步检查既有测试是否依赖"方法返回可赋给 str"的宽松行为。
   - 数值兜底：`str t = 5` 这类 llvmType 不匹配（i32 vs i8*）应硬报错，不依赖 semanticType。
 
-### 10. 🔴 数组写无边界检查（读有写无）—— 待修
+### 10. ✅ 数组写无边界检查（读有写无）—— 已修复
+- 修复：写路径补 null 检查 + `idx<0 || idx>=len` 检查（与读路径同款 `emitRuntimeError("Array index out of bounds")`，可 catch）；读路径补 null 检查（原实现先 load 长度头后判界，null 数组直接 SEGV）。实测 `a[99] = 5` → `error: Array index out of bounds` exit 1；`f.list()` 对文件返回 null 后 `names[0]` → `error: Null pointer dereference`；回归 40/40。
+- 原现象：
 - 现象：`a[99] = 5; a[-1] = 7` 编译通过 → 堆越界写/内存破坏；读路径有 `Array index out of bounds` 检查。
 - 位置：`generateArrayAssign`（约 3235-3292）直接 store；读检查模板在约 4856-4870（`icmp slt/ge + emitRuntimeError`）。
 - 修复指引：写路径照抄读路径：负数 + `≥ length` 双检 → `emitRuntimeError("Array index out of bounds", line, ok)`。注意先 load 长度头再比较（读路径现有实现里数组为 null 时先 load 崩——顺手把 null 数组检查也补上，读写都要）。
@@ -277,8 +283,8 @@
 4. ~~37 + 38 运行时数组分配 + 字段数组元素追踪~~ ✅（见第 37/38 条）
 5. ~~泛型多类型单态化（T71）+ 纯 Cang ArrayList（T72）~~ ✅：多具体类型每类一特化（重解析克隆 + 全键映射 + 钻石推断 + 未用模板跳过）；`stdlib/cang/lang/ArrayList.cang` 11 个方法，`t_arraylist` 29 断言（int+String 双类型同程序）全过，套件 35/35
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
-7. **10 + 7 + 9**（数组写越界 = 数据破坏；赋值/str 不查 = 错误程序放行）
-8. 12 + 13/20/21（必返分析 AST 化 + finally 出口统一）
+7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
+8. **12 + 13/20/21**（必返分析 AST 化 + finally 出口统一）
 9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理

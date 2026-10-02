@@ -1958,6 +1958,10 @@ public class LLVMGen {
             if (isFunctionType(cangType)) {
                 checkFunctionValue(val, cangType, decl.line);
             }
+            if (!assignableTo(llvmType, val)) {
+                throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
+                    + " to " + cangType + " (at line " + decl.line + ")");
+            }
             String castedInit = castValue(val, llvmType);
             body.append("  store ").append(llvmType).append(" ").append(castedInit)
                  .append(", ").append(llvmType).append("* ").append(ptrName).append("\n");
@@ -2007,6 +2011,27 @@ public class LLVMGen {
         // bool can convert to int
         if (from.equals("i1") && (to.equals("i32") || to.equals("i64"))) return true;
         return false;
+    }
+
+    /** May `val` be stored into a slot of LLVM type `target`? (debug.md #7/#9)
+     *  Same rules as call-argument checks plus loose pointer-to-pointer assignment and
+     *  the null literal for pointer/Function slots; rejects kind mismatches like
+     *  int <- string or str <- int that previously produced invalid IR. */
+    private boolean assignableTo(String target, LLVMValue val) {
+        if (val.type.equals(target)) return true;
+        if (typesCompatible(val.type, target)) return true;
+        if (isNumericLLVM(val.type) && isNumericLLVM(target)) return true;
+        if (val.type.endsWith("*") && target.endsWith("*")) return true; // String/str/class refs
+        if (val.value != null && val.value.equals("null")) {
+            return target.endsWith("*") || target.equals("%CangFunction");
+        }
+        return false;
+    }
+
+    /** Return semantic types that must travel with call results (chaining/assign checks). */
+    private boolean callResultCarriesSemantic(String cangType) {
+        return isArraySemanticType(cangType) || isFunctionType(cangType)
+            || cangType.equals("String") || cangType.equals("str");
     }
 
     private void generateIf(IfStmt stmt) {
@@ -3568,6 +3593,10 @@ public class LLVMGen {
             }
             LLVMValue ptr = scope.lookup(id.name);
             if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
+            if (!assignableTo(ptr.type, val)) {
+                throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
+                    + " to " + cangTypeFromLLVMFull(ptr.type) + " (at line " + node.line + ")");
+            }
             String castedAssign = castValue(val, ptr.type);
             body.append("  store ").append(ptr.type).append(" ").append(castedAssign)
                  .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
@@ -3612,6 +3641,10 @@ public class LLVMGen {
                  .append(", ").append(ci.llvmName).append("* ").append(objPtr.value)
                  .append(", i32 0, i32 ").append(fieldIdx).append("\n");
             String castedField = castValue(val, toLLVMType(fieldType));
+            if (!assignableTo(toLLVMType(fieldType), val)) {
+                throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
+                    + " to field '" + fa.field + "' of type " + fieldType + " (at line " + node.line + ")");
+            }
             body.append("  store ").append(toLLVMType(fieldType)).append(" ")
                  .append(castedField)
                  .append(", ").append(toLLVMType(fieldType)).append("* ").append(fieldPtr).append("\n");
@@ -3673,6 +3706,35 @@ public class LLVMGen {
         } else {
             body.append("  ").append(idxI64).append(" = zext ").append(idx.type).append(" ").append(idx.value).append(" to i64\n");
         }
+
+        // Null + bounds checks for writes (debug.md #10): mirror the read path so an
+        // out-of-range store raises a catchable error instead of corrupting the heap.
+        int wid = labelCount++;
+        String wNullErr = "arr.wnull." + wid;
+        String wOkNull = "arr.wnn." + wid;
+        String wIsNull = "%arr.wnullc." + tmpCount++;
+        body.append("  ").append(wIsNull).append(" = icmp eq i8* ").append(arrPtr.value).append(", null\n");
+        body.append("  br i1 ").append(wIsNull).append(", label %").append(wNullErr)
+             .append(", label %").append(wOkNull).append("\n\n");
+        body.append(wNullErr).append(":\n");
+        emitRuntimeError("Null pointer dereference", line, wOkNull);
+        body.append(wOkNull).append(":\n");
+
+        String wLen = "%arr.wlen." + tmpCount++;
+        body.append("  ").append(wLen).append(" = load i64, i64* ").append(arrPtr.value).append("\n");
+        String wGe = "%arr.wge." + tmpCount++;
+        body.append("  ").append(wGe).append(" = icmp sge i64 ").append(idxI64).append(", ").append(wLen).append("\n");
+        String wLt0 = "%arr.wlt0." + tmpCount++;
+        body.append("  ").append(wLt0).append(" = icmp slt i64 ").append(idxI64).append(", 0\n");
+        String wOob = "%arr.woob." + tmpCount++;
+        body.append("  ").append(wOob).append(" = or i1 ").append(wGe).append(", ").append(wLt0).append("\n");
+        String wErr = "arr.werr." + wid;
+        String wOk = "arr.wok." + wid;
+        body.append("  br i1 ").append(wOob).append(", label %").append(wErr)
+             .append(", label %").append(wOk).append("\n\n");
+        body.append(wErr).append(":\n");
+        emitRuntimeError("Array index out of bounds", line, wOk);
+        body.append(wOk).append(":\n");
 
         // Get element pointer
         String elemPtr = "%arr.elem." + tmpCount++;
@@ -4219,7 +4281,7 @@ public class LLVMGen {
                 String result = "%call." + tmpCount++;
                 body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                      .append(" @").append(node.method).append("(").append(args).append(")\n");
-                String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+                String retSem = (callResultCarriesSemantic(fi.returnType))
                     ? fi.returnType : null;
                 return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
             }
@@ -4314,7 +4376,7 @@ public class LLVMGen {
             // Array-returning calls (File.readLines/list) expose their Array<T> semantic type
             // so chained .length() and var-decl element tracking work; Function returns need
             // their signature semantic for checkFunctionValue.
-            String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+            String retSem = (callResultCarriesSemantic(fi.returnType))
                 ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
@@ -4718,7 +4780,7 @@ public class LLVMGen {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(funcName).append("(").append(args).append(")\n");
-            String retSem = (isArraySemanticType(fi.returnType) || isFunctionType(fi.returnType))
+            String retSem = (callResultCarriesSemantic(fi.returnType))
                 ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
@@ -5363,6 +5425,18 @@ public class LLVMGen {
         } else {
             body.append("  ").append(idxI64).append(" = zext ").append(idx.type).append(" ").append(idx.value).append(" to i64\n");
         }
+
+        // Null array check BEFORE touching the header (debug.md #10: load on null SEGVd).
+        int nullId = labelCount++;
+        String nullErr = "arr.nullerr." + nullId;
+        String notNull = "arr.nn." + nullId;
+        String isNull = "%arr.null." + tmpCount++;
+        body.append("  ").append(isNull).append(" = icmp eq i8* ").append(arrPtr.value).append(", null\n");
+        body.append("  br i1 ").append(isNull).append(", label %").append(nullErr)
+             .append(", label %").append(notNull).append("\n\n");
+        body.append(nullErr).append(":\n");
+        emitRuntimeError("Null pointer dereference", node.line, notNull);
+        body.append(notNull).append(":\n");
 
         // Load array length from header
         String lenVar = "%arr.len." + tmpCount++;
