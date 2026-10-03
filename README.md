@@ -18,6 +18,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - 数组、定长数组、多维数组和 `length()`；
 - 数组边界检查；
 - `Function<R, ...>` 函数对象；
+- 函数与方法重载（按参数个数/类型解析；带默认参数的方法禁止同名重载）；
 - lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
 - `Math`、`System`、`Stdout`、`Stderr`、`String` 等基础标准库；

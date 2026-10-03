@@ -539,6 +539,29 @@ func int square(int x) {
 
 编译器会检查返回值类型和缺失 return。
 
+### 8.5 方法重载
+
+同名函数/方法可以按**参数个数或类型**定义多个版本，调用处按实参解析到对应实现：
+
+```cang
+class Calc()
+func int add(int a) { return a + 1 }
+func int add(int a, int b) { return a + b }
+func double add(double a, double b) { return a + b }
+
+class Main()
+var c = new Calc()
+Stdout.println(c.add(1))          # 2        -> add(int)
+Stdout.println(c.add(2, 3))       # 5        -> add(int, int)
+Stdout.println(c.add(1.5, 2.5))   # 4.000000 -> add(double, double)
+```
+
+规则：
+
+- 全局函数、静态方法、实例方法均支持重载；多态调用按**签名**选择子类实现，子类未提供同签名重载时回退到父类版本。
+- **带默认参数值的方法禁止同名重载**（报错 `has default parameter values and cannot be overloaded`）：默认值让"少传实参"的调用同时可匹配缺省版与其它版本，产生无法裁决的歧义，因此从规则上直接禁止。
+- 同签名重复定义、`static`/实例混用、`native`/非 `native` 混用均报编译错误。
+
 ---
 
 ## 9. Function 函数对象

@@ -51,6 +51,8 @@ public class LLVMGen {
         boolean isStatic;
         boolean isFinal;
         boolean isNative;
+        /** Unique LLVM symbol: base name for the first registration, base.N for overloads. */
+        String llvmName;
     }
 
     static class LoopContext {
@@ -93,6 +95,9 @@ public class LLVMGen {
     private final Map<String, ClassDecl> genericTemplates = new LinkedHashMap<>();
     private final Map<String, String> genericTypeOwners = new LinkedHashMap<>();
     private final Map<String, FuncInfo> functions = new LinkedHashMap<>();
+    // All same-name registrations (singletons included) for overload resolution; `functions`
+    // keeps the FIRST registration as the legacy single-entry view.
+    private final Map<String, List<FuncInfo>> overloadGroups = new LinkedHashMap<>();
     private final Map<String, String> stringLiterals = new LinkedHashMap<>(); // text 閳?global name
     private final List<LoopContext> loopStack = new ArrayList<>();
     private final Deque<String> exceptionHandlers = new ArrayDeque<>();
@@ -736,7 +741,9 @@ public class LLVMGen {
         for (int i = 0; i < possibleTypes.size(); i++) {
             ClassInfo ci = possibleTypes.get(i);
             String funcName = ci.fullName + "." + node.method;
-            if (!functions.containsKey(funcName)) continue;
+            // Same-signature overload for this dynamic class (subclass without a matching
+            // overload falls back to the resolved base implementation).
+            FuncInfo target = dispatchTarget(funcName, staticFi);
 
             String callLabel = "disp.call." + id + "." + i;
             String checkLabel = "disp.check." + id + "." + i;
@@ -766,7 +773,7 @@ public class LLVMGen {
             }
             String result = "%disp.val." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(retType)
-                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+                 .append(" @").append(symOf(target)).append("(").append(args).append(")\n");
             body.append("  store ").append(retType).append(" ").append(result)
                  .append(", ").append(retType).append("* ").append(phiSlot).append("\n");
             body.append("  br label %").append(endLabel).append("\n\n");
@@ -800,7 +807,8 @@ public class LLVMGen {
         for (int i = 0; i < possibleTypes.size(); i++) {
             ClassInfo ci = possibleTypes.get(i);
             String funcName = ci.fullName + "." + node.method;
-            if (!functions.containsKey(funcName)) continue;
+            // Same-signature overload (base fallback), mirroring the non-void dispatcher.
+            FuncInfo target = dispatchTarget(funcName, staticFi);
 
             String callLabel = "disp.call." + id + "." + i;
 
@@ -823,7 +831,7 @@ public class LLVMGen {
                 args.append(", ").append(toLLVMType(paramType)).append(" ")
                     .append(castValue(argVal, toLLVMType(paramType)));
             }
-            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            body.append("  call void @").append(symOf(target)).append("(").append(args).append(")\n");
             body.append("  br label %").append(endLabel).append("\n\n");
 
             // Next label
@@ -837,20 +845,64 @@ public class LLVMGen {
 
     private void collectFunction(FuncDecl decl, String className) {
         String funcName = (className != null ? className + "." : "") + decl.name;
+        List<String> newTypes = new ArrayList<>();
+        for (Parameter p : decl.params) newTypes.add(p.type);
+
         if (functions.containsKey(funcName)) {
+            FuncInfo existing = functions.get(funcName);
             // Native overload surface (Stdout.print/println, Stderr...): declaration-only docs
             // for name-based builtin dispatch — first declaration wins instead of erroring,
             // so `import cang/lang/Stdout` no longer crashes (was: Duplicate function).
-            if (functions.get(funcName).isNative && decl.isNative) {
+            if (existing.isNative && decl.isNative) {
                 return;
             }
             String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
             String srcLine = readSourceLine(file, decl.line);
-            throw new util.CompileError(
-                "Duplicate function: '" + decl.name + "' is already defined (methods cannot be overloaded)",
-                file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
-                srcLine, decl.name.length());
+            // Mixed native/non-native overloads can never link (native has no body).
+            if (existing.isNative != decl.isNative) {
+                throw new util.CompileError(
+                    "Method '" + decl.name + "' mixes native and non-native declarations; overloads must be uniform",
+                    file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
+                    srcLine, decl.name.length());
+            }
+            boolean existingDefaults = false;
+            for (AST d : existing.paramDefaults) if (d != null) { existingDefaults = true; break; }
+            boolean newDefaults = false;
+            for (Parameter p : decl.params) if (p.defaultValue != null) { newDefaults = true; break; }
+            // User rule: a method with default parameter values may not be overloaded
+            // (this also removes every defaults/overload resolution ambiguity).
+            if (existingDefaults || newDefaults) {
+                throw new util.CompileError(
+                    "Method '" + decl.name + "' has default parameter values and cannot be overloaded",
+                    file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
+                    srcLine, decl.name.length());
+            }
+            if (existing.isStatic != decl.isStatic) {
+                throw new util.CompileError(
+                    "Method '" + decl.name + "' mixes static and instance declarations; overloads must be uniform",
+                    file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
+                    srcLine, decl.name.length());
+            }
+            if (existing.paramTypes.equals(newTypes)) {
+                throw new util.CompileError(
+                    "Duplicate function: '" + decl.name + "' is already defined with the same signature",
+                    file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
+                    srcLine, decl.name.length());
+            }
+            // Genuine overload: register under a unique LLVM symbol, keep `functions` on the first.
+            FuncInfo info = buildFuncInfo(decl, className, funcName);
+            List<FuncInfo> group = overloadGroups.get(funcName);
+            info.llvmName = funcName + "." + group.size();
+            group.add(info);
+            return;
         }
+        FuncInfo info = buildFuncInfo(decl, className, funcName);
+        info.llvmName = funcName;
+        functions.put(info.name, info);
+        overloadGroups.computeIfAbsent(funcName, k -> new ArrayList<>()).add(info);
+    }
+
+    private FuncInfo buildFuncInfo(FuncDecl decl, String className, String funcName) {
         FuncInfo info = new FuncInfo();
         info.name = funcName;
         info.returnType = decl.returnType;
@@ -863,7 +915,7 @@ public class LLVMGen {
             info.paramNames.add(p.name);
             info.paramDefaults.add(p.defaultValue);
         }
-        functions.put(info.name, info);
+        return info;
     }
 
     /** Read a source line from file for error reporting; returns "" if unavailable. */
@@ -1368,9 +1420,10 @@ public class LLVMGen {
         if (!decl.sourceFile.isEmpty()) this.sourceFile = decl.sourceFile;
 
         String funcName = (className != null ? className + "." : "") + decl.name;
-        FuncInfo fi = functions.get(funcName);
+        FuncInfo fi = findFuncInfoForDecl(funcName, decl);
+        String llvmName = fi != null && fi.llvmName != null ? fi.llvmName : funcName;
 
-        body.append("define ").append(toLLVMType(decl.returnType)).append(" @").append(funcName).append("(");
+        body.append("define ").append(toLLVMType(decl.returnType)).append(" @").append(llvmName).append("(");
 
         // Parameters
         boolean first = true;
@@ -2962,7 +3015,7 @@ public class LLVMGen {
             if (currentClassName == null) {
                 throw new RuntimeException("this:: is only valid inside a class method (at line " + line + ")");
             }
-            FuncInfo fi = lookupInstanceMethod(classes.get(currentClassName), node.method);
+            FuncInfo fi = resolveMethodRef(lookupInstanceMethods(classes.get(currentClassName), node.method), line);
             if (fi == null) {
                 throw new RuntimeException("Unknown method in reference: this::" + node.method + " (at line " + line + ")");
             }
@@ -2986,7 +3039,7 @@ public class LLVMGen {
         // Class::staticMethod 鈥?receiver-less reference
         ClassInfo ci = classes.get(owner);
         if (ci != null) {
-            FuncInfo fi = functions.get(ci.fullName + "." + node.method);
+            FuncInfo fi = resolveMethodRef(overloadGroups.get(ci.fullName + "." + node.method), line);
             if (fi != null && fi.isStatic) {
                 String thunk = emitThunk(fi, null);
                 return functionRefValue(thunk, fi);
@@ -3009,7 +3062,7 @@ public class LLVMGen {
             throw new RuntimeException("Method reference receiver must be a class instance (at line " + line + ")");
         }
         ClassInfo receiverClass = classes.get(extractClassName(receiver.type));
-        FuncInfo fi = lookupInstanceMethod(receiverClass, node.method);
+        FuncInfo fi = resolveMethodRef(lookupInstanceMethods(receiverClass, node.method), line);
         if (fi == null) {
             throw new RuntimeException("Unknown method in reference: " + owner + "::" + node.method + " (at line " + line + ")");
         }
@@ -3019,6 +3072,145 @@ public class LLVMGen {
         }
         String thunk = emitThunk(fi, "%" + fi.className + "*");
         return buildFunctionValue(thunk, fi, receiver.value, receiver.type, functionSignature(fi));
+    }
+
+    /** Type-level assignability (mirrors assignableTo without a value). */
+    private boolean typeAssignable(String from, String to) {
+        if (from.equals(to)) return true;
+        if (typesCompatible(from, to)) return true;
+        if (isNumericLLVM(from) && isNumericLLVM(to)) return true;
+        if (from.endsWith("*") && to.endsWith("*")) return true;
+        if (from.equals("null")) return to.endsWith("*") || to.equals("%CangFunction");
+        return false;
+    }
+
+    /** Static type hint for overload scoring — computed WITHOUT emitting IR. null = unknown. */
+    private String callArgTypeHint(AST arg) {
+        if (arg instanceof IntLit) return "i32";
+        if (arg instanceof LongLit) return "i64";
+        if (arg instanceof FloatLit) return "float";
+        if (arg instanceof DoubleLit) return "double";
+        if (arg instanceof BoolLit) return "i1";
+        if (arg instanceof StringLit || arg instanceof StrLit) return "i8*";
+        if (arg instanceof NullLit) return "null";
+        if (arg instanceof Identifier && scope != null) {
+            LLVMValue v = scope.lookup(((Identifier) arg).name);
+            if (v != null) return v.type;
+        }
+        return null;
+    }
+
+    /**
+     * Overload resolution. Defaults are banned on overloaded names (enforced at registration),
+     * so arity is exact: candidates → lambda narrowing → static type-hint scoring → ambiguity error.
+     */
+    private FuncInfo resolveOverload(List<FuncInfo> cands, List<AST> args, int line) {
+        if (cands == null || cands.isEmpty()) return null;
+        if (cands.size() == 1) return cands.get(0);
+
+        String base = cands.get(0).name;
+        List<FuncInfo> arity = new ArrayList<>();
+        for (FuncInfo f : cands) if (f.paramTypes.size() == args.size()) arity.add(f);
+        if (arity.isEmpty()) throw new RuntimeException("No overload of '" + base + "' matches "
+            + args.size() + " argument(s); candidates: " + candidateSignatures(cands) + " (at line " + line + ")");
+        if (arity.size() == 1) return arity.get(0);
+
+        boolean hasLambda = false;
+        for (AST a : args) if (a instanceof LambdaExpr) { hasLambda = true; break; }
+        if (hasLambda) {
+            List<FuncInfo> fnCand = new ArrayList<>();
+            for (FuncInfo f : arity) {
+                boolean ok = true;
+                for (int i = 0; i < args.size(); i++) {
+                    if (args.get(i) instanceof LambdaExpr && !isFunctionType(f.paramTypes.get(i))) { ok = false; break; }
+                }
+                if (ok) fnCand.add(f);
+            }
+            if (fnCand.size() == 1) return fnCand.get(0);
+            throw new RuntimeException("Ambiguous overload of '" + base + "' for a lambda argument (at line " + line
+                + "); candidates: " + candidateSignatures(fnCand.isEmpty() ? arity : fnCand));
+        }
+
+        String[] hints = new String[args.size()];
+        for (int i = 0; i < args.size(); i++) hints[i] = callArgTypeHint(args.get(i));
+        List<FuncInfo> viable = new ArrayList<>();
+        for (FuncInfo f : arity) {
+            boolean ok = true;
+            for (int i = 0; i < args.size() && ok; i++) {
+                if (hints[i] == null) continue;
+                if (!typeAssignable(hints[i], toLLVMType(f.paramTypes.get(i)))) ok = false;
+            }
+            if (ok) viable.add(f);
+        }
+        if (viable.isEmpty()) throw new RuntimeException("No overload of '" + base + "' matches argument types "
+            + java.util.Arrays.toString(hints) + "; candidates: " + candidateSignatures(arity) + " (at line " + line + ")");
+        if (viable.size() == 1) return viable.get(0);
+
+        // Prefer the candidate with the most exact (non-widening) hint matches.
+        FuncInfo best = null;
+        int bestExact = -1;
+        boolean tie = false;
+        for (FuncInfo f : viable) {
+            int exact = 0;
+            for (int i = 0; i < args.size(); i++) {
+                if (hints[i] != null && hints[i].equals(toLLVMType(f.paramTypes.get(i)))) exact++;
+            }
+            if (exact > bestExact) { best = f; bestExact = exact; tie = false; }
+            else if (exact == bestExact) tie = true;
+        }
+        if (best != null && !tie) return best;
+        throw new RuntimeException("Ambiguous overload of '" + base + "' for argument types "
+            + java.util.Arrays.toString(hints) + "; candidates: " + candidateSignatures(viable) + " (at line " + line + ")");
+    }
+
+    private String candidateSignatures(List<FuncInfo> cands) {
+        StringBuilder sb = new StringBuilder();
+        for (FuncInfo f : cands) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(functionSignature(f));
+        }
+        return sb.toString();
+    }
+
+    /** Resolve a method reference against the expected Function<...> context. */
+    private FuncInfo resolveMethodRef(List<FuncInfo> cands, int line) {
+        if (cands == null || cands.isEmpty()) return null;
+        if (cands.size() == 1) return cands.get(0);
+        String expected = expectedFunctionType;
+        if (expected != null && isFunctionType(expected)) {
+            List<FuncInfo> exact = new ArrayList<>();
+            for (FuncInfo f : cands) {
+                if (sameFunctionSignature(functionSignature(f), expected)) exact.add(f);
+            }
+            if (exact.size() == 1) return exact.get(0);
+        }
+        throw new RuntimeException("Ambiguous method reference '" + cands.get(0).name
+            + "'; candidates: " + candidateSignatures(cands)
+            + " — provide the target Function<...> type (at line " + line + ")");
+    }
+
+    /** Signature equality that normalizes Void/void like checkFunctionValue. */
+    private boolean sameFunctionSignature(String a, String b) {
+        String[] pa = functionTypeParts(a), pb = functionTypeParts(b);
+        if (pa.length != pb.length) return false;
+        for (int i = 0; i < pa.length; i++) {
+            String x = pa[i].equals("Void") ? "void" : pa[i];
+            String y = pb[i].equals("Void") ? "void" : pb[i];
+            if (x.equals(y)) continue;
+            if (!typesCompatible(toLLVMType(x), toLLVMType(y))) return false;
+        }
+        return true;
+    }
+
+    /** Group of same-name methods on ci or the first ancestor declaring the name. */
+    private List<FuncInfo> lookupInstanceMethods(ClassInfo ci, String method) {
+        int guard = 0;
+        while (ci != null && guard++ < 64) {
+            List<FuncInfo> grp = overloadGroups.get(ci.fullName + "." + method);
+            if (grp != null && !grp.isEmpty()) return grp;
+            ci = ci.parentName != null ? classes.get(ci.parentName) : null;
+        }
+        return null;
     }
 
     /** Find a method (static or instance) on a class or its parents. */
@@ -3049,6 +3241,33 @@ public class LLVMGen {
      * Emit a top-level thunk implementing the canonical code ABI for a callee.
      * receiverType != null means env is bitcast to the receiver and passed first.
      */
+    /** LLVM symbol for a FuncInfo (overloads carry a .N suffix; synthetic entries may not). */
+    private String symOf(FuncInfo fi) {
+        return fi.llvmName != null ? fi.llvmName : fi.name;
+    }
+
+    /** Find the FuncInfo registered for a specific FuncDecl (overload groups match by params). */
+    private FuncInfo findFuncInfoForDecl(String funcName, FuncDecl decl) {
+        List<FuncInfo> grp = overloadGroups.get(funcName);
+        if (grp == null) return functions.get(funcName);
+        List<String> myTypes = new ArrayList<>();
+        for (Parameter p : decl.params) myTypes.add(p.type);
+        for (FuncInfo g : grp) if (g.paramTypes.equals(myTypes)) return g;
+        return functions.get(funcName);
+    }
+
+    /**
+     * Overload target for dynamic dispatch: the same-signature method on this class, or the
+     * resolved base implementation (inheritance) when the subclass does not override it.
+     */
+    private FuncInfo dispatchTarget(String funcName, FuncInfo staticFi) {
+        List<FuncInfo> grp = overloadGroups.get(funcName);
+        if (grp != null) {
+            for (FuncInfo g : grp) if (g.paramTypes.equals(staticFi.paramTypes)) return g;
+        }
+        return staticFi;
+    }
+
     private String emitThunk(FuncInfo fi, String receiverType) {
         String name = "@cang.thunk." + thunkCount++;
         String retType = toLLVMType(fi.returnType);
@@ -3069,12 +3288,12 @@ public class LLVMGen {
         extraDefs.append("define ").append(retType).append(" ").append(name)
                  .append("(").append(params).append(") {\nentry:\n").append(inside);
         if (retType.equals("void")) {
-            extraDefs.append("  call void @").append(fi.name).append("(").append(joined).append(")\n");
+            extraDefs.append("  call void @").append(symOf(fi)).append("(").append(joined).append(")\n");
             extraDefs.append("  ret void\n");
         } else {
             String result = "%tr." + thunkCount;
             extraDefs.append("  ").append(result).append(" = call ").append(retType)
-                     .append(" @").append(fi.name).append("(").append(joined).append(")\n");
+                     .append(" @").append(symOf(fi)).append("(").append(joined).append(")\n");
             extraDefs.append("  ret ").append(retType).append(" ").append(result).append("\n");
         }
         extraDefs.append("}\n\n");
@@ -4331,7 +4550,7 @@ public class LLVMGen {
             if (classes.containsKey(objName)) {
                 String classFullName = classes.get(objName).fullName;
                 String funcName = classFullName + "." + node.method;
-                FuncInfo fi = functions.get(funcName);
+                FuncInfo fi = resolveOverload(overloadGroups.get(funcName), node.args, node.line);
                 if (fi != null && fi.isStatic) {
                     return generateStaticCall(fi, funcName, node.args, node.line);
                 }
@@ -4352,7 +4571,7 @@ public class LLVMGen {
                 LLVMValue callable = generateExpr(new Identifier(node.method, node.line));
                 return generateIndirectCall(callable, node.args, node.line);
             }
-            FuncInfo fi = functions.get(node.method);
+            FuncInfo fi = resolveOverload(overloadGroups.get(node.method), node.args, node.line);
             if (fi == null) throw new RuntimeException("Unknown function: " + node.method);
 
             StringBuilder args = new StringBuilder();
@@ -4381,12 +4600,12 @@ public class LLVMGen {
             }
 
             if (fi.returnType.equals("void")) {
-                body.append("  call void @").append(node.method).append("(").append(args).append(")\n");
+                body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
                 return new LLVMValue("void", "void");
             } else {
                 String result = "%call." + tmpCount++;
                 body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
-                     .append(" @").append(node.method).append("(").append(args).append(")\n");
+                     .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
                 String retSem = (callResultCarriesSemantic(fi.returnType))
                     ? fi.returnType : null;
                 return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
@@ -4421,28 +4640,29 @@ public class LLVMGen {
         String className = extractClassName(objVal.type);
         String funcName = className + "." + node.method;
 
-        FuncInfo fi = functions.get(funcName);
-        if (fi == null) {
+        List<FuncInfo> cands = overloadGroups.get(funcName);
+        if (cands == null || cands.isEmpty()) {
             // Try with namespace prefix
             ClassInfo ci = classes.get(className);
             if (ci != null && !ci.fullName.equals(className)) {
                 funcName = ci.fullName + "." + node.method;
-                fi = functions.get(funcName);
+                cands = overloadGroups.get(funcName);
             }
         }
         // Walk up parent chain for inherited methods
-        if (fi == null) {
+        if (cands == null || cands.isEmpty()) {
             ClassInfo ci = classes.get(className);
             while (ci != null && ci.parentName != null) {
                 ClassInfo parent = classes.get(ci.parentName);
                 if (parent == null) break;
                 funcName = parent.fullName + "." + node.method;
-                fi = functions.get(funcName);
-                if (fi != null) break;
+                cands = overloadGroups.get(funcName);
+                if (cands != null && !cands.isEmpty()) break;
                 ci = parent;
             }
         }
-        if (fi == null) throw new RuntimeException("Unknown method: " + funcName + " (at line " + node.line + ")");
+        if (cands == null || cands.isEmpty()) throw new RuntimeException("Unknown method: " + funcName + " (at line " + node.line + ")");
+        FuncInfo fi = resolveOverload(cands, node.args, node.line);
 
         // Private access check: _ prefix methods only accessible within same class
         if (node.method.startsWith("_")) {
@@ -4473,12 +4693,12 @@ public class LLVMGen {
         }
 
         if (fi.returnType.equals("void")) {
-            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
-                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+                 .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
             // Array-returning calls (File.readLines/list) expose their Array<T> semantic type
             // so chained .length() and var-decl element tracking work; Function returns need
             // their signature semantic for checkFunctionValue.
@@ -4510,7 +4730,12 @@ public class LLVMGen {
             throw new RuntimeException("Thread.spawn requires a non-capturing ordinary function identifier; capturing lambda and Function receiver are not supported (at line " + node.line + ")");
         }
         String entryName = ((Identifier) entry).name;
-        FuncInfo ordinary = functions.get(entryName);
+        // Same-signature overload resolution on the entry args (arity alone would pick the
+        // first declared — wrong target for a by-arity-matched thread entry).
+        List<AST> entryArgs = node.args.subList(1, node.args.size());
+        FuncInfo ordinary = overloadGroups.containsKey(entryName)
+            ? resolveOverload(overloadGroups.get(entryName), entryArgs, node.line)
+            : functions.get(entryName);
         if (ordinary == null || ordinary.className != null || ordinary.isStatic) {
             throw new RuntimeException("Thread.spawn requires a top-level ordinary function identifier (at line " + node.line + ")");
         }
@@ -4546,7 +4771,7 @@ public class LLVMGen {
         body.append("  ").append(start).append(" = bitcast i8* ").append(raw).append(" to ").append(startType).append("*\n");
         String fp = "%thread.fp." + tmpCount++;
         body.append("  ").append(fp).append(" = getelementptr ").append(startType).append(", ").append(startType).append("* ").append(start).append(", i32 0, i32 0\n");
-        body.append("  store i8* bitcast (").append(functionPointerType(ordinary)).append(" @").append(entryName).append(" to i8*), i8** ").append(fp).append("\n");
+        body.append("  store i8* bitcast (").append(functionPointerType(ordinary)).append(" @").append(symOf(ordinary)).append(" to i8*), i8** ").append(fp).append("\n");
         for (int i = 0; i < values.size(); i++) {
             String paramLLVM = toLLVMType(ordinary.paramTypes.get(i));
             String ap = "%thread.ap." + tmpCount++;
@@ -4880,12 +5105,12 @@ public class LLVMGen {
         }
 
         if (fi.returnType.equals("void")) {
-            body.append("  call void @").append(funcName).append("(").append(args).append(")\n");
+            body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
-                 .append(" @").append(funcName).append("(").append(args).append(")\n");
+                 .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
             String retSem = (callResultCarriesSemantic(fi.returnType))
                 ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
