@@ -42,11 +42,14 @@ public class Lexer {
                 line++;
                 column = 1;
             } else if (c == '#' && pos + 1 < code.length() && code.charAt(pos + 1) == '*') {
-                // Multi-line comment: #* ... *#
+                // Multi-line comment: #* ... *#  (unterminated -> immediate error, debug.md #26)
+                int cmtLine = line, cmtCol = column;
                 advance(); advance(); // skip #*
+                boolean cmtClosed = false;
                 while (pos < code.length()) {
                     if (code.charAt(pos) == '*' && pos + 1 < code.length() && code.charAt(pos + 1) == '#') {
                         advance(); advance(); // skip *#
+                        cmtClosed = true;
                         break;
                     }
                     if (code.charAt(pos) == '\n') {
@@ -54,6 +57,10 @@ public class Lexer {
                         column = 1;
                     }
                     advance();
+                }
+                if (!cmtClosed) {
+                    throw new RuntimeException("Lexer error at line " + cmtLine + ", column " + cmtCol
+                        + ": Unterminated comment");
                 }
             } else if (c == '#') {
                 // Single-line comment
@@ -93,9 +100,9 @@ public class Lexer {
         advance(); // skip opening quote
         StringBuilder sb = new StringBuilder();
         while (pos < code.length() && code.charAt(pos) != quote) {
-            if (code.charAt(pos) == '\\') {
+            char ch = code.charAt(pos);
+            if (ch == '\\' && pos + 1 < code.length()) {
                 advance();
-                if (pos >= code.length()) break;
                 char esc = code.charAt(pos);
                 switch (esc) {
                     case 'n': sb.append('\n'); break;
@@ -107,12 +114,33 @@ public class Lexer {
                     case '0': sb.append('\0'); break;
                     default: sb.append(esc); break;
                 }
+                if (esc == '\n') {
+                    // Escaped newline also advances the line counter (debug.md #26).
+                    advance();
+                    line++;
+                    column = 1;
+                    continue;
+                }
+                advance();
             } else {
-                sb.append(code.charAt(pos));
+                sb.append(ch);
+                if (ch == '\n') {
+                    // Count real newlines inside the literal so later positions stay correct.
+                    advance();
+                    line++;
+                    column = 1;
+                    continue;
+                }
+                advance();
             }
-            advance();
         }
-        if (pos < code.length()) advance(); // skip closing quote
+        if (pos >= code.length()) {
+            // Never saw the closing quote — fail at the OPENING position instead of
+            // silently swallowing the rest of the file (debug.md #26).
+            throw new RuntimeException("Lexer error at line " + startLine + ", column " + startCol
+                + ": Unterminated string");
+        }
+        advance(); // skip closing quote
         TokenType type = quote == '\'' ? TokenType.STR_LIT : TokenType.STRING_LIT;
         return new Token(type, sb.toString(), startLine, startCol);
     }
@@ -135,14 +163,21 @@ public class Lexer {
                 }
             } else {
                 if (code.charAt(pos) == '\n') {
+                    sb.append('\n');
+                    advance();
                     line++;
                     column = 1;
+                    continue;
                 }
                 sb.append(code.charAt(pos));
             }
             advance();
         }
-        if (pos < code.length()) advance(); // skip closing `
+        if (pos >= code.length()) {
+            throw new RuntimeException("Lexer error at line " + startLine + ", column " + startCol
+                + ": Unterminated string");
+        }
+        advance(); // skip closing `
         return new Token(TokenType.STRING_LIT, sb.toString(), startLine, startCol);
     }
 
