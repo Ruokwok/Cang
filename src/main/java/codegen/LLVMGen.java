@@ -1287,6 +1287,74 @@ public class LLVMGen {
 
     // ==================== Function generation ====================
 
+    /** AST-level "never completes normally" analysis (debug.md #12). */
+    private boolean alwaysReturns(AST node) {
+        if (node == null) return false;
+        if (node instanceof ReturnStmt) return true;
+        if (node instanceof Block) return alwaysReturnsList(((Block) node).statements);
+        if (node instanceof IfStmt) {
+            IfStmt s = (IfStmt) node;
+            return s.elseBlock != null && alwaysReturns(s.thenBlock) && alwaysReturns(s.elseBlock);
+        }
+        if (node instanceof WhileStmt) {
+            WhileStmt s = (WhileStmt) node;
+            // while(true) with no break never leaves the body
+            return s.condition instanceof BoolLit && ((BoolLit) s.condition).value && !containsBreak(s.body);
+        }
+        if (node instanceof ForStmt) {
+            ForStmt s = (ForStmt) node;
+            boolean infinite = s.condition == null
+                || (s.condition instanceof BoolLit && ((BoolLit) s.condition).value);
+            return infinite && !containsBreak(s.body);
+        }
+        if (node instanceof SwitchStmt) {
+            SwitchStmt s = (SwitchStmt) node;
+            if (s.defaultBody == null) return false;
+            // Conservative (cases fall through): require every case body and the default to
+            // always return — accepts the all-return form; partial fall-through chains rejected.
+            for (SwitchCase c : s.cases) if (!alwaysReturnsList(c.body)) return false;
+            return alwaysReturnsList(s.defaultBody);
+        }
+        if (node instanceof TryStmt) {
+            TryStmt s = (TryStmt) node;
+            if (!alwaysReturns(s.tryBlock)) return false;
+            if (s.catches != null) {
+                for (CatchClause cc : s.catches) if (!alwaysReturns(cc.body)) return false;
+            }
+            return true;
+        }
+        // Lambda/thread-block bodies are separate functions; other statements never return.
+        return false;
+    }
+
+    private boolean alwaysReturnsList(List<AST> stmts) {
+        if (stmts == null) return false;
+        for (AST s : stmts) if (alwaysReturns(s)) return true;
+        return false;
+    }
+
+    /** Does this subtree contain a break bound to the ENCLOSING loop/switch? Nested loops,
+     *  switches, lambdas and thread blocks own their breaks, so they are not descended into. */
+    private boolean containsBreak(AST node) {
+        if (node == null) return false;
+        if (node instanceof BreakStmt) return true;
+        if (node instanceof WhileStmt || node instanceof ForStmt || node instanceof ForEachStmt
+                || node instanceof SwitchStmt || node instanceof LambdaExpr || node instanceof ThreadBlockStmt) {
+            return false;
+        }
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) {
+                    if (containsBreak((AST) v)) return true;
+                } else if (v instanceof List) {
+                    for (Object x : (List) v) if (x instanceof AST && containsBreak((AST) x)) return true;
+                }
+            } catch (IllegalAccessException ignored) { }
+        }
+        return false;
+    }
+
     private void generateFunction(FuncDecl decl, String className) {
         // Set source file for error reporting
         String prevSourceFile = this.sourceFile;
@@ -1352,16 +1420,18 @@ public class LLVMGen {
         generateBlockBody((Block) decl.body);
 
         endRegionCleanup();
-        // Ensure terminator
+        // Must-return via AST analysis (debug.md #12): precise instead of an IR-text search
+        // (if-without-else missing return is now caught; while(true){} is no longer rejected).
         String recent = body.substring(bodyStart).trim();
-        boolean hasTerminator = recent.contains("\n  ret ") ||
-            recent.startsWith("ret ") ||
-            recent.startsWith("\nret ");
-        if (!hasTerminator) {
-            if (decl.returnType.equals("void")) {
-                body.append("  ret void\n");
-            } else {
-                // Non-void function must have explicit return
+        String lastLine = recent.isEmpty() ? ""
+            : (recent.contains("\n") ? recent.substring(recent.lastIndexOf('\n') + 1) : recent).trim();
+        // A line ending in ':' is a LABEL (e.g. "switch.end.3:" starts with "switch" but is
+        // not a switch instruction) — only real terminator instructions count.
+        boolean termLast = !lastLine.endsWith(":")
+            && (lastLine.startsWith("ret ") || lastLine.startsWith("br ")
+                || lastLine.startsWith("switch ") || lastLine.startsWith("unreachable"));
+        if (!decl.returnType.equals("void")) {
+            if (!alwaysReturns((Block) decl.body)) {
                 String srcFile = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
                 String srcLine = "";
                 try {
@@ -1376,6 +1446,13 @@ public class LLVMGen {
                     "Function '" + decl.name + "' must return a value of type '" + decl.returnType + "'",
                     srcFile, decl.line, 1, srcLine, decl.name.length());
             }
+            if (!termLast) {
+                // Every path returned but the text ends on a join label (if/switch end):
+                // that block is unreachable — give it a terminator so the IR stays valid.
+                body.append("  unreachable\n");
+            }
+        } else if (!termLast) {
+            body.append("  ret void\n");
         }
 
         body.append("}\n\n");
@@ -2476,8 +2553,15 @@ public class LLVMGen {
                 checkFunctionValue(val, retType, stmt.line);
             } else if (!retType.equals("void")) {
                 String expectedLLVM = toLLVMType(retType);
+                // bool → integral is allowed for call arguments, but returning `true`/a
+                // comparison into int is a Java error too (debug.md #12).
+                if (val.type.equals("i1") && !expectedLLVM.equals("i1")) {
+                    throw new RuntimeException(
+                        "Return type mismatch: expected '" + retType + "' but found 'bool' (at line " + stmt.line + ")");
+                }
                 if (!typesCompatible(val.type, expectedLLVM)) {
-                    String actualCang = cangTypeFromLLVM(val.type);
+                    String actualCang = val.value != null && val.value.equals("null")
+                        ? "null" : cangTypeFromLLVM(val.type);
                     throw new RuntimeException(
                         "Return type mismatch: expected '" + retType +
                         "' but found '" + actualCang + "' (at line " + stmt.line + ")");

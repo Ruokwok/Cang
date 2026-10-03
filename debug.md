@@ -88,7 +88,10 @@
 - 位置：`LLVMGen` `classes.put`（约 467）、`collectFunction`（约 743，有查重）、var-decl 无查重。
 - 修复指引：统一策略——`collectClass` 对已存在的同 fullName 抛 `Duplicate class`；`generateVarDecl` 在 scope.define 前查 `scope.lookup(name) != null`（限同层作用域，考虑 shadowing 规则是否允许内层遮蔽——若允许，只查同层）。
 
-### 12. 🔴 必返分析是 IR 文本匹配 —— 待修
+### 12. ✅ 必返分析是 IR 文本匹配 —— 已修复（AST 化 + 终结符保证）
+- 修复三件套：① **AST 级 `alwaysReturns` 分析**（Return/Block 任一句/双分支 If/无 break 的 `while(true)` 与 `for(;;)`/全 return 的 switch（保守：每 case+default）/try+全部 catch）替换 IR 文本搜索——`if(c){return 1}` 缺 else 现在友好报 `Function 'bad' must return...`，`while(true){}` 按 Java 语义放行；② **尾部终结符保证**：非 void 且全路径已 return 但文本落在 join 标签上 → 追加 `unreachable`，void → `ret void`；termLast 判定须排除以 `:` 结尾的标签行（`switch.end.3:` 以 switch 开头但不是指令——首版踩坑，clang `expected instruction opcode`）；③ 返回类型：`return true` 进 int/long/byte 现在报 `found 'bool'`（与 Java 对齐，仅返回路径收紧、调用实参仍允许 bool→int），`return null` 报错文案改为 `found 'null'`。
+- 验证：`t_retpath`（双分支 return / 全 return switch / while(true) 编译 / bool 返回）`1|2|10|20|0|1|done`；负例 `t_retpath_missing`、`t_retpath_bool` 友好报错；回归 44/44。
+- 原现象（保留）：
 - 现象：对整个函数 IR 搜 `"\n  ret "`。漏报：`func int f(bool c){ if(c){ return 1 } }`、switch 全 return → 编译过但产无终止符 endLabel → clang `expected instruction opcode`；误报：`func int w(){ while(true){} }` 被拒（Java 合法）。
 - 位置：必返检查（约 1236-1259）；无终止符 label 发射点约 1893/1965。
 - 修复指引：
@@ -284,7 +287,7 @@
 5. ~~泛型多类型单态化（T71）+ 纯 Cang ArrayList（T72）~~ ✅：多具体类型每类一特化（重解析克隆 + 全键映射 + 钻石推断 + 未用模板跳过）；`stdlib/cang/lang/ArrayList.cang` 11 个方法，`t_arraylist` 29 断言（int+String 双类型同程序）全过，套件 35/35
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
-8. **12 + 13/20/21**（必返分析 AST 化 + finally 出口统一）
+8. **13/20/21**（finally 出口统一——12 已完成）
 9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理
