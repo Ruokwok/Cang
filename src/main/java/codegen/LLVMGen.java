@@ -306,9 +306,12 @@ public class LLVMGen {
                         cd.members.add(stmt);
                         cd.topLevelBody.remove(stmt);
                     } else if (!isEntry) {
-                        // Non-entry classes: statements go to global main
-                        mainStatements.add(stmt);
-                        cd.topLevelBody.remove(stmt);
+                        // debug.md #36: only the entry class's statements run (they become the
+                        // main body); statements hanging on any later class would land in
+                        // mainStatements, which is never generated once an entry exists —
+                        // silently dropped. Fail loudly instead.
+                        throw new RuntimeException("statements must appear right after the entry class (first class in file); class '"
+                            + cd.name + "' is not the entry class (at line " + stmt.line + ")");
                     }
                     // Entry class: statements stay in topLevelBody
                 }

@@ -219,10 +219,10 @@
 - 现象：类字段链 `p.inner.value` 永远编译失败 `Unknown class: Inner*`（`generateExprForPtr` 字段分支返回 `toLLVMType(ft)+"*"` 双星类型，下游剥星不彻底）。
 - 修复：改为循环剥掉全部尾部 `*`。
 
-### 36. 🔴 语句挂在非入口类下被静默丢弃 —— 待修（新发现）
-- 现象：入口 = 文件**第一个** class；语句必须紧跟入口类。若写成 `class P(...)⏎class Main()⏎语句`，语句归属 Main（非入口）→ **既不执行也不报错**，main() 为空程序"成功"运行。
-- 位置：Parser 顶层节点组装（语句归最近 class 头）+ 入口选择（第一 class）。
-- 修复指引：非入口 class 头之后若出现语句（非 class/func 声明）→ 报错 `statements must appear right after the entry class (first class in file)`；或文档强约定 + 报错兜底。**优先报错，静默丢代码不可接受。**
+### 36. ✅ 语句挂在非入口类下被静默丢弃 —— 已修复（编译期报错）
+- 原现象：入口 = 文件第一个 class；语句写在后续 class 头后 → 归属非入口类 → entryClass 存在时 mainStatements 永不生成 → 静默丢代码。
+- 修复：member loop 非入口类的顶层语句直接抛 `statements must appear right after the entry class (first class in file); class 'X' is not the entry class (at line N)`（指向语句行）。FuncDecl/FieldDecl（方法/字段定义）不受影响。
+- 测试：t_stmt_lost 负例（P 第一、Main 后语句 → 报错 3:1）；回归 61/61（多类正例 arr_class 等零误伤）。
 
 ### 37. ✅ 缺运行时尺寸数组分配（纯 Cang 动态数组的根本前提）—— 已修复
 - 原现象：`T[N]` 只收正整型字面量，无 `new T[expr]` → 纯 Cang 无法实现可扩容动态数组。
@@ -287,6 +287,6 @@
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
 8. ~~13/20/21~~ ✅（finally 五出口统一——finallyStack + inlineFinallyLayers 内联 + jexit.dead 死块，见第 13/20/21 条）
-9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
+9. ~~36~~ ✅（静默丢语句——编译期报错，见第 36 条）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理
