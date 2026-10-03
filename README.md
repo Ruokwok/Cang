@@ -15,14 +15,16 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - 基本类型：`byte`、`int`、`long`、`float`、`double`、`bool`、`string`；
 - 引用字符串类型 `String`，支持双引号和反引号多行字符串；
 - 类、单继承、构造参数、实例方法、静态方法和类型 ID 动态分派；
+- 泛型类：编译期单态化，支持多类型参数（`Pair<K, V>`）与多实参特化；
 - 数组、定长数组、多维数组和 `length()`；
 - 数组边界检查；
 - `Function<R, ...>` 函数对象；
 - 函数与方法重载（按参数个数/类型解析；带默认参数的方法禁止同名重载）；
 - lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
-- `Math`、`System`、`Stdout`、`Stderr`、`String` 等基础标准库；
+- `Math`、`System`、`Stdout`、`Stderr`、`String`、`List`、`Dict` 等基础标准库；
 - `try/catch/finally` 与 `Error` 的第一版实现；
+- 线程：`Thread.spawn(fn, ...)`、`thread { }` 语法糖、`new Thread().task(this::run).start()` 对象式写法；
 - Boehm GC 自动内存管理（默认）+ `free` 提前释放，`--no-gc` 可切回手动模式；
 - Windows、Linux、macOS 目标平台常量和基础交叉编译参数。
 
@@ -213,7 +215,10 @@ stdlib/cang/lang/
 - `System.cang`：参数、平台、环境变量、时间和退出；
 - `Function.cang`：函数对象类型声明；
 - `Void.cang`：无返回值包装类型；
-- `Error.cang`：异常对象基础类型。
+- `Error.cang`：异常对象基础类型；
+- `List.cang`：泛型动态数组（参考 ArrayList）；
+- `Dict.cang`：泛型 KV 映射（参考 HashMap）；
+- `Thread.cang`：线程句柄类型声明。
 
 ## 项目结构
 

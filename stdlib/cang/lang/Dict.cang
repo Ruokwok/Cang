@@ -1,0 +1,137 @@
+namespace cang/lang
+
+# Dict<K, V> - KV 映射（纯 Cang 实现，API 参考 java.util.HashMap）
+# 存储：并行数组 keys[] / vals[] + count，线性查找；String 键按内容比较（== 语义）。
+# 说明：
+# - put 覆盖同键旧值并保持插入顺序；
+# - get 未找到抛 Error；未抛错取值用 getOrDefault(key, fallback)；
+# - remove 返回是否移除；keys()/values() 返回快照数组（顺序对应，可配对遍历）；
+# - 容量不足翻倍扩容（2x）；K 支持值类型与 String，V 不限；
+# - _ 前缀方法为类私有（外部不可调用）。
+
+import cang/lang/Error
+
+class Dict<K, V>(K[] keys = new K[8], V[] vals = new V[8], int count = 0)
+
+# 键值个数
+func int size() {
+    return this.count
+}
+
+# 是否为空
+func bool isEmpty() {
+    return this.count == 0
+}
+
+# 写入或覆盖
+func void put(K key, V value) {
+    int i = this._indexOf(key)
+    if (i >= 0) {
+        this.vals[i] = value
+        return
+    }
+    if (this.count == this.keys.length()) {
+        this._grow()
+    }
+    this.keys[this.count] = key
+    this.vals[this.count] = value
+    this.count = this.count + 1
+}
+
+# 是否包含指定键
+func bool containsKey(K key) {
+    return this._indexOf(key) >= 0
+}
+
+# 取值；键不存在抛 Error
+func V get(K key) {
+    int i = this._indexOf(key)
+    if (i < 0) {
+        throw new Error("Dict key not found")
+    }
+    return this.vals[i]
+}
+
+# 取值；键不存在返回 fallback
+func V getOrDefault(K key, V fallback) {
+    int i = this._indexOf(key)
+    if (i < 0) {
+        return fallback
+    }
+    return this.vals[i]
+}
+
+# 移除指定键；返回是否移除
+func bool remove(K key) {
+    int i = this._indexOf(key)
+    if (i < 0) {
+        return false
+    }
+    int last = this.count - 1
+    int j = i
+    while (j < last) {
+        this.keys[j] = this.keys[j + 1]
+        this.vals[j] = this.vals[j + 1]
+        j = j + 1
+    }
+    this.count = last
+    return true
+}
+
+# 清空（容量保留）
+func void clear() {
+    this.count = 0
+}
+
+# 全部键的快照（插入顺序）
+func K[] keys() {
+    K[] out = new K[this.count]
+    int i = 0
+    while (i < this.count) {
+        out[i] = this.keys[i]
+        i = i + 1
+    }
+    return out
+}
+
+# 全部值的快照（与 keys() 顺序对应）
+func V[] values() {
+    V[] out = new V[this.count]
+    int i = 0
+    while (i < this.count) {
+        out[i] = this.vals[i]
+        i = i + 1
+    }
+    return out
+}
+
+# 线性查找键下标；未找到返回 -1
+func int _indexOf(K key) {
+    int i = 0
+    while (i < this.count) {
+        if (this.keys[i] == key) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# 容量翻倍；_ 前缀 = 类私有
+func void _grow() {
+    int oldCap = this.keys.length()
+    int newCap = oldCap * 2
+    if (newCap <= oldCap) {
+        newCap = oldCap + 8
+    }
+    K[] bigKeys = new K[newCap]
+    V[] bigVals = new V[newCap]
+    int i = 0
+    while (i < this.count) {
+        bigKeys[i] = this.keys[i]
+        bigVals[i] = this.vals[i]
+        i = i + 1
+    }
+    this.keys = bigKeys
+    this.vals = bigVals
+}

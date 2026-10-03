@@ -326,8 +326,9 @@ public abstract class AST {
 
     public static class ImportDecl extends AST {
         public String path; // e.g. "cc/ruok/cang/Foo" or "cc/ruok/cang"
+        public String alias; // "import path as Alias" — optional; null when absent
         public ImportDecl(String path, int line) {
-            super(line); this.path = path;
+            super(line); this.path = path; this.alias = null;
         }
     }
 

@@ -90,8 +90,18 @@ public class Parser {
             advance();
             path.append("/").append(parsePathSegment());
         }
+        // Optional alias: "import cc/ruok/Server as RuokServer".
+        // 'as' is NOT a keyword — it is matched as a plain identifier only in this position,
+        // so `int as = 1` elsewhere keeps working.
+        String alias = null;
+        if (check(TokenType.IDENT) && current().value.equals("as")) {
+            advance();
+            alias = expect(TokenType.IDENT).value;
+        }
         optionalSemicolon();
-        return new ImportDecl(path.toString(), line);
+        ImportDecl decl = new ImportDecl(path.toString(), line);
+        decl.alias = alias;
+        return decl;
     }
 
     private String parsePathSegment() {
@@ -232,7 +242,10 @@ public class Parser {
             advance();
             if (!check(TokenType.IDENT)) error("Generic parameter must be an identifier");
             genericParams.add(expect(TokenType.IDENT).value);
-            if (check(TokenType.COMMA)) error("Generic classes support exactly one type parameter");
+            while (check(TokenType.COMMA)) {
+                advance();
+                genericParams.add(expect(TokenType.IDENT).value);
+            }
             expect(TokenType.GT);
         }
         String superClass = null;
@@ -387,13 +400,19 @@ public class Parser {
         lastArraySize = -1;
         if (check(TokenType.LT)) {
             advance();
-            if (!check(TokenType.IDENT, TokenType.VOID, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
-                error("Generic type argument must be a concrete type");
+            List<String> genArgs = new ArrayList<>();
+            while (true) {
+                if (!check(TokenType.IDENT, TokenType.VOID, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                    error("Generic type argument must be a concrete type");
+                }
+                genArgs.add(parseBaseType());
+                if (check(TokenType.LT)) error("Nested generic types are not supported");
+                if (check(TokenType.COMMA)) { advance(); continue; }
+                break;
             }
-            String arg = parseBaseType();
-            if (check(TokenType.LT)) error("Nested generic types are not supported");
             expect(TokenType.GT);
-            base = base + "<" + arg + ">";
+            // Canonical separator ", " so type keys match genericTypeOwners lookups.
+            base = base + "<" + String.join(", ", genArgs) + ">";
         }
         if (!check(TokenType.LBRACKET)) {
             return base;
@@ -968,12 +987,15 @@ public class Parser {
                 if (check(TokenType.GT)) {
                     advance(); // diamond
                 } else {
-                    if (!check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
-                        error("Generic type argument must be a concrete type");
+                    while (true) {
+                        if (!check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                            error("Generic type argument must be a concrete type");
+                        }
+                        typeArgs.add(parseBaseType());
+                        if (check(TokenType.LT)) error("Nested generic types are not supported");
+                        if (check(TokenType.COMMA)) { advance(); continue; }
+                        break;
                     }
-                    typeArgs.add(parseBaseType());
-                    if (check(TokenType.LT)) error("Nested generic types are not supported");
-                    if (check(TokenType.COMMA)) error("Generic classes support exactly one type argument");
                     expect(TokenType.GT);
                 }
             }

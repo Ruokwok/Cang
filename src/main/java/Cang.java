@@ -367,7 +367,12 @@ public class Cang {
                 }
             }
             for (AST member : importProgram.members) {
-                if (member instanceof AST.ImportDecl) continue;
+                // Pass import declarations through so "import ... as Alias" aliases declared
+                // inside imported files register too (nested loading itself already happened).
+                if (member instanceof AST.ImportDecl) {
+                    members.add(member);
+                    continue;
+                }
                 if (member instanceof AST.NamespaceDecl) continue;
 
                 if (member instanceof AST.ClassDecl) {
@@ -460,6 +465,7 @@ public class Cang {
         "cang/lang/Math.cang", "cang/lang/System.cang", "cang/lang/Function.cang",
         "cang/lang/Void.cang", "cang/lang/Thread.cang", "cang/lang/Error.cang",
         "cang/lang/List.cang",
+        "cang/lang/Dict.cang",
         "cang/io/File.cang"
     };
 

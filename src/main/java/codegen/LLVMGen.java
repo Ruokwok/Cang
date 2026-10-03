@@ -92,6 +92,16 @@ public class LLVMGen {
     private int strCount = 0;
 
     private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
+    // Simple names claimed by two or more classes from different namespaces (imported or
+    // auto-loaded): simple-name lookup was dropped for them — full name still resolves.
+    private final Map<String, java.util.Set<String>> ambiguousShortNames = new LinkedHashMap<>();
+    // ClassDecl -> full name, recorded at collect time so generation never depends on the
+    // (overwritable) simple-name alias.
+    private final Map<ClassDecl, String> declFullNames = new java.util.IdentityHashMap<>();
+    // Import aliases: "import cc/ruok/Server as RuokServer" — alias -> real simple name.
+    // Type strings are normalized through this before monomorphization; expression positions
+    // (new/static/like) resolve through the classes table alias key instead.
+    private final Map<String, String> importAliases = new LinkedHashMap<>();
     private final Map<String, ClassDecl> genericTemplates = new LinkedHashMap<>();
     private final Map<String, String> genericTypeOwners = new LinkedHashMap<>();
     private final Map<String, FuncInfo> functions = new LinkedHashMap<>();
@@ -266,7 +276,6 @@ public class LLVMGen {
             if (member instanceof ClassDecl) {
                 ClassDecl cd = (ClassDecl) member;
                 if (!cd.genericParams.isEmpty()) {
-                    if (cd.genericParams.size() != 1) throw new RuntimeException("Generic class '" + cd.name + "' must have exactly one type parameter");
                     genericTemplates.put(cd.name, cd);
                     // Un-specialized template: never collected nor generated — its method bodies
                     // still reference the unsubstituted type parameter (invalid IR like %T*).
@@ -304,6 +313,30 @@ public class LLVMGen {
             } else {
                 // Top-level statement outside class
                 mainStatements.add(member);
+            }
+        }
+
+        // Register import aliases now that every class has been collected: alias -> same
+        // ClassInfo as the real simple name (aliases never generate code of their own).
+        for (AST member : program.members) {
+            if (member instanceof ImportDecl) {
+                ImportDecl imp = (ImportDecl) member;
+                if (imp.alias == null || imp.alias.isEmpty()) continue;
+                String real = imp.path.substring(imp.path.lastIndexOf('/') + 1);
+                ClassInfo existing = classes.get(imp.alias);
+                if (existing != null) {
+                    ClassInfo info = classes.get(real);
+                    if (existing != info) {
+                        throw new RuntimeException("Import alias '" + imp.alias + "' in 'import "
+                            + imp.path + " as " + imp.alias + "' conflicts with class '"
+                            + existing.fullName + "' (at line " + imp.line + "); choose another alias");
+                    }
+                    continue; // alias names its own class — no-op
+                }
+                ClassInfo info = classes.get(real);
+                if (info != null) classes.put(imp.alias, info);
+                // else: generic template or class-less file — aliases only resolve through
+                // type-string normalization / monomorphized names for those.
             }
         }
 
@@ -356,6 +389,11 @@ public class LLVMGen {
     // ==================== Pass 1: Collection ====================
 
     private void prepareGenericMonomorphization(List<AST> members) {
+        // Import aliases must be known before type strings are inspected: Map<String,int>
+        // has to be seen as Dict<String,int> for use-collection to hit the template.
+        collectImportAliases(members);
+        for (AST root : members) normalizeTypeAliasWalk(root);
+
         // Multi-specialization (T71): record every concrete argument per generic owner, then
         // materialize one ClassDecl per (generic, arg) pair — first arg reuses the original
         // decl, further args get a fresh copy re-parsed from the same source file.
@@ -368,7 +406,9 @@ public class LLVMGen {
             ClassDecl cd = (ClassDecl) root;
             if (cd.genericParams.isEmpty() || cd.name.equals("Thread")) continue;
             String baseName = cd.name;
-            String param = cd.genericParams.get(0);
+            // Multi-parameter generics: params = [K, V]; each recorded use is a canonical
+            // combo string like "int, String" (", " joined by parseType / collect).
+            String[] params = cd.genericParams.toArray(new String[0]);
             Set<String> args = allArgs.get(baseName);
             if (args == null || args.isEmpty()) {
                 // Generic template that is never used (e.g. auto-loaded stdlib): keep it as an
@@ -376,28 +416,81 @@ public class LLVMGen {
                 continue;
             }
             boolean first = true;
-            for (String arg : args) {
-                if (arg.contains("<") || arg.contains(">") || arg.contains(",")) {
+            for (String argCombo : args) {
+                if (argCombo.contains("<") || argCombo.contains(">")) {
                     throw new RuntimeException("Nested generic types are not supported");
+                }
+                String[] concrete = argCombo.split(", ");
+                if (concrete.length != params.length) {
+                    throw new RuntimeException("Generic class '" + baseName + "' expects " + params.length
+                        + " type argument(s) but got " + concrete.length + " (" + argCombo + ")");
                 }
                 ClassDecl spec = cd;
                 if (!first) {
                     spec = reparseClassDecl(cd, baseName);
                     if (spec == null) {
-                        throw new RuntimeException("Cannot create specialization '" + baseName + "_" + arg + "' (source file unavailable: '" + cd.sourceFile + "')");
+                        throw new RuntimeException("Cannot create specialization '" + baseName + "_" + argCombo + "' (source file unavailable: '" + cd.sourceFile + "')");
                     }
                     materialized.add(spec);
                 }
                 first = false;
-                rewriteAstTypes(spec, param, arg);
-                String specName = baseName + "_" + arg;
-                genericTypeOwners.put(baseName + "<" + arg + ">", specName);
+                for (int i = 0; i < params.length; i++) {
+                    rewriteAstTypes(spec, params[i], concrete[i]);
+                }
+                String specName = baseName + "_" + String.join("_", concrete);
+                genericTypeOwners.put(baseName + "<" + argCombo + ">", specName);
                 spec.name = specName;
                 spec.genericParams.clear();
             }
         }
         members.addAll(materialized);
         for (AST root : members) rewriteGenericNames(root);
+    }
+
+    /** Record alias -> real simple name from every import declaration (incl. nested files). */
+    private void collectImportAliases(List<AST> members) {
+        for (AST root : members) {
+            if (root instanceof ImportDecl) {
+                ImportDecl imp = (ImportDecl) root;
+                if (imp.alias != null && !imp.alias.isEmpty()) {
+                    String real = imp.path.substring(imp.path.lastIndexOf('/') + 1);
+                    importAliases.put(imp.alias, real);
+                }
+            }
+        }
+    }
+
+    /** Rewrite alias owners inside type-carrying String fields (Map<..> -> Dict<..>) before
+     *  monomorphization. Expression positions are intentionally NOT touched — they resolve
+     *  via the classes-table alias key, which preserves full-name disambiguation. */
+    private void normalizeTypeAliasWalk(AST node) {
+        if (node == null || importAliases.isEmpty()) return;
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                String fn = f.getName();
+                if (v instanceof String && (fn.equals("type") || fn.equals("returnType")
+                        || fn.equals("varType"))) {
+                    f.set(node, normalizeTypeAliases((String) v));
+                } else if (v instanceof AST) {
+                    normalizeTypeAliasWalk((AST) v);
+                } else if (v instanceof List<?>) {
+                    for (Object x : (List<?>) v) if (x instanceof AST) normalizeTypeAliasWalk((AST) x);
+                }
+            } catch (IllegalAccessException ignored) { }
+        }
+    }
+
+    private String normalizeTypeAliases(String t) {
+        if (t == null || t.isEmpty()) return t;
+        for (Map.Entry<String, String> e : importAliases.entrySet()) {
+            String a = e.getKey();
+            if (t.equals(a)) return e.getValue();
+            if (t.startsWith(a + "<") || t.startsWith(a + "[")) {
+                t = e.getValue() + t.substring(a.length());
+            }
+        }
+        return t;
     }
 
     /** Deep-copy a generic class by re-parsing its source file (multi-specialization, T71). */
@@ -440,7 +533,11 @@ public class LLVMGen {
         if (node instanceof NewExpr) {
             NewExpr n = (NewExpr) node;
             if (!n.typeArgs.isEmpty()) {
-                allArgs.computeIfAbsent(n.className, k -> new LinkedHashSet<>()).add(n.typeArgs.get(0));
+                // Canonical combo "int, String" — must match parseType's ", " join.
+                // Owner may be an import alias (new Map<String,int> -> Dict uses).
+                String combo = String.join(", ", n.typeArgs);
+                String owner = importAliases.getOrDefault(n.className, n.className);
+                allArgs.computeIfAbsent(owner, k -> new LinkedHashSet<>()).add(combo);
             }
         }
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
@@ -458,16 +555,44 @@ public class LLVMGen {
                 Object v = f.get(node);
                 if (v instanceof String && (f.getName().equals("type") || f.getName().equals("returnType"))) {
                     String s = (String) v;
-                    if (s.equals(parameter)) {
-                        f.set(node, concrete);
-                    } else if (s.contains("<" + parameter + ">")) {
-                        // Composite types: Array<T> -> Array<int> (needed for generic T[] fields)
-                        f.set(node, s.replace("<" + parameter + ">", "<" + concrete + ">"));
-                    }
+                    String r = replaceTypeParam(s, parameter, concrete);
+                    if (!r.equals(s)) f.set(node, r);
                 } else if (v instanceof AST) rewriteAstTypes((AST) v, parameter, concrete);
                 else if (v instanceof List<?>) for (Object x : (List<?>) v) if (x instanceof AST) rewriteAstTypes((AST) x, parameter, concrete);
             } catch (IllegalAccessException ignored) { }
         }
+    }
+
+    /** Substitute one type parameter inside a type string, incl. multi-parameter composites
+     *  (Pair<K, V> with param K) and nested Array<...>. No match returns s unchanged. */
+    private String replaceTypeParam(String s, String param, String concrete) {
+        if (s == null || s.isEmpty()) return s;
+        if (s.equals(param)) return concrete;
+        int lt = s.indexOf('<');
+        if (lt < 0 || !s.endsWith(">")) return s;
+        String head = s.substring(0, lt);
+        String body = s.substring(lt + 1, s.length() - 1);
+        List<String> parts = new ArrayList<>();
+        int depth = 0, start = 0;
+        boolean matched = false;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '<') depth++;
+            else if (c == '>') depth--;
+            else if (c == ',' && depth == 0) {
+                String seg = body.substring(start, i);
+                String r = replaceTypeParam(seg.trim(), param, concrete);
+                if (!r.equals(seg.trim())) matched = true;
+                parts.add(r);
+                start = i + 1;
+            }
+        }
+        String last = body.substring(start);
+        String lastR = replaceTypeParam(last.trim(), param, concrete);
+        if (!lastR.equals(last.trim())) matched = true;
+        parts.add(lastR);
+        if (!matched) return s;
+        return head + "<" + String.join(", ", parts) + ">";
     }
 
     private void rewriteGenericNames(AST node) {
@@ -480,13 +605,16 @@ public class LLVMGen {
                 // Diamond `Box<int> b = new Box<>()`: infer the specialization from the decl.
                 if (v.init instanceof NewExpr) {
                     NewExpr n = (NewExpr) v.init;
-                    if (n.typeArgs.isEmpty() && n.className.equals(owner)) n.className = replaced;
+                    String nOwner = importAliases.getOrDefault(n.className, n.className);
+                    if (n.typeArgs.isEmpty() && nOwner.equals(owner)) n.className = replaced;
                 }
             }
         } else if (node instanceof NewExpr) {
             NewExpr n = (NewExpr) node;
             if (!n.typeArgs.isEmpty()) {
-                String spec = genericTypeOwners.get(n.className + "<" + n.typeArgs.get(0) + ">");
+                String owner = importAliases.getOrDefault(n.className, n.className);
+                String key = owner + "<" + String.join(", ", n.typeArgs) + ">";
+                String spec = genericTypeOwners.get(key);
                 if (spec != null) n.className = spec;
             }
         } else if (node instanceof FuncDecl) {
@@ -515,6 +643,16 @@ public class LLVMGen {
             if (t.contains(e.getKey())) t = t.replace(e.getKey(), e.getValue());
         }
         return t;
+    }
+
+    /** Unknown-class error with an ambiguity hint when the simple name is contested. */
+    private RuntimeException unknownClassError(String name, int line) {
+        java.util.Set<String> alts = ambiguousShortNames.get(name);
+        if (alts != null) {
+            return new RuntimeException("Class '" + name + "' is ambiguous across namespaces: "
+                + alts + "; use the full name (at line " + line + ")");
+        }
+        return new RuntimeException("Unknown class: " + name + " (at line " + line + ")");
     }
 
     private void collectClass(ClassDecl decl) {
@@ -561,8 +699,20 @@ public class LLVMGen {
                 }
             }
         }
-        classes.put(decl.name, info);
+        // Simple-name alias: usable only while unique. A second class with the same simple
+        // name (different namespace) makes it ambiguous — drop the alias and record both
+        // full names so use sites can suggest full-name qualification; fullName always works.
+        ClassInfo shortExisting = classes.get(decl.name);
+        if (shortExisting == null) {
+            classes.put(decl.name, info);
+        } else if (!shortExisting.fullName.equals(fullName)) {
+            classes.remove(decl.name);
+            ambiguousShortNames.computeIfAbsent(decl.name, k -> new java.util.LinkedHashSet<>())
+                .add(shortExisting.fullName);
+            ambiguousShortNames.get(decl.name).add(fullName);
+        }
         classes.put(fullName, info);
+        declFullNames.put(decl, fullName);
 
         // Register implicit constructor if there are ctor params OR has parent
         if (!decl.ctorParams.isEmpty() || decl.superClass != null) {
@@ -1064,6 +1214,8 @@ public class LLVMGen {
         // Function object: { code pointer, receiver/environment }
         header.append("%CangFunction = type { i8*, i8* }\n");
         header.append("%CangThreadHandle = type { i64, i8*, i32 }\n");
+        // Object-style Thread: new Thread().task(fn).start() — { task code, task receiver, handle }
+        header.append("%CangThreadObj = type { i8*, i8*, i8* }\n");
         header.append("%CangList = type { i8*, i64, i64 }\n\n");
 
         // Object constructor (no-op)
@@ -1164,8 +1316,13 @@ public class LLVMGen {
     // ==================== Class generation ====================
 
     private void generateClass(ClassDecl decl) {
-        ClassInfo ci = classes.get(decl.name);
-        String fullName = ci.fullName;
+        // Resolve by the full name recorded at collect time: the simple-name alias may have
+        // been dropped or overwritten by a same-named class from another namespace.
+        String fullName = declFullNames.get(decl);
+        if (fullName == null) fullName = decl.name;
+        ClassInfo ci = classes.get(fullName);
+        if (ci == null) ci = classes.get(decl.name);
+        if (ci == null) return;
         currentClassName = fullName;
 
         // Generate implicit constructor if has params OR has parent (to call parent ctor)
@@ -2496,11 +2653,11 @@ public class LLVMGen {
         // Allocate loop variable (id suffix: same var name in two loops must not collide in LLVM)
         String varPtr = "%v." + stmt.varName + "." + id;
         String varLLVMType;
+        String realElemCang = forEachElemCang(iterable, stmt.iterable);
         if (stmt.varType.equals("var")) {
-            // Infer from iterable element type (Cang-level first, LLVM tracking as fallback)
-            String iterableElemCang = elemCangOf(stmt.iterable);
-            if (iterableElemCang != null) {
-                varLLVMType = toLLVMType(iterableElemCang);
+            // Infer from iterable element type (call-return semantic first, then AST tracking)
+            if (realElemCang != null) {
+                varLLVMType = toLLVMType(realElemCang);
             } else {
                 String tracked = null;
                 if (stmt.iterable instanceof Identifier) {
@@ -2512,6 +2669,21 @@ public class LLVMGen {
             }
         } else {
             varLLVMType = toLLVMType(stmt.varType);
+            // Declared element type vs real array element type. Same LLVM type passes; two
+            // pointer types pass (reference family, same width — e.g. Object over String[]);
+            // anything else is refused: scalar/pointer mixes once silently read garbage
+            // (Object over int[] loaded 8 bytes from 4-byte slots), and mixed-width scalars
+            // (long over int[]) would read past the slot.
+            if (realElemCang != null) {
+                String want = toLLVMType(stmt.varType);
+                String have = toLLVMType(realElemCang);
+                boolean compatible = want.equals(have) || (want.endsWith("*") && have.endsWith("*"));
+                if (!compatible) {
+                    throw new RuntimeException("for-each element type '" + stmt.varType
+                        + "' does not match array element type '" + realElemCang
+                        + "' (at line " + stmt.line + ")");
+                }
+            }
         }
         body.append("  ").append(varPtr).append(" = alloca ").append(varLLVMType).append("\n");
         registerGcRoot(varPtr, varLLVMType);
@@ -3055,7 +3227,7 @@ public class LLVMGen {
 
         // object::method 鈥?bind runtime receiver
         if (scope.lookup(owner) == null) {
-            throw new RuntimeException("Unknown class or object: " + owner + " (at line " + line + ")");
+            throw unknownClassError(owner, line);
         }
         LLVMValue receiver = generateExpr(new Identifier(owner, line));
         if (!(receiver.type.startsWith("%") && receiver.type.endsWith("*"))) {
@@ -3948,7 +4120,7 @@ public class LLVMGen {
             }
             String className = extractClassName(objPtr.type);
             ClassInfo ci = classes.get(className);
-            if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+            if (ci == null) throw unknownClassError(className, node.line);
 
             Integer fieldIdx = ci.fieldIndices.get(fa.field);
             if (fieldIdx == null) throw new RuntimeException("Unknown field: " + fa.field);
@@ -4113,19 +4285,21 @@ public class LLVMGen {
         String typeId = "%like.tid." + tmpCount++;
         body.append("  ").append(typeId).append(" = load i32, i32* ").append(typePtr).append("\n");
 
-        // Get target class type ID
+        // Get target class type ID (className may be an import alias — compare real name)
         ClassInfo targetInfo = classes.get(node.className);
         if (targetInfo == null) {
-            throw new RuntimeException("Unknown class: " + node.className + " (at line " + node.line + ")");
+            throw unknownClassError(node.className, node.line);
         }
+        String likeTarget = importAliases.getOrDefault(node.className, targetInfo.simpleName);
 
         // Collect all type IDs that are target or subclass of target
         java.util.List<Integer> validIds = new ArrayList<>();
         for (ClassInfo ci : classes.values()) {
-            if (isSubclass(ci.simpleName, node.className)) {
+            if (isSubclass(ci.simpleName, likeTarget)) {
                 validIds.add(ci.typeId);
             }
         }
+        if (validIds.isEmpty()) validIds.add(targetInfo.typeId);
 
         // Generate OR chain of comparisons
         String current = "%like." + tmpCount++;
@@ -4485,19 +4659,31 @@ public class LLVMGen {
 
     private LLVMValue generateMethodCall(MethodCallExpr node) {
         markRegionControlFlow();
+        LLVMValue objCache = null;
         // Thread<T> is a compiler intrinsic. Phase one intentionally targets Windows/MinGW.
         if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Thread")
                 && node.method.equals("spawn")) {
             return generateThreadSpawn(node);
         }
+        // Object-style Thread: task(fn) / start() on new Thread() results (exact type gate so
+        // unrelated classes' task/start methods fall through to the normal instance path).
+        if (node.object != null && (node.method.equals("task") || node.method.equals("start"))) {
+            objCache = generateExpr(node.object);
+            if (objCache.type.equals("%CangThreadObj*")) {
+                if (node.method.equals("task")) return generateThreadObjTask(objCache, node);
+                return generateThreadObjStart(objCache, node);
+            }
+        }
         // Receiver is generated at most once (debug.md #15): the join probe, the array-length
         // probe and the regular instance path share the same value.
-        LLVMValue objCache = null;
-        if (node.object != null && node.method.equals("join")) {
+        if (objCache == null && node.object != null && node.method.equals("join")) {
             objCache = generateExpr(node.object);
             LLVMValue receiver = objCache;
             if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
                 if (!node.args.isEmpty()) throw new RuntimeException("Thread.join accepts no arguments (at line " + node.line + ")");
+                if (receiver.type.equals("%CangThreadObj*")) {
+                    receiver = threadObjHandle(receiver, node.line);
+                }
                 return generateThreadJoin(receiver, node.line);
             }
         }
@@ -4547,6 +4733,9 @@ public class LLVMGen {
         // Static method call: ClassName.method(...)
         if (node.object instanceof Identifier) {
             String objName = ((Identifier) node.object).name;
+            if (!classes.containsKey(objName) && ambiguousShortNames.containsKey(objName)) {
+                throw unknownClassError(objName, node.line);
+            }
             if (classes.containsKey(objName)) {
                 String classFullName = classes.get(objName).fullName;
                 String funcName = classFullName + "." + node.method;
@@ -4804,7 +4993,15 @@ public class LLVMGen {
         body.append("  store i32 0, i32* ").append(joined).append("\n");
 
         emitThreadEntry(ordinary, startType, isVoid, threadCount);
+        emitThreadCreate(raw, tid, node.line);
 
+        threadCount++;
+        return new LLVMValue(handle, "%CangThreadHandle*", "Thread<" + ordinary.returnType + ">");
+    }
+
+    /** Create the native thread running @cang.thread.entry.<threadCount> with pack raw;
+     *  writes the OS thread id into tidPtr (i64*). Bumps threadCount on success path. */
+    private void emitThreadCreate(String raw, String tidPtr, int line) {
         if (targetPlatform.equals("windows")) {
             String entryFn = "@cang.thread.entry." + threadCount;
             String createFn = gcEnabled ? "@GC_CreateThread" : "@CreateThread";
@@ -4816,11 +5013,11 @@ public class LLVMGen {
             body.append("  ").append(isNull).append(" = icmp eq i8* ").append(created).append(", null\n");
             body.append("  br i1 ").append(isNull).append(", label %").append(bad).append(", label %").append(ok).append("\n");
             body.append(bad).append(":\n");
-            emitFatalError("Thread creation failed", node.line, ok);
+            emitFatalError("Thread creation failed", line, ok);
             body.append(ok).append(":\n");
             String tid32 = "%thread.id32." + tmpCount++;
             body.append("  ").append(tid32).append(" = ptrtoint i8* ").append(created).append(" to i64\n");
-            body.append("  store i64 ").append(tid32).append(", i64* ").append(tid).append("\n");
+            body.append("  store i64 ").append(tid32).append(", i64* ").append(tidPtr).append("\n");
         } else {
             String entryFn = "@cang.thread.entry." + threadCount;
             String ptidSlot = "%thread.ptid.slot." + tmpCount++;
@@ -4835,14 +5032,12 @@ public class LLVMGen {
             body.append("  ").append(failed).append(" = icmp ne i32 ").append(rc).append(", 0\n");
             body.append("  br i1 ").append(failed).append(", label %").append(bad).append(", label %").append(ok).append("\n");
             body.append(bad).append(":\n");
-            emitFatalError("Thread creation failed", node.line, ok);
+            emitFatalError("Thread creation failed", line, ok);
             body.append(ok).append(":\n");
             String tidVal = "%thread.ptid.load." + tmpCount++;
             body.append("  ").append(tidVal).append(" = load i64, i64* ").append(ptidSlot).append("\n");
-            body.append("  store i64 ").append(tidVal).append(", i64* ").append(tid).append("\n");
+            body.append("  store i64 ").append(tidVal).append(", i64* ").append(tidPtr).append("\n");
         }
-        threadCount++;
-        return new LLVMValue(handle, "%CangThreadHandle*", "Thread<" + ordinary.returnType + ">");
     }
 
     private void emitThreadEntry(FuncInfo ordinary, String startType, boolean isVoid, int id) {
@@ -4895,6 +5090,176 @@ public class LLVMGen {
             x.append("  %rpt = bitcast i8* %rpp to ").append(retLLVM).append("*\n");
             x.append("  store ").append(retLLVM).append(" %r, ").append(retLLVM).append("* %rpt\n");
         }
+        if (registerWithGc) {
+            x.append("  %gc.sbres3.").append(id).append(" = call i32 @GC_unregister_my_thread(i8* ").append(sb8).append(")\n");
+        }
+        x.append("  call void @").append(freeFn()).append("(i8* %arg)\n");
+        if (posix) x.append("  ret i8* null\n}\n\n");
+        else x.append("  ret i32 0\n}\n\n");
+        extraDefs.append(x);
+    }
+
+    /** Object-style .task(fn): validate Function<void>, store { code, receiver }; returns this. */
+    private LLVMValue generateThreadObjTask(LLVMValue receiver, MethodCallExpr node) {
+        if (node.args.size() != 1) {
+            throw new RuntimeException("Thread.task accepts exactly one function argument (at line " + node.line + ")");
+        }
+        if (receiver.semanticType == null || !isThreadType(receiver.semanticType)) {
+            throw new RuntimeException("Thread.task must be called on new Thread() (at line " + node.line + ")");
+        }
+        LLVMValue fn = generateExpr(node.args.get(0));
+        String sig = fn.semanticType;
+        if (sig == null || !isFunctionType(sig)) {
+            throw new RuntimeException("Thread.task requires a no-argument no-return function, e.g. this::run or a lambda (at line " + node.line + ")");
+        }
+        String[] parts = functionTypeParts(sig);
+        if (parts.length != 1 || !parts[0].equals("void")) {
+            throw new RuntimeException("Thread.task requires a no-argument no-return function (Function<void>), got " + sig + " (at line " + node.line + ")");
+        }
+        if (!fn.type.equals("%CangFunction")) {
+            throw new RuntimeException("Thread.task requires a method reference, function name or lambda (at line " + node.line + ")");
+        }
+        String code = "%thr.task.code." + tmpCount++;
+        body.append("  ").append(code).append(" = extractvalue %CangFunction ").append(fn.value).append(", 0\n");
+        String recv = "%thr.task.recv." + tmpCount++;
+        body.append("  ").append(recv).append(" = extractvalue %CangFunction ").append(fn.value).append(", 1\n");
+        String cfield = "%thr.task.cf." + tmpCount++;
+        body.append("  ").append(cfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 0\n");
+        body.append("  store i8* ").append(code).append(", i8** ").append(cfield).append("\n");
+        String rfield = "%thr.task.rf." + tmpCount++;
+        body.append("  ").append(rfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 1\n");
+        body.append("  store i8* ").append(recv).append(", i8** ").append(rfield).append("\n");
+        return receiver;
+    }
+
+    /** Object-style .start(): pack { code, receiver }, create the thread, store the handle;
+     *  returns the handle (Thread<void>) so .join() chains. */
+    private LLVMValue generateThreadObjStart(LLVMValue receiver, MethodCallExpr node) {
+        if (!node.args.isEmpty()) {
+            throw new RuntimeException("Thread.start accepts no arguments (at line " + node.line + ")");
+        }
+        String cfield = "%thr.start.cf." + tmpCount++;
+        body.append("  ").append(cfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 0\n");
+        String code = "%thr.start.code." + tmpCount++;
+        body.append("  ").append(code).append(" = load i8*, i8** ").append(cfield).append("\n");
+        String rfield = "%thr.start.rf." + tmpCount++;
+        body.append("  ").append(rfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 1\n");
+        String recv = "%thr.start.recv." + tmpCount++;
+        body.append("  ").append(recv).append(" = load i8*, i8** ").append(rfield).append("\n");
+        String hfield = "%thr.start.hf." + tmpCount++;
+        body.append("  ").append(hfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 2\n");
+        String oldHandle = "%thr.start.old." + tmpCount++;
+        body.append("  ").append(oldHandle).append(" = load i8*, i8** ").append(hfield).append("\n");
+
+        int id = labelCount++;
+        String noTask = "thr.start.notask." + id;
+        String taskOk = "thr.start.taskok." + id;
+        String noTaskCmp = "%thr.start.notask.cmp." + tmpCount++;
+        body.append("  ").append(noTaskCmp).append(" = icmp eq i8* ").append(code).append(", null\n");
+        body.append("  br i1 ").append(noTaskCmp).append(", label %").append(noTask).append(", label %").append(taskOk).append("\n");
+        body.append(noTask).append(":\n");
+        emitRuntimeError("Thread has no task; call task() before start", node.line, taskOk);
+        body.append(taskOk).append(":\n");
+
+        String already = "thr.start.already." + id;
+        String startOk = "thr.start.ok." + id;
+        String alreadyCmp = "%thr.start.already.cmp." + tmpCount++;
+        body.append("  ").append(alreadyCmp).append(" = icmp ne i8* ").append(oldHandle).append(", null\n");
+        body.append("  br i1 ").append(alreadyCmp).append(", label %").append(already).append(", label %").append(startOk).append("\n");
+        body.append(already).append(":\n");
+        emitRuntimeError("Thread already started", node.line, startOk);
+        body.append(startOk).append(":\n");
+
+        // Pack { i8* code, i8* receiver }
+        String startType = "{ i8*, i8* }";
+        String raw = "%thr.start.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 16)\n");
+        String start = "%thr.start.pack." + tmpCount++;
+        body.append("  ").append(start).append(" = bitcast i8* ").append(raw).append(" to ").append(startType).append("*\n");
+        String p0 = "%thr.start.p0." + tmpCount++;
+        body.append("  ").append(p0).append(" = getelementptr ").append(startType).append(", ").append(startType)
+             .append("* ").append(start).append(", i32 0, i32 0\n");
+        body.append("  store i8* ").append(code).append(", i8** ").append(p0).append("\n");
+        String p1 = "%thr.start.p1." + tmpCount++;
+        body.append("  ").append(p1).append(" = getelementptr ").append(startType).append(", ").append(startType)
+             .append("* ").append(start).append(", i32 0, i32 1\n");
+        body.append("  store i8* ").append(recv).append(", i8** ").append(p1).append("\n");
+
+        // Handle { tid, resultSlot=null, joined=0 }, store into obj field 2
+        String handleRaw = "%thr.start.hraw." + tmpCount++;
+        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+        String handle = "%thr.start.handle." + tmpCount++;
+        body.append("  ").append(handle).append(" = bitcast i8* ").append(handleRaw).append(" to %CangThreadHandle*\n");
+        String tid = "%thr.start.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
+             .append(", i32 0, i32 0\n");
+        String rid = "%thr.start.rid." + tmpCount++;
+        body.append("  ").append(rid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
+             .append(", i32 0, i32 1\n");
+        body.append("  store i8* null, i8** ").append(rid).append("\n");
+        String joined = "%thr.start.joined." + tmpCount++;
+        body.append("  ").append(joined).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
+             .append(", i32 0, i32 2\n");
+        body.append("  store i32 0, i32* ").append(joined).append("\n");
+        body.append("  store i8* ").append(handleRaw).append(", i8** ").append(hfield).append("\n");
+
+        emitThreadEntryFunction(threadCount);
+        emitThreadCreate(raw, tid, node.line);
+        threadCount++;
+        return new LLVMValue(handle, "%CangThreadHandle*", "Thread<void>");
+    }
+
+    /** Object-style Thread join: load the handle from field 2 with a not-started runtime check. */
+    private LLVMValue threadObjHandle(LLVMValue receiver, int line) {
+        String hfield = "%thr.join.hf." + tmpCount++;
+        body.append("  ").append(hfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 2\n");
+        String handleRaw = "%thr.join.handle." + tmpCount++;
+        body.append("  ").append(handleRaw).append(" = load i8*, i8** ").append(hfield).append("\n");
+        int id = labelCount++;
+        String notStarted = "thr.join.notstarted." + id;
+        String ok = "thr.join.started." + id;
+        String cmp = "%thr.join.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp eq i8* ").append(handleRaw).append(", null\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(notStarted).append(", label %").append(ok).append("\n");
+        body.append(notStarted).append(":\n");
+        emitRuntimeError("Thread not started: call start() before join", line, ok);
+        body.append(ok).append(":\n");
+        String handle = "%thr.join.htyped." + tmpCount++;
+        body.append("  ").append(handle).append(" = bitcast i8* ").append(handleRaw).append(" to %CangThreadHandle*\n");
+        return new LLVMValue(handle, "%CangThreadHandle*", receiver.semanticType);
+    }
+
+    /** Thread entry for the object-style pack { i8* code, i8* receiver }: call void (i8*, i8*). */
+    private void emitThreadEntryFunction(int id) {
+        String startType = "{ i8*, i8* }";
+        boolean posix = !targetPlatform.equals("windows");
+        StringBuilder x = new StringBuilder();
+        x.append("define ").append(posix ? "i8*" : "i32")
+         .append(" @cang.thread.entry.").append(id).append("(i8* %arg) {\nentry:\n");
+        emitStackBaseSet(x, "th." + id);
+        String sb = "%gc.sb." + id;
+        String sb8 = "%gc.sb8." + id;
+        boolean registerWithGc = gcEnabled && !targetPlatform.equals("windows");
+        if (registerWithGc) {
+            x.append("  ").append(sb).append(" = alloca [64 x i8]\n");
+            x.append("  ").append(sb8).append(" = getelementptr [64 x i8], [64 x i8]* ").append(sb).append(", i32 0, i32 0\n");
+            x.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(sb8).append(", i8 0, i64 64, i1 false)\n");
+            x.append("  %gc.sbres1.").append(id).append(" = call i32 @GC_get_stack_base(i8* ").append(sb8).append(")\n");
+            x.append("  %gc.sbres2.").append(id).append(" = call i32 @GC_register_my_thread(i8* ").append(sb8).append(")\n");
+        }
+        x.append("  %s = bitcast i8* %arg to ").append(startType).append("*\n");
+        x.append("  %cf = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 0\n");
+        x.append("  %code = load i8*, i8** %cf\n");
+        x.append("  %rf = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 1\n");
+        x.append("  %recv = load i8*, i8** %rf\n");
+        x.append("  %fp = bitcast i8* %code to void (i8*, i8*)*\n");
+        x.append("  call void %fp(i8* %code, i8* %recv)\n");
         if (registerWithGc) {
             x.append("  %gc.sbres3.").append(id).append(" = call i32 @GC_unregister_my_thread(i8* ").append(sb8).append(")\n");
         }
@@ -5317,7 +5682,7 @@ public class LLVMGen {
 
         String className = extractClassName(objPtr.type);
         ClassInfo ci = classes.get(className);
-        if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+        if (ci == null) throw unknownClassError(className, node.line);
 
         // Private access check: _ prefix fields only accessible within same class
         if (node.field.startsWith("_") && !isSameOrParentClass(currentClassName, ci.simpleName)) {
@@ -5384,7 +5749,7 @@ public class LLVMGen {
             }
             String className = extractClassName(objPtr.type);
             ClassInfo ci = classes.get(className);
-            if (ci == null) throw new RuntimeException("Unknown class: " + className + " (at line " + node.line + ")");
+            if (ci == null) throw unknownClassError(className, node.line);
             Integer fieldIdx = ci.fieldIndices.get(fa.field);
             if (fieldIdx == null) throw new RuntimeException("Unknown field: " + fa.field + " (at line " + node.line + ")");
             // fieldIdx includes type ID offset, fieldTypes starts at 0
@@ -5459,8 +5824,27 @@ public class LLVMGen {
             }
             return new LLVMValue(value.value, "i8*", "String");
         }
+        // new Thread() — intrinsic object-style handle; no Cang class body. Fields start null;
+        // .task(fn) stores { code, receiver }, .start() creates the thread and stores the handle.
+        if (node.className.equals("Thread")) {
+            if (!node.args.isEmpty() || (node.typeArgs != null && !node.typeArgs.isEmpty())) {
+                throw new RuntimeException("new Thread() takes no arguments or type parameters; use Thread.spawn(fn, ...) for value-returning threads (at line " + node.line + ")");
+            }
+            String raw = "%thr.obj.raw." + tmpCount++;
+            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+            String obj = "%thr.obj." + tmpCount++;
+            body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangThreadObj*\n");
+            for (int f = 0; f < 3; f++) {
+                String fp = "%thr.obj.f." + tmpCount++;
+                body.append("  ").append(fp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+                     .append(", i32 0, i32 ").append(f).append("\n");
+                body.append("  store i8* null, i8** ").append(fp).append("\n");
+            }
+            return new LLVMValue(obj, "%CangThreadObj*", "Thread<void>");
+        }
+
         ClassInfo ci = classes.get(node.className);
-        if (ci == null) throw new RuntimeException("Unknown class: " + node.className + " (at line " + node.line + ")");
+        if (ci == null) throw unknownClassError(node.className, node.line);
 
         // Calculate struct size
         String sizeVar = "%size." + tmpCount++;
@@ -5568,6 +5952,21 @@ public class LLVMGen {
             }
             return null;
         }
+        return null;
+    }
+
+    /** Real element Cang type of a for-each iterable. The generated value's Array<T> semantic
+     *  comes first (covers method calls like Dict.keys() which elemCangOf cannot see), then
+     *  AST-level tracking (identifier/field/array-access), then System.ARGS. */
+    private String forEachElemCang(LLVMValue iterableVal, AST iterable) {
+        if (iterableVal != null && iterableVal.semanticType != null
+                && iterableVal.semanticType.startsWith("Array<")
+                && iterableVal.semanticType.endsWith(">")) {
+            return iterableVal.semanticType.substring(6, iterableVal.semanticType.length() - 1);
+        }
+        String cang = elemCangOf(iterable);
+        if (cang != null) return cang;
+        if (isSystemArgs(iterable)) return "String";
         return null;
     }
 
@@ -5962,6 +6361,29 @@ public class LLVMGen {
         tmpCount = 0;
         currentFuncReturnType = "int";
         emitGcFrameSetup();
+
+        // Entry-class instance for top-level `this`: the rest of the file is the entry
+        // instance's body, so this:: method references (e.g. task(this::run)) work at top level.
+        ClassInfo entryCi = classes.get(entryClass.name);
+        if (entryCi != null) {
+            String eSizeGep = "%entry.obj.size." + tmpCount++;
+            body.append("  ").append(eSizeGep).append(" = getelementptr ").append(entryCi.llvmName)
+                 .append(", ").append(entryCi.llvmName).append("* null, i32 1\n");
+            String eSize = "%entry.obj.sizeof." + tmpCount++;
+            body.append("  ").append(eSize).append(" = ptrtoint ").append(entryCi.llvmName)
+                 .append("* ").append(eSizeGep).append(" to i64\n");
+            String eRaw = "%entry.obj.raw." + tmpCount++;
+            body.append("  ").append(eRaw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(eSize).append(")\n");
+            String eObj = "%entry.obj." + tmpCount++;
+            body.append("  ").append(eObj).append(" = bitcast i8* ").append(eRaw).append(" to ").append(entryCi.llvmName).append("*\n");
+            String eTid = "%entry.obj.tid." + tmpCount++;
+            body.append("  ").append(eTid).append(" = getelementptr ").append(entryCi.llvmName)
+                 .append(", ").append(entryCi.llvmName).append("* ").append(eObj).append(", i32 0, i32 0\n");
+            body.append("  store i32 ").append(entryCi.typeId).append(", i32* ").append(eTid).append("\n");
+            scope.define("this", new LLVMValue(eObj, entryCi.llvmName + "*"));
+            // Top-level code is the entry instance's body: allow this:: references.
+            currentClassName = entryCi.fullName;
+        }
 
         // Allocate and initialize parameters with default values
         for (Parameter p : entryClass.ctorParams) {

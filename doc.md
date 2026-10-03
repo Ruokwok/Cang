@@ -43,6 +43,28 @@ Stdout.println("main continues")
 - **不允许捕获外部变量或 `this`**（报 `Thread block cannot capture ...`；与 lambda 不同，线程块保持无捕获）；
 - 暂不支持写在循环体内（编译期报错）。
 
+### new Thread().task(fn).start() 对象式写法
+
+参考 Java 的线程写法：先创建线程对象，绑定任务，再启动：
+
+```cang
+class Main()
+func void run() {
+    Stdout.println("in thread")
+}
+
+var t = new Thread().task(this::run).start()
+t.join()
+Stdout.println("main done")
+```
+
+- `new Thread()` 创建线程对象（任务与句柄字段初始为空）；
+- `.task(fn)` 绑定任务并返回线程对象本身（支持链式）：参数须是**无参无返回**的 `Function<void>`——方法引用（`this::run`、`obj::m`、`Class::staticM`）、顶层函数名或无参 lambda 均可；带参数或有返回值的函数在编译期被拒绝（`Thread.task requires a no-argument no-return function`）；
+- `.start()` 在新线程执行任务，返回 `Thread<void>` 句柄，可继续 `.join()` 等待完成；未 `task` 就 `start`、或对同一对象重复 `start`，运行时报错（`Thread has no task` / `Thread already started`）；
+- `.join()` 等待任务结束（`void` 无返回值）；对未启动的对象调用 `join` 运行时报错；
+- 与 `thread { }` 的无捕获限制不同：任务可以携带 `this`/对象 receiver（`this::run` 即绑定当前实例），跨线程共享状态的数据竞争由程序自己保证（与 Java 相同）；
+- `Thread.spawn` 与 `thread { }` 写法不受影响，继续支持值类型返回值与参数。
+
 > 文档基于当前编译器实现。部分高级功能仍在开发中，文末列出了已知限制。
 
 ---
@@ -180,6 +202,36 @@ Stdout.println(add(1, 2))
 - 空白行。
 
 函数定义、变量声明和执行逻辑都应放在入口 `class` 之后。
+
+**同名类消歧**：不同命名空间下的两个同名类可以同时 import，但简单类名只在唯一时可用；冲突时必须写全限定名（命名空间中的 `/` 换成 `_`）：
+
+```cang
+import a/util/Logger
+import b/util/Logger
+
+class Main()
+Stdout.println(a_util_Logger.who())   # 全限定名
+Stdout.println(b_util_Logger.who())
+Stdout.println(Logger.who())          # 编译错误：Class 'Logger' is ambiguous across namespaces
+```
+
+**import 别名（`as`）**：`import <路径> as <别名>` 后可用别名代替类名。`as` **不是关键字**——只在 `import` 行内起作用，代码里 `as` 仍可作变量/函数名：
+
+```cang
+import cc/ruok/Server as RuokServer
+import cang/lang/Dict as Map
+
+class Main()
+var s = new RuokServer("box")          # new 用别名
+Stdout.println(RuokServer.kind())      # 静态调用用别名
+RuokServer t = new RuokServer()        # 类型注解用别名
+Map<String, int> d = new Map<String, int>()   # 泛型同样支持
+int as = 5                             # as 仍是普通标识符
+```
+
+- 别名与已有类名冲突时编译报错（`Import alias '...' conflicts with class '...'`），换一个别名即可；
+- 别名是引入类的另一个名字，不会生成新类型：`s like RuokServer` 等类型判断同样生效；
+- 别名也是消歧手段之一——两个同名类可分别 `as A` / `as B`。
 
 ### 2.2 语句分号
 
@@ -791,6 +843,31 @@ Cang 当前只支持单继承，不支持多继承。
 
 ---
 
+### 10.5 泛型类（多个类型参数）
+
+泛型类在编译期单态化：每个「类名 + 类型实参组合」生成一份具体类型。类型参数个数任意：
+
+```cang
+class Pair<K, V>(K first, V second)
+
+class Main()
+Pair<int, String> p = new Pair<>(1, "one")      # diamond 从声明推断
+Stdout.println(p.first)                          # 1
+var q = new Pair<String, int>("two", 2)          # 显式类型实参
+Stdout.println(q.second)                         # 2
+```
+
+规则：
+
+- 声明写 `class Pair<K, V>(K first, V second)`，使用点写全实参：`Pair<int, String>`、`new Pair<String, int>(...)`；
+- 同一程序可用多个不同实参组合（`Pair<int, String>` 与 `Pair<String, int>` 各生成一份独立类型，互不影响）；
+- **类型实参个数必须匹配**：给双参数类写 `Pair<int>` 会在编译期报 `Generic class 'Pair' expects 2 type argument(s) but got 1`；
+- 实参须是具体类型（`int`/`String`/... 或类名），嵌套泛型实参暂不支持（`Nested generic types are not supported`）；
+- 函数参数、返回类型与字段中的泛型类型（如 `func String f(Pair<int, String> p)`）随物化一并替换；
+- diamond `new Pair<>()` 必须配合**有类型的声明**（`Pair<int, String> p = new Pair<>()`）：`var` 无法推断实参组合。
+
+---
+
 ## 11. 数组
 
 ### 11.1 数组声明
@@ -859,6 +936,12 @@ for (int[] row : matrix) {
     Stdout.println(row[0])
 }
 ```
+
+元素类型规则：
+
+- `var` 元素类型从可迭代对象推导，包括**方法返回的数组**（如 `for (var k : dict.keys())`）；
+- 显式元素类型必须与数组真实元素类型**兼容**：完全相同，或同为指针类型（引用族，如 `for (Object k : dict.keys())` 对 `String[]` 合法）；
+- 标量与指针互斥、不同宽度标量互斥（`for (Object k : int[]数组)`、`for (long x : int[]数组)` 均编译报错，避免越界读与静默垃圾值）。
 
 ---
 
@@ -945,16 +1028,46 @@ stdlib/cang/io/
 
 - `Object.cang`
 - `Stdout.cang`
+- `Stderr.cang`
 - `String.cang`
 - `Math.cang`
 - `System.cang`
 - `Function.cang`
 - `Void.cang`
 - `Error.cang`
+- `Thread.cang`
+- `List.cang`
+- `Dict.cang`
 - `cang/io/File.cang`
 
 `cang/lang` 下的标准库由编译器自动查找，也可以显式 import。
 `cang/io` 下的模块需要显式 `import cang/io/File`。
+
+### 13.1 cang/lang/Dict（KV 映射）
+
+`Dict<K, V>` 是键值映射（纯 Cang 实现，API 参考 `java.util.HashMap`），多类型参数泛型的第一个标准库用户：
+
+```cang
+import cang/lang/Dict
+
+class Main()
+var d = new Dict<String, int>()
+d.put("a", 1)
+d.put("b", 2)
+d.put("a", 10)                            # 同键覆盖
+Stdout.println(d.get("a"))                # 10
+Stdout.println(d.getOrDefault("zz", -1))  # -1（键不存在）
+Stdout.println(d.size())                  # 2
+for (String k : d.keys()) {
+    Stdout.println(k + " = " + d.get(k))
+}
+```
+
+- API：`put` / `get` / `getOrDefault` / `containsKey` / `remove` / `size` / `isEmpty` / `clear` / `keys` / `values`；
+- `get` 未找到抛 `Error("Dict key not found")`；不想抛错用 `getOrDefault(key, fallback)`；
+- `keys()` / `values()` 返回快照数组，顺序按插入序一一对应（可配对遍历）；
+- 键判等用 `==`：`String` 按**内容**比较，值类型按数值；`K` 支持值类型与 `String`，`V` 不限；
+- 底层为并行数组线性查找、容量不足自动翻倍（2x），适合中小规模；`_indexOf` / `_grow` 为类私有。
 
 ---
 
