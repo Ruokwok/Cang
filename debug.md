@@ -193,7 +193,11 @@
 - 修复：①未闭合 `"`/`'`/反引号 → 在**开引号位置**立即抛 `Unterminated string`（不再吞到 EOF）；②未闭合 `#*` → 开位置抛 `Unterminated comment`；③普通/转义/反引号字符串内换行均 `line++/column=1`（此前引用串不计行 → 后续全偏）；④反引号版顺带修正换行推进顺序。
 - 实测：t_lex_unterm_str 2:16 / t_lex_unterm_cmt 2:1 / t_lex_unterm_tick 2:9 / t_lex_lineshift（跨行串后故意错）**4:9 正确**；多行串内容回归正常；全量 65/65。
 
-### 27. 🟡 报错质量 —— 约 20 处 codegen 异常缺 `(at line N)` → 一律定位 1:1（逐个补行号）；**import 进来的文件词法错 → `Internal error` + Java 栈回溯**（`Cang.java` tokenize 不在 try 内，约 321/222）；Lexer `&` 先 advance 后 error 列号 +1（约 271）
+### 27. ✅ 报错质量 —— 已修复（三件套）
+- ①**codegen 无行号异常**：`generateStmt` 入口记 `lastStmtLine`，`generate(program)` 统一 wrapper——RuntimeException 消息不含 `at line` 时自动追加 `(at line N)`（CompileError 原样放行）；一次覆盖全部深层无定位异常。
+- ②**import 文件词法错 → Internal error + 栈**：根因是 `loadImport` 外层 try 只有 finally、`tokenize()` 不在内层 catch 内 → 单独 try-catch `wrapError`。实测 Broken.cang 未闭合串现在渲染为标准诊断（文件:3:25 + 源行 + 脱字符）。
+- ③**Lexer `&`/`|` 列号 +1**：advance 后 error 用当前列 → 新增 `errorAt(startLine, startCol, msg)` 用 token 起始列。实测 `int x = 1 & 2` 报 **2:11**（原 2:12）。
+- 回归 65/65（全部错误例渲染零变化）。
 
 ### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1
 
@@ -289,6 +293,6 @@
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
 8. ~~13/20/21~~ ✅（finally 五出口统一——finallyStack + inlineFinallyLayers 内联 + jexit.dead 死块，见第 13/20/21 条）
-9. ~~36~~ ✅（静默丢语句——编译期报错，见第 36 条）→ 26/27（26 已修，见第 26 条；27 待修）→ 40（泛型 null 默认值）
+9. ~~36~~ ✅ → ~~26/27~~ ✅（26 词法吞文件/行号、27 报错质量，均见各条）→ 40（泛型 null 默认值）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理

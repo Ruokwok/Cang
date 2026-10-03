@@ -318,7 +318,14 @@ public class Cang {
 
         try {
             Lexer importLexer = new Lexer(importCode);
-            List<Token> importTokens = importLexer.tokenize();
+            List<Token> importTokens;
+            try {
+                importTokens = importLexer.tokenize();
+            } catch (RuntimeException e) {
+                // Lexical errors in an imported file must render like any other diagnostic —
+                // unwrapped they surface as "Internal error" + a Java stack trace (debug.md #27).
+                throw wrapError(e);
+            }
             Parser importParser = new Parser(importTokens);
             AST.Program importProgram;
             try {

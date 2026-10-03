@@ -303,11 +303,11 @@ public class Lexer {
             case '&':
                 advance();
                 if (peek == '&') { advance(); return new Token(TokenType.AND, "&&", startLine, startCol); }
-                error("Unexpected character '&'");
+                errorAt(startLine, startCol, "Unexpected character '&'");
             case '|':
                 advance();
                 if (peek == '|') { advance(); return new Token(TokenType.OR, "||", startLine, startCol); }
-                error("Unexpected character '|'");
+                errorAt(startLine, startCol, "Unexpected character '|'");
             case '(': advance(); return new Token(TokenType.LPAREN, "(", startLine, startCol);
             case ')': advance(); return new Token(TokenType.RPAREN, ")", startLine, startCol);
             case '{': advance(); return new Token(TokenType.LBRACE, "{", startLine, startCol);
@@ -340,5 +340,10 @@ public class Lexer {
 
     private void error(String msg) {
         throw new RuntimeException("Lexer error at line " + line + ", column " + column + ": " + msg);
+    }
+
+    /** Error at an explicit (already-known) position — for cases where advance() moved the cursor. */
+    private void errorAt(int l, int c, String msg) {
+        throw new RuntimeException("Lexer error at line " + l + ", column " + c + ": " + msg);
     }
 }

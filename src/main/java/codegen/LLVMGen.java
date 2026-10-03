@@ -258,6 +258,25 @@ public class LLVMGen {
     }
 
     public String generate(Program program) {
+        try {
+            return generateInternal(program);
+        } catch (util.CompileError e) {
+            throw e; // already carries precise file/line/column
+        } catch (RuntimeException e) {
+            // debug.md #27: codegen exceptions without "(at line N)" were rendered at 1:1.
+            // Attach the line of the statement being generated when available.
+            String msg = e.getMessage();
+            if (lastStmtLine > 0 && msg != null && !msg.contains("at line")) {
+                throw new RuntimeException(msg + " (at line " + lastStmtLine + ")");
+            }
+            throw e;
+        }
+    }
+
+    /** Line of the statement currently being generated (for wrapping bare codegen errors). */
+    private int lastStmtLine = -1;
+
+    private String generateInternal(Program program) {
         // Register built-in Object class (cang.lang.Object)
         registerBuiltinObject();
 
@@ -1692,6 +1711,7 @@ public class LLVMGen {
     }
 
     private void generateStmt(AST node) {
+        lastStmtLine = node.line; // for wrapping bare codegen errors (debug.md #27)
         if (node instanceof Block) {
             Scope prev = scope;
             scope = new Scope(prev);
