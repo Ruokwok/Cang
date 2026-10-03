@@ -98,9 +98,8 @@
   - 把"文本搜 ret"换成 AST 级控制流分析：`alwaysReturns(block)` 递归——Return 恒真；Block 看最后非空语句；If 两支都真且有 else；Switch 全 case+default 都真；While/For 循环体真且条件非常量 true 时假（`while(true)` 无 break → 真）；Try 看 try 块。
   - 发射侧兜底：函数结束时若当前块还没有 terminator，按返回类型补默认 ret 或报"missing return"，保证 IR 永远有终结符（治标先于治本）。
 
-### 13. 🔴 return 在 try 内 → 跳过 finally + 无效 IR —— 待修（与 20/21 同域）
-- 现象：`try { return } finally { ... }` 跳过 finally 执行，且 `try.continue.N` 空块无终结符 → clang 编译失败（实测 `zz_fin_return`）。
-- 修复指引：见第五节 20 的统一方案。
+### 13. ✅ return 在 try 内 → 跳过 finally + 无效 IR —— 已修复（finally 五出口统一，见第 20 条机制）
+- 修复后：`try { return } finally { ... }` 先跑 finally 再 ret（值表达式先于 finally 求值）；跳转后开 `jexit.dead.N` 死块承接后续语句，消灭空块无终结符。t_fin_return 实测 `fin|1` 顺序正确。
 
 ---
 
@@ -154,11 +153,11 @@
 
 ## 五、try / catch / finally 语义缺口
 
-### 20. 🔴 try 内 break/continue 跳过 finally + 双终结符 IR —— 待修
-- 现象：try 内 `break`/`continue` 直接 br 到循环标签跳过 finally（实测 finally 无输出），且产生双终结符 IR。
-- 位置：`generateBreakContinue`（约 1303-1310）。
-### 21. 🟡 catch 内 throw 跳过 finally —— 待修
-- 位置：约 1463（pop handler）+ 1484（直跳外层）。
+### 20. ✅ try 内 break/continue 跳过 finally + 双终结符 IR —— 已修复（finally 五出口统一）
+- **统一机制（13/20/21 同批落地）**：`finallyStack`（FinallyCtx：finallyBlock + inTryBody）在 generateTry 进入时 push、共享 finally 生成前 remove；出口点（return / break / continue / catch 内 throw）调 `inlineFinallyLayers()` 按**内→外**逐层内联生成 finally 体（每层只激活外层栈，finally 内 return 正确链到外层）；某层终结（finally 自己 return/throw）则吞掉原跳转；内联后统一开 `jexit.dead.N` 死块承接后续语句（治双终结符/空块无终结）。**finally 本体正常路径不受影响**（after 标签照旧），无 finally 时三出口逐字节保持原行为。
+- 实测 t_fin_return：continue/break 每层 finally 全跑（f0|f1|f2|f3），回归 60/60。
+### 21. ✅ catch 内 throw 跳过 finally —— 已修复（并入 20 的内联机制）
+- 机制：catch 阶段 FinallyCtx.inTryBody=false → generateThrow 检测后先 inlineFinallyLayers 再 br 外层 handler；try 体内的普通 throw 不内联（走 handler→after 正常跑 finally）。t_fin_rethrow 实测 `outer caught → outer fin` 顺序正确。
 ### 13（并入）return 在 try 内跳过 finally + 空块无终结符 —— 约 2223/1501/1237。
 
 - **统一修复指引（三条同一机制）**：实现"finally 复制/跳板"——
@@ -287,7 +286,7 @@
 5. ~~泛型多类型单态化（T71）+ 纯 Cang ArrayList（T72）~~ ✅：多具体类型每类一特化（重解析克隆 + 全键映射 + 钻石推断 + 未用模板跳过）；`stdlib/cang/lang/ArrayList.cang` 11 个方法，`t_arraylist` 29 断言（int+String 双类型同程序）全过，套件 35/35
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
-8. **13/20/21**（finally 出口统一——12 已完成）
+8. ~~13/20/21~~ ✅（finally 五出口统一——finallyStack + inlineFinallyLayers 内联 + jexit.dead 死块，见第 13/20/21 条）
 9. 36（静默丢语句——报错即可）→ 26/27（词法吞文件/行号）→ 40（泛型 null 默认值）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理

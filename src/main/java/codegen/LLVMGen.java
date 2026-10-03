@@ -111,6 +111,16 @@ public class LLVMGen {
     private final Map<String, String> stringLiterals = new LinkedHashMap<>(); // text 閳?global name
     private final List<LoopContext> loopStack = new ArrayList<>();
     private final Deque<String> exceptionHandlers = new ArrayDeque<>();
+    /** One in-scope try-with-finally. inTryBody distinguishes a throw inside the try body
+     *  (normal handler path — finally runs at `after`) from one inside the catch clause
+     *  (must inline this layer's finally before propagating outward). */
+    private static final class FinallyCtx {
+        final AST finallyBlock;
+        boolean inTryBody = true;
+        FinallyCtx(AST finallyBlock) { this.finallyBlock = finallyBlock; }
+    }
+    /** Active try-with-finally layers, innermost first (push = enter try). */
+    private final Deque<FinallyCtx> finallyStack = new ArrayDeque<>();
 
     private Scope scope;
     private String currentClassName;
@@ -1709,11 +1719,11 @@ public class LLVMGen {
             generateTry((TryStmt) node);
         } else if (node instanceof BreakStmt) {
             if (!loopStack.isEmpty()) {
-                body.append("  br label %").append(loopStack.get(loopStack.size() - 1).breakLabel).append("\n");
+                emitLoopJump(loopStack.get(loopStack.size() - 1).breakLabel);
             }
         } else if (node instanceof ContinueStmt) {
             if (!loopStack.isEmpty()) {
-                body.append("  br label %").append(loopStack.get(loopStack.size() - 1).continueLabel).append("\n");
+                emitLoopJump(loopStack.get(loopStack.size() - 1).continueLabel);
             }
         } else if (node instanceof FreeStmt) {
             generateFree((FreeStmt) node);
@@ -1836,9 +1846,31 @@ public class LLVMGen {
             emitUncaughtError(stmt.line);
             body.append("throw.dead.").append(labelCount++).append(":\n");
         } else {
-            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+            // Throw from a CATCH clause: inline every enclosing finally before propagating
+            // outward (debug.md #21). A throw inside the try BODY keeps the normal handler
+            // path — the shared finally runs at `after` and needs no inlining.
+            boolean swallowed = false;
+            if (!finallyStack.isEmpty() && !finallyStack.peek().inTryBody) {
+                swallowed = inlineFinallyLayers();
+            }
+            if (!swallowed) {
+                body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+            }
             // Statements after throw are dead code but must still form a valid LLVM block.
             body.append("throw.dead.").append(labelCount++).append(":\n");
+        }
+    }
+
+    /** Jump out of a loop: inline enclosing finally layers first (debug.md #20), then branch.
+     *  Opens a dead label when a finally was involved so following statements stay valid. */
+    private void emitLoopJump(String target) {
+        boolean hadFinally = !finallyStack.isEmpty();
+        boolean swallowed = inlineFinallyLayers();
+        if (!swallowed) {
+            body.append("  br label %").append(target).append("\n");
+        }
+        if (hadFinally) {
+            body.append("jexit.dead.").append(labelCount++).append(":\n");
         }
     }
 
@@ -1922,9 +1954,12 @@ public class LLVMGen {
         }
 
         exceptionHandlers.push(handler);
+        FinallyCtx fctx = hasFinally ? new FinallyCtx(stmt.finallyBlock) : null;
+        if (fctx != null) finallyStack.push(fctx);
         int tryStart = body.length();
         generateStmt(stmt.tryBlock);
         exceptionHandlers.pop();
+        if (fctx != null) fctx.inTryBody = false; // catch phase: throws here must inline finally
         if (needPending && !tailTerminated(tryStart)) {
             body.append("  store i32 0, i32* ").append(pending).append("\n");
         }
@@ -1953,6 +1988,9 @@ public class LLVMGen {
             body.append("  br label %").append(after).append("\n");
         }
         body.append(after).append(":\n");
+        // The shared finally block runs without this layer on the stack: a return or throw
+        // inside finally must only chain to the OUTER layers (Java semantics).
+        if (fctx != null) finallyStack.remove(fctx);
         if (hasFinally) generateStmt(stmt.finallyBlock);
 
         if (needPending) {
@@ -1981,6 +2019,32 @@ public class LLVMGen {
             }
             body.append(continueLabel).append(":\n");
         }
+    }
+
+    /** Emit every active layer's finally body (innermost first) ahead of a control jump that
+     *  leaves the try (return / break / continue / catch-throw). Each layer generates with only
+     *  the OUTER layers active, so a return inside one finally chains outward correctly.
+     *  Returns true when a layer swallowed the jump (finally returned/threw) — the caller must
+     *  then NOT emit its own jump. Callers must open a fresh dead label when the stack was
+     *  non-empty so following statements form a valid block. */
+    private boolean inlineFinallyLayers() {
+        if (finallyStack.isEmpty()) return false;
+        List<FinallyCtx> layers = new ArrayList<>(finallyStack);
+        finallyStack.clear();
+        boolean dead = false;
+        for (int i = 0; i < layers.size(); i++) {
+            finallyStack.addAll(layers.subList(i + 1, layers.size()));
+            if (dead || tailTerminated(body.length())) {
+                body.append("fin.dead.").append(labelCount++).append(":\n");
+                dead = true;
+            }
+            int segStart = body.length();
+            generateStmt(layers.get(i).finallyBlock);
+            if (tailTerminated(segStart)) dead = true;
+            finallyStack.clear();
+        }
+        finallyStack.addAll(layers);
+        return dead;
     }
 
     /** True when the text generated since offset already ends with a terminator instruction. */
@@ -2793,18 +2857,33 @@ public class LLVMGen {
                 }
             }
 
+            // Inline enclosing finally layers AFTER the value is computed (Java evaluates the
+            // return expression first) and BEFORE the jump (debug.md #13).
+            boolean hadFinally = !finallyStack.isEmpty();
+            if (inlineFinallyLayers()) {
+                // finally returned/threw: the return itself is swallowed
+                if (hadFinally) body.append("jexit.dead.").append(labelCount++).append(":\n");
+                return;
+            }
             emitGcFramePop();
             String castedRet = castValue(val, toLLVMType(retType));
             body.append("  ret ").append(toLLVMType(retType)).append(" ")
                  .append(castedRet).append("\n");
+            if (hadFinally) body.append("jexit.dead.").append(labelCount++).append(":\n");
         } else {
             // return; with no value 鈥?only valid for void functions
             if (!retType.equals("void")) {
                 throw new RuntimeException(
                     "Function must return a value of type '" + retType + "' (at line " + stmt.line + ")");
             }
+            boolean hadFinally = !finallyStack.isEmpty();
+            if (inlineFinallyLayers()) {
+                if (hadFinally) body.append("jexit.dead.").append(labelCount++).append(":\n");
+                return;
+            }
             emitGcFramePop();
             body.append("  ret void\n");
+            if (hadFinally) body.append("jexit.dead.").append(labelCount++).append(":\n");
         }
     }
 
