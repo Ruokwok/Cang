@@ -582,6 +582,22 @@ public class LLVMGen {
     }
 
     private void rewriteAstTypes(AST node, String parameter, String concrete) {
+        // debug.md #40: `T v = null` specialized to a value type must get a zero literal —
+        // a NullLit default would emit `store i8* null, i32* ...` and fail at clang.
+        // Checked BEFORE the type string rewrite below (p.type is still the parameter here).
+        if (node instanceof Parameter) {
+            Parameter p = (Parameter) node;
+            if (p.defaultValue instanceof NullLit && parameter.equals(p.type)) {
+                if (concrete.equals("bool")) {
+                    p.defaultValue = new BoolLit(false, p.line);
+                } else if (concrete.equals("int") || concrete.equals("byte") || concrete.equals("long")
+                        || concrete.equals("float") || concrete.equals("double")) {
+                    // castValue widens/narrows i32 -> any numeric LLVM type at the call site.
+                    p.defaultValue = new IntLit("0", p.line);
+                }
+                // Reference concretes (String / classes / arrays / Function) keep null.
+            }
+        }
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
             try {
                 Object v = f.get(node);

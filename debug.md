@@ -250,12 +250,9 @@
 - 修复：`isSameOrParentClass` 入口把 currentClass 经 `classes` 表归一化为 simpleName 再比较/走父链（单点修复，方法与字段两处私有检查同时覆盖）。
 - 验证：`t_arraylist` 的 `_grow` 私有调用 ✓；回归 35/35。
 
-### 40. 🟡 泛型参数默认值 `null` 不随具体类型适配 —— 待修
-- 现象：`class Box<T>(T v = null)` 实例化 `Box<int>` → 默认值 NullLit 原样生成 → IR `store i8* null, i32* ...` → clang `null must be a pointer type` 编译失败（在 clang 层报错而非编译器友好提示）。引用类型 T（String/类）默认 null 正常；值类型（int 等）必炸。
-- 根因：单态化 `rewriteAstTypes` 只改类型字符串，不改默认值 AST；`generateNew` 缺参路径直接 `generateExpr(defaultVal)`。
-- 修复指引（择一）：① `rewriteAstTypes` 遇到值类型 concrete 且 default 为 NullLit 时替换为对应零值字面量（IntLit 0 / false / 0.0）；② `generateNew` 缺参路径检测 `NullLit` + 目标为非引用 llvmType → 发零值。推荐 ①（一次改在单态化处）。
-- 影响面：仅"值类型 T + null 默认值"组合；`T[] data = null`（数组恒为引用）与无默认值参数不受影响。ArrayList 已用 `new T[10]` 规避。
-- 附注：跨函数 `throw` 不进入调用方 `catch`（实测未捕获→报错退出）已由第九节"异常只支持同函数 handler"覆盖，不另立条目。
+### 40. ✅ 泛型参数默认值 `null` 不随具体类型适配 —— 已修复（单态化处换零值）
+- 修复：`rewriteAstTypes` 遍历到 Parameter 时，若 defaultValue 为 NullLit 且 type==被替换参数名，按 concrete 换零值——bool→`BoolLit(false)`，int/byte/long/float/double→`IntLit("0")`（调用点 castValue 统一转目标类型），引用 concrete（String/类/数组/Function）保持 null。检查在类型字符串替换**之前**（此时 p.type 仍是 T）。
+- 实测 t_generic_null：`0|0|0|0.000000|0|null|5`（五值类型零值 + String null + 显式参）；回归 66/66。
 
 ### 41. ✅ List 内建 `%CangList` → 纯 Cang 实现迁移（用户定名，参考 ArrayList）—— 已完成
 - 决策：`List` 正名回归 `cang/lang/List`（替换原 native 壳文件），实现存储/扩容参考 java.util.ArrayList；内建分派与纯 Cang 实现同名无法共存，故**移除内建**。
@@ -293,6 +290,6 @@
 6. ~~14–16 短路求值 + 重复求值~~ ✅（短路 phi / 三元分支+phi / objCache+iterable 复用，见第 14/15/16 条）
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
 8. ~~13/20/21~~ ✅（finally 五出口统一——finallyStack + inlineFinallyLayers 内联 + jexit.dead 死块，见第 13/20/21 条）
-9. ~~36~~ ✅ → ~~26/27~~ ✅（26 词法吞文件/行号、27 报错质量，均见各条）→ 40（泛型 null 默认值）
+9. ~~36~~ ✅ → ~~26/27~~ ✅ → ~~40~~ ✅（见第 40 条）
 10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理
