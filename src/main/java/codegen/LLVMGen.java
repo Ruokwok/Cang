@@ -2201,6 +2201,19 @@ public class LLVMGen {
      * spawn it via the regular Thread.spawn path (GC-aware), store the handle globally,
      * and join all such threads just before program exit so their output is never lost.
      */
+    private LLVMValue generateThreadBlockExpr(ThreadBlockExpr node) {
+        // Sugar: new Thread(false).task(() -> { body }).start()
+        // Each evaluation creates a fresh object/handle registered for the main-exit join
+        // sweep, so loops are fine (the old single-global-handle mechanism was not).
+        AST falseFlag = new BoolLit(false, node.line);
+        NewExpr thrNew = new NewExpr("Thread", java.util.Collections.singletonList(falseFlag), node.line);
+        LambdaExpr lam = new LambdaExpr(new ArrayList<>(), node.body, "void", node.line);
+        MethodCallExpr taskCall = new MethodCallExpr(thrNew, "task",
+            java.util.Collections.singletonList(lam), node.line);
+        MethodCallExpr startCall = new MethodCallExpr(taskCall, "start", new ArrayList<>(), node.line);
+        return generateExpr(startCall);
+    }
+
     private void generateThreadBlock(ThreadBlockStmt stmt) {
         if (!loopStack.isEmpty()) {
             throw new RuntimeException("thread block inside loops is not supported yet (at line " + stmt.line + ")");
@@ -3182,6 +3195,9 @@ public class LLVMGen {
         }
         if (node instanceof LambdaExpr) {
             return generateLambda((LambdaExpr) node);
+        }
+        if (node instanceof ThreadBlockExpr) {
+            return generateThreadBlockExpr((ThreadBlockExpr) node);
         }
         if (node instanceof BinaryExpr) {
             return generateBinary((BinaryExpr) node);
@@ -5660,8 +5676,10 @@ public class LLVMGen {
         x.append("  %code = load i8*, i8** %cf\n");
         x.append("  %rf = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 1\n");
         x.append("  %recv = load i8*, i8** %rf\n");
-        x.append("  %fp = bitcast i8* %code to void (i8*, i8*)*\n");
-        x.append("  call void %fp(i8* %code, i8* %recv)\n");
+        // Function ABI: the callee is bitcast from `code`; the ONLY argument is the receiver
+        // (same as generateIndirectCall). Task is Function<void> = void (i8* env).
+        x.append("  %fp = bitcast i8* %code to void (i8*)*\n");
+        x.append("  call void %fp(i8* %recv)\n");
         if (registerWithGc) {
             x.append("  %gc.sbres3.").append(id).append(" = call i32 @GC_unregister_my_thread(i8* ").append(sb8).append(")\n");
         }

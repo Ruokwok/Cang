@@ -219,6 +219,13 @@ public abstract class AST {
         public ThreadBlockStmt(AST body, int line) { super(line); this.body = body; }
     }
 
+    /** thread { ... } as an expression — sugar for
+     *  new Thread(false).task(() -> { ... }).start() (returns the handle). */
+    public static class ThreadBlockExpr extends AST {
+        public AST body;
+        public ThreadBlockExpr(AST body, int line) { super(line); this.body = body; }
+    }
+
     public static class IfStmt extends AST {
         public AST condition;
         public AST thenBlock;

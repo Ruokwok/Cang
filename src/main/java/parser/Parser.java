@@ -653,7 +653,9 @@ public class Parser {
     private AST parseThreadBlockStmt() {
         int line = advance().line; // 'thread'
         AST body = parseBlock();
-        return new ThreadBlockStmt(body, line);
+        // thread { } is sugar for new Thread(false).task(() -> { ... }).start() — parse as an
+        // expression statement so `var th = thread { ... }` captures the handle too.
+        return new ExprStmt(new ThreadBlockExpr(body, line), line);
     }
 
     private AST parseVarDecl() {
@@ -997,6 +999,13 @@ public class Parser {
         // Lambda: (p1, p2, ...) -> [returnType] { body }  (0..N parameters)
         // Recognized by scanning to the matching ')' and checking for '->' so that ordinary
         // parenthesized expressions like (a, b) are not misparsed.
+        // thread { ... } in expression position: `var th = thread { ... }`
+        if (check(TokenType.THREAD)) {
+            int thLine = advance().line;
+            AST body = parseBlock();
+            return new ThreadBlockExpr(body, thLine);
+        }
+
         if (check(TokenType.LPAREN) && looksLikeLambda()) {
             advance(); // (
             List<String> parameters = new ArrayList<>();

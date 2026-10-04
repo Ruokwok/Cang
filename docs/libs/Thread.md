@@ -3,7 +3,7 @@
 > 返回 [文档索引](../README.md)
 
 ## 要点
-- 对象式 new Thread([daemon]).task(fn).start() + join；非守护默认退出前等待，new Thread(true) 为守护不等；thread { } 同非守护语义
+- 对象式 new Thread([daemon]).task(fn).start() + join；thread { } 是其语法糖（= new Thread(false).task(...).start()，可捕获、可 `var th =` 拿句柄）；非守护退出前等待，new Thread(true) 守护不等
 - **Thread.spawn 已移除**（编译期报错并提示迁移）；对象式任务为 void 无参，fn 收方法引用/顶层函数/无参 lambda
 - 仅值类型跨线程（对象式任务的 receiver 除外）；与 Boehm GC 兼容（GC_CreateThread）
 
@@ -34,27 +34,26 @@ Linux/macOS 已验证 LLVM IR 与目标文件编译，实际链接运行需对�
 
 ### thread { } 语法糖
 
-用于创建无需返回值的线程，可写在方法体或顶层代码中：
+`thread { ... }` 等价于对象式写法（**非守护** + 无参 lambda 任务），可作为语句，也可以
+赋值给变量拿到句柄：
 
 ```cang
-class Main()
+thread { Stdout.println("fire and forget") }   # 语句形态（退出前等待完成）
 
-Stdout.println("before")
-
-thread {
-    Stdout.println("in thread")
+int x = 41
+var th = thread {                              # = new Thread(false).task(() -> { ... }).start()
+    Stdout.println(x + 1)                      # 可以读取外部变量（按值捕获，与 lambda 相同）
 }
-
-Stdout.println("main continues")
+th.join()                                      # 需要时显式等待
 ```
 
 语义：
 
-- 块被编译成一个独立的无参 `void` 函数并作为线程启动（继承对象式的 GC 语义与跨平台路径）；
-- 当前线程不等待，继续执行后面的语句；
-- 程序返回前会自动 join 所有 `thread { }` 创建的线程，保证块内输出不会因进程退出而丢失；
-- **不允许捕获外部变量或 `this`**（报 `Thread block cannot capture ...`；与 lambda 不同，线程块保持无捕获）；
-- 暂不支持写在循环体内（编译期报错）。
+- **完全等价** `var th = new Thread(false).task(() -> { ... }).start()`——非守护句柄登记，
+  程序返回前统一 join 等待完成（与旧行为一致，输出不丢）；
+- **可以读取外部变量与 `this`**（按值捕获，创建时快照——不再有"无捕获"限制）；
+- 语句形态丢弃句柄；`var th = thread { ... }` 保留句柄，可 `th.join()`；
+- **循环内可用**：每次迭代创建全新的线程对象与句柄（各自登记，退出前全部 join）；循环变量在创建时**按值快照**（`for` 里 `i` 的每次迭代值独立）；
 
 ### new Thread().task(fn).start() 对象式写法
 
@@ -86,7 +85,7 @@ t.join()
 - `.start()` 在新线程执行任务，返回 `Thread<void>` 句柄，可继续 `.join()` 等待完成；未 `task` 就 `start`、或对同一对象重复 `start`，运行时报错（`Thread has no task` / `Thread already started`）；
 - `.join()` 等待任务结束（`void` 无返回值）；对未启动的对象调用 `join` 运行时报错；
 - **守护线程决定退出行为**：非守护（默认）的句柄会登记，**程序退出前统一 join 等待完成**（与 `thread { }` 一致）；`new Thread(true)` 声明守护线程，退出**不等待**（可能被截断，输出不保证）；手动 `t.join()` 过的句柄收尾自动跳过（不会重复 join）；
-- 与 `thread { }` 的无捕获限制不同：任务可以携带 `this`/对象 receiver（`this::run` 即绑定当前实例），跨线程共享状态的数据竞争由程序自己保证（与 Java 相同）；
+- 对象式与 `thread { }` 共享同一套语义（非守护登记收尾、按值捕获）；跨线程共享状态的数据竞争由程序自己保证（与 Java 相同）；
 - `thread { }` 写法不受影响，继续作为 void 任务的语法糖（程序退出前自动 join）。
 
 > 文档基于当前编译器实现。高级功能仍在开发中，已知限制见 [编译与当前限制](../17-编译与当前限制.md)。
