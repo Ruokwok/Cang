@@ -195,7 +195,7 @@
 - ③**Lexer `&`/`|` 列号 +1**：advance 后 error 用当前列 → 新增 `errorAt(startLine, startCol, msg)` 用 token 起始列。实测 `int x = 1 & 2` 报 **2:11**（原 2:12）。
 - 回归 65/65（全部错误例渲染零变化）。
 
-### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1
+### 28. ✅ CLI —— 已修复（usage + 友好错误全路径）①无参/首参为 flag → usage + exit 1；②所有带值选项（--target/--arch/--clang/--gcc/--gc-lib）经 requireValue 缺值报 `requires a value` 而非裸栈；③未知 flag 报 `unknown option`；④未知 target 值报 `unknown target ... expected windows|linux|macos`（原裸 exit 1）；⑤printUsage 列出全部选项。五错误场景+正向手验全过（错误类不入 harness），回归 87/87
 
 ### 29. ✅ `Thread.spawn` 无 join 兜底 —— 随 spawn 移除而关闭（对象式需显式 join，thread{} 有自动 join 收尾） —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）
 

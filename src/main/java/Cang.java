@@ -20,6 +20,12 @@ public class Cang {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         if (args.length < 1) {
+            printUsage();
+            System.exit(1);
+        }
+        if (args[0].startsWith("-")) {
+            System.err.println("error: missing source file (first argument must be a .cang file)");
+            printUsage();
             System.exit(1);
         }
 
@@ -35,13 +41,17 @@ public class Cang {
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--no-link": noLink = true; break;
-                case "--target": target = args[++i].toLowerCase(); break;
-                case "--arch": architecture = args[++i].toLowerCase(); break;
-                case "--clang": clangPath = args[++i]; break;
-                case "--gcc": gccPath = args[++i]; break;
+                case "--target": target = requireValue(args, ++i, "--target", "windows|linux|macos").toLowerCase(); break;
+                case "--arch": architecture = requireValue(args, ++i, "--arch", "amd64|...").toLowerCase(); break;
+                case "--clang": clangPath = requireValue(args, ++i, "--clang", "<path>"); break;
+                case "--gcc": gccPath = requireValue(args, ++i, "--gcc", "<path>"); break;
                 case "--gc": gc = true; break;
                 case "--no-gc": gc = false; break;
-                case "--gc-lib": gcLibDir = args[++i]; break;
+                case "--gc-lib": gcLibDir = requireValue(args, ++i, "--gc-lib", "<dir>"); break;
+                default:
+                    System.err.println("error: unknown option '" + args[i] + "'");
+                    printUsage();
+                    System.exit(1);
             }
         }
 
@@ -73,8 +83,31 @@ public class Cang {
             case "linux":   compileLinux(llFile, baseName, gc, gcLibDir); break;
             case "macos":   compileMacOS(llFile, baseName, gc, gcLibDir); break;
             default:
+                System.err.println("error: unknown target '" + target + "'; expected windows|linux|macos");
+                printUsage();
                 System.exit(1);
         }
+    }
+
+    /** Option value accessor: missing value is a usage error, not an ArrayIndexOutOfBounds. */
+    private static String requireValue(String[] args, int idx, String opt, String expected) {
+        if (idx >= args.length) {
+            System.err.println("error: " + opt + " requires a value (" + expected + ")");
+            printUsage();
+            System.exit(1);
+        }
+        return args[idx];
+    }
+
+    private static void printUsage() {
+        System.err.println("Usage: Cang <source.cang> [options]");
+        System.err.println("  --no-link          compile to .ll only (skip clang/gcc)");
+        System.err.println("  --target <t>       windows | linux | macos   (default: windows)");
+        System.err.println("  --arch <a>         target architecture         (default: amd64)");
+        System.err.println("  --clang <path>     clang executable");
+        System.err.println("  --gcc <path>       gcc executable");
+        System.err.println("  --gc / --no-gc     Boehm GC on (default) / manual malloc-free");
+        System.err.println("  --gc-lib <dir>     override libgc lookup directory");
     }
 
     private static String compile(String filename, String code, boolean noLink, String target, String architecture, boolean gc) throws IOException {
