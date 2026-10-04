@@ -1438,9 +1438,28 @@ public class LLVMGen {
                       .append(sl.value.length() + 1).append(" x i8]* ")
                       .append(strName).append(", i32 0, i32 0)\n");
             } else {
-                // Numeric/bool literal or default
-                String defaultVal = defaultValueForType(f.type);
-                header.append(globalName).append(" = global ").append(llvmType).append(" ").append(defaultVal).append("\n");
+                // Constant literal init (static int n = 7, slot = null, ...) — emitted directly
+                // into the global initializer. Non-constant expressions fall back to default
+                // (static fields are constant-initialized only, documented).
+                String initVal = defaultValueForType(f.type);
+                AST init = f.init;
+                if (init instanceof IntLit) {
+                    initVal = ((IntLit) init).text;
+                } else if (init instanceof LongLit) {
+                    initVal = ((LongLit) init).text;
+                } else if (init instanceof FloatLit) {
+                    initVal = normalizeFloatText(((FloatLit) init).text, false);
+                } else if (init instanceof DoubleLit) {
+                    initVal = normalizeFloatText(((DoubleLit) init).text, true);
+                } else if (init instanceof BoolLit) {
+                    initVal = ((BoolLit) init).value ? "1" : "0";
+                } else if (init instanceof NullLit) {
+                    initVal = "null";
+                } else if (init instanceof UnaryExpr && ((UnaryExpr) init).op.equals("-")
+                        && ((UnaryExpr) init).operand instanceof IntLit) {
+                    initVal = "-" + ((IntLit) ((UnaryExpr) init).operand).text;
+                }
+                header.append(globalName).append(" = global ").append(llvmType).append(" ").append(initVal).append("\n");
             }
         }
         header.append("\n");
@@ -4397,6 +4416,47 @@ public class LLVMGen {
             throw new RuntimeException("Only == and != are supported for str/String (at line " + line + ")");
         }
 
+        // Reference == null / != null (pointer identity) — the singleton/optional idiom:
+        // `if (instance == null)` must work for class objects, not just String (debug: the
+        // null literal is i8* and previously fell into the String-vs-object rejection).
+        boolean leftNull = left.value.equals("null");
+        boolean rightNull = right.value.equals("null");
+        if ((leftNull || rightNull) && !op.equals("==") && !op.equals("!=")) {
+            throw new RuntimeException("null can only be compared with == or != (at line " + line + ")");
+        }
+        if (leftNull || rightNull) {
+            LLVMValue ptrSide = leftNull ? right : left;
+            LLVMValue otherSide = leftNull ? left : right;
+            if (ptrSide.type.endsWith("*")) {
+                String ptype = ptrSide.type;
+                String cmp = "%nullcmp." + tmpCount++;
+                body.append("  ").append(cmp).append(" = icmp ").append(op.equals("==") ? "eq" : "ne")
+                     .append(" ").append(ptype).append(" ").append(ptrSide.value)
+                     .append(", ").append(otherSide.value).append("\n");
+                return new LLVMValue(cmp, "i1");
+            }
+            // non-pointer vs null (e.g. int == null): fall through to the type-mismatch error
+        }
+
+        // Reference vs reference: identity comparison (a == b, singleton checks). Both sides
+        // bitcast to i8* so differing class pointer types still compare as addresses.
+        if (left.type.endsWith("*") && right.type.endsWith("*")
+                && !left.type.equals("i8*") && !right.type.equals("i8*")) {
+            if (!op.equals("==") && !op.equals("!=")) {
+                throw new RuntimeException("Objects only support == and != (at line " + line + ")");
+            }
+            String lb = "%objcmp.l." + tmpCount++;
+            String rb = "%objcmp.r." + tmpCount++;
+            body.append("  ").append(lb).append(" = bitcast ").append(left.type).append(" ")
+                 .append(left.value).append(" to i8*\n");
+            body.append("  ").append(rb).append(" = bitcast ").append(right.type).append(" ")
+                 .append(right.value).append(" to i8*\n");
+            String cmp = "%objcmp." + tmpCount++;
+            body.append("  ").append(cmp).append(" = icmp ").append(op.equals("==") ? "eq" : "ne")
+                 .append(" i8* ").append(lb).append(", ").append(rb).append("\n");
+            return new LLVMValue(cmp, "i1");
+        }
+
         // Type mismatch check: string vs non-string
         boolean leftIsString = left.type.equals("i8*");
         boolean rightIsString = right.type.equals("i8*");
@@ -4639,7 +4699,24 @@ public class LLVMGen {
                 throw new RuntimeException("Cannot assign to final variable '" + id.name + "' (at line " + node.line + ")");
             }
             LLVMValue ptr = scope.lookup(id.name);
-            if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
+            if (ptr == null) {
+                // Static field write of the current class by bare name (Java-style), e.g. the
+                // singleton `instance = new Db()` inside its own static method.
+                FieldDecl sf = findCurrentStaticField(id.name);
+                if (sf != null && currentClassName != null) {
+                    String gname = "@static." + currentClassName + "_" + sf.name;
+                    String llvmT = toLLVMType(sf.type);
+                    if (!assignableTo(llvmT, val)) {
+                        throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
+                            + " to " + cangTypeFromLLVMFull(llvmT) + " (at line " + node.line + ")");
+                    }
+                    String casted = castValue(val, llvmT);
+                    body.append("  store ").append(llvmT).append(" ").append(casted)
+                         .append(", ").append(llvmT).append("* ").append(gname).append("\n");
+                    return new LLVMValue(casted, llvmT);
+                }
+                throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
+            }
             if (!assignableTo(ptr.type, val)) {
                 throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
                     + " to " + cangTypeFromLLVMFull(ptr.type) + " (at line " + node.line + ")");
@@ -6124,8 +6201,10 @@ public class LLVMGen {
             // garbage / out-of-bounds, debug.md #31); they print as <ClassName@addr>.
             boolean isObj = argVal.type.startsWith("%");
 
-            // Check if pointer is null
-            String isNull = "%isnull." + tmpCount++;
+            // Check if pointer is null. NOTE: name must NOT collide with the `isnull.N`
+            // LABELS used by deref checks — LLVM values and labels share one namespace
+            // (tmpCount/labelCount both hitting N made br label %isnull.N resolve to this value).
+            String isNull = "%pnull." + tmpCount++;
             body.append("  ").append(isNull).append(" = icmp eq i8* ").append(argVal.value).append(", null\n");
             body.append("  br i1 ").append(isNull).append(", label %print.null.").append(id)
                  .append(", label %").append(notNullLabel).append("\n\n");
@@ -6271,6 +6350,17 @@ public class LLVMGen {
         return new LLVMValue(ptr, "i8*");
     }
 
+    /** Static field of the CURRENT class by bare name (class-internal `instance` etc.), or null. */
+    private FieldDecl findCurrentStaticField(String name) {
+        if (currentClassName == null) return null;
+        ClassInfo ci = classes.get(currentClassName);
+        if (ci == null) return null;
+        for (FieldDecl f : ci.staticFields) {
+            if (f.name.equals(name)) return f;
+        }
+        return null;
+    }
+
     private LLVMValue generateFieldAccess(FieldAccessExpr node) {
         // Handle System built-in fields
         if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("System")) {
@@ -6283,6 +6373,22 @@ public class LLVMGen {
         if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("File")
                 && node.field.equals("separator") && classes.containsKey("cang_io_File")) {
             return makeStringConstant(targetPlatform.equals("windows") ? "\\" : "/");
+        }
+        // User-class static field: Counter.n / Box.slot (ClassName.staticField read)
+        if (node.object instanceof Identifier) {
+            ClassInfo ownerCi = classes.get(((Identifier) node.object).name);
+            if (ownerCi != null) {
+                for (FieldDecl sf : ownerCi.staticFields) {
+                    if (sf.name.equals(node.field)) {
+                        String gname = "@static." + ownerCi.fullName + "_" + sf.name;
+                        String llvmType = toLLVMType(sf.type);
+                        String loaded = "%staticf." + tmpCount++;
+                        body.append("  ").append(loaded).append(" = load ").append(llvmType)
+                             .append(", ").append(llvmType).append("* ").append(gname).append("\n");
+                        return new LLVMValue(loaded, llvmType);
+                    }
+                }
+            }
         }
 
         LLVMValue objPtr = generateExprForPtr(node.object);
