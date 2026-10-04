@@ -60,14 +60,11 @@ public abstract class AST {
     }
 
     public static class LambdaExpr extends AST {
-        public String parameter;
+        public List<String> parameters; // may be empty: () -> { ... }
         public AST body;
         public String returnType; // null = omitted; inferred from the expected Function type
-        public LambdaExpr(String parameter, AST body, int line) {
-            this(parameter, body, null, line);
-        }
-        public LambdaExpr(String parameter, AST body, String returnType, int line) {
-            super(line); this.parameter = parameter; this.body = body; this.returnType = returnType;
+        public LambdaExpr(List<String> parameters, AST body, String returnType, int line) {
+            super(line); this.parameters = parameters; this.body = body; this.returnType = returnType;
         }
     }
 

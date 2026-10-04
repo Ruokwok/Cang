@@ -3190,9 +3190,10 @@ public class LLVMGen {
             throw new RuntimeException(hint + " (at line " + node.line + ")");
         }
         String[] parts = functionTypeParts(expected);
-        if (parts.length != 2) {
-            throw new RuntimeException("Lambda must match Function<R, T> with exactly one parameter: expected "
-                + expected + " (at line " + node.line + ")");
+        int nParams = node.parameters.size();
+        if (parts.length != nParams + 1) {
+            throw new RuntimeException("Lambda has " + nParams + " parameter(s) but expected "
+                + expected + " (" + (parts.length - 1) + " expected) (at line " + node.line + ")");
         }
         // Return type: explicit annotation must match the expectation; omitted inherits it.
         String expRetRaw = parts[0];
@@ -3213,13 +3214,20 @@ public class LLVMGen {
         List<LLVMValue> captureVals = new ArrayList<>();
         for (String capName : captures) captureVals.add(scope.lookup(capName));
 
-        String paramCang = parts[1];
-        String paramLLVM = toLLVMType(paramCang);
-        String retLLVM = toLLVMType(retCang);
+        String[] paramCangs = new String[nParams];
+        String[] paramLLVMs = new String[nParams];
+        StringBuilder paramList = new StringBuilder();
+        for (int i = 0; i < nParams; i++) {
+            paramCangs[i] = parts[i + 1];
+            paramLLVMs[i] = toLLVMType(paramCangs[i]);
+            if (i > 0) paramList.append(", ");
+            paramList.append(paramLLVMs[i]);
+        }
         int lambdaId = lambdaCount++;
         String fnName = "@cang.lambda." + lambdaId;
         String envType = "%cang.env." + lambdaId;
-        String codeType = retLLVM + " (i8*, " + paramLLVM + ")*";
+        String retLLVM = toLLVMType(retCang);
+        String codeType = retLLVM + " (i8*" + (nParams > 0 ? ", " + paramList : "") + ")*";
 
         Scope savedScope = scope;
         String savedReturn = currentFuncReturnType;
@@ -3232,15 +3240,23 @@ public class LLVMGen {
         currentFuncReturnType = retCang;
 
         int pid = tmpCount++;
-        String argName = "%lparg." + pid;
-        String allocaName = "%lp." + pid;
         int start = body.length();
-        body.append("define ").append(retLLVM).append(" ").append(fnName).append("(i8* %env, ")
-             .append(paramLLVM).append(" ").append(argName).append(") {\nentry:\n");
-        body.append("  ").append(allocaName).append(" = alloca ").append(paramLLVM).append("\n");
-        body.append("  store ").append(paramLLVM).append(" ").append(argName)
-             .append(", ").append(paramLLVM).append("* ").append(allocaName).append("\n");
-        scope.define(node.parameter, new LLVMValue(allocaName, paramLLVM, paramCang));
+        StringBuilder def = new StringBuilder();
+        def.append("define ").append(retLLVM).append(" ").append(fnName).append("(i8* %env");
+        String[] argNames = new String[nParams];
+        for (int i = 0; i < nParams; i++) {
+            argNames[i] = "%lparg." + pid + "." + i;
+            def.append(", ").append(paramLLVMs[i]).append(" ").append(argNames[i]);
+        }
+        def.append(") {\nentry:\n");
+        body.append(def);
+        for (int i = 0; i < nParams; i++) {
+            String allocaName = "%lp." + pid + "." + i;
+            body.append("  ").append(allocaName).append(" = alloca ").append(paramLLVMs[i]).append("\n");
+            body.append("  store ").append(paramLLVMs[i]).append(" ").append(argNames[i])
+                 .append(", ").append(paramLLVMs[i]).append("* ").append(allocaName).append("\n");
+            scope.define(node.parameters.get(i), new LLVMValue(allocaName, paramLLVMs[i], paramCangs[i]));
+        }
 
         // Unpack env slots into lambda-local scope entries. Shape-compatible with regular
         // declarations (alloca + value type) so generateIdentifier works unchanged; `this`
@@ -3354,7 +3370,7 @@ public class LLVMGen {
         if (node == null) return;
         if (node instanceof LambdaExpr) {
             java.util.Set<String> inner = new java.util.HashSet<>(bound);
-            inner.add(((LambdaExpr) node).parameter);
+            inner.addAll(((LambdaExpr) node).parameters);
             validateLambdaCapture(((LambdaExpr) node).body, inner, line, context);
             return;
         }
@@ -3393,7 +3409,7 @@ public class LLVMGen {
     private List<String> collectLambdaCaptures(LambdaExpr node) {
         java.util.Set<String> declared = new java.util.LinkedHashSet<>();
         collectDeclaredNames(node.body, declared);
-        declared.add(node.parameter);
+        declared.addAll(node.parameters);
         List<String> refs = new ArrayList<>();
         collectFreeRefs(node.body, declared, refs);
         List<String> caps = new ArrayList<>();
@@ -3411,7 +3427,7 @@ public class LLVMGen {
         if (node == null) return;
         if (node instanceof VarDecl) out.add(((VarDecl) node).name);
         else if (node instanceof ForEachStmt) out.add(((ForEachStmt) node).varName);
-        else if (node instanceof LambdaExpr) out.add(((LambdaExpr) node).parameter);
+        else if (node instanceof LambdaExpr) out.addAll(((LambdaExpr) node).parameters);
         else if (node instanceof CatchClause) out.add(((CatchClause) node).name);
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
             try {

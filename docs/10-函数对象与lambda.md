@@ -64,7 +64,7 @@ call((i) -> void {
 })
 ```
 
-- 一个参数；
+- **任意个参数（0..N）**：``(x, y) -> { ... }``、``() -> { ... }``；同名参数编译报错（``Duplicate lambda parameter``）；参数个数必须与期望的 ``Function<R, P1..PN>`` 一致；
 - **返回类型可写任意类型，也可省略**：`(i) -> { ... }` 从期望的 `Function<...>` 推导；`(i) -> int { ... }` 显式，须与期望一致；
 - **需要推导时必须写返回类型**：lambda 不在已知 `Function<...>` 上下文（如 `var f = (x) -> ...`）时编译报错并提示显式写出——参数类型同样来自期望类型；
 - 非 `void` 返回的 lambda，每个路径都必须 `return`（否则 `must return a value of type ... on every path`）；

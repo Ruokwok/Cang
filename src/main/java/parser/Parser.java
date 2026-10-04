@@ -121,6 +121,21 @@ public class Parser {
 
     // ==================== Top Level ====================
 
+    /** True when '(' starts a lambda parameter list ending in ')' followed by '->'. */
+    private boolean looksLikeLambda() {
+        if (!check(TokenType.LPAREN)) return false;
+        int i = 1;
+        if (peek(i).type == TokenType.RPAREN) return peek(i + 1).type == TokenType.ARROW;
+        if (peek(i).type != TokenType.IDENT) return false;
+        i++;
+        while (peek(i).type == TokenType.COMMA) {
+            i++;
+            if (peek(i).type != TokenType.IDENT) return false;
+            i++;
+        }
+        return peek(i).type == TokenType.RPAREN && peek(i + 1).type == TokenType.ARROW;
+    }
+
     private AST parseTopLevel() {
         // abstract class Shape(...) / abstract func ... — modifier before the keyword
         if (check(TokenType.ABSTRACT)) {
@@ -979,13 +994,26 @@ public class Parser {
             return new ThisExpr(line);
         }
 
-        // Lambda: (p) -> [returnType] { body }
-        // The return type is OPTIONAL: omitted means "infer it from the expected Function<...>"
-        // (generateLambda errors when there is no expectation to infer from).
-        if (check(TokenType.LPAREN) && peek(1).type == TokenType.IDENT &&
-            peek(2).type == TokenType.RPAREN && peek(3).type == TokenType.ARROW) {
-            advance();
-            String parameter = expect(TokenType.IDENT).value;
+        // Lambda: (p1, p2, ...) -> [returnType] { body }  (0..N parameters)
+        // Recognized by scanning to the matching ')' and checking for '->' so that ordinary
+        // parenthesized expressions like (a, b) are not misparsed.
+        if (check(TokenType.LPAREN) && looksLikeLambda()) {
+            advance(); // (
+            List<String> parameters = new ArrayList<>();
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            if (!check(TokenType.RPAREN)) {
+                String p0 = expect(TokenType.IDENT).value;
+                parameters.add(p0);
+                seen.add(p0);
+                while (check(TokenType.COMMA)) {
+                    advance();
+                    String p = expect(TokenType.IDENT).value;
+                    if (!seen.add(p)) {
+                        error("Duplicate lambda parameter '" + p + "'");
+                    }
+                    parameters.add(p);
+                }
+            }
             expect(TokenType.RPAREN);
             expect(TokenType.ARROW);
             String retType = null;
@@ -993,7 +1021,7 @@ public class Parser {
                 retType = parseType();
             }
             AST body = parseBlock();
-            return new LambdaExpr(parameter, body, retType, line);
+            return new LambdaExpr(parameters, body, retType, line);
         }
 
         if (check(TokenType.NEW)) {
