@@ -59,7 +59,7 @@
 - 位置：`generateAssign` 变量分支（约 3189）只 `castValue` 不校验。
 - 修复指引：仿照 `generateVarDecl`（约 1801）的检查：声明类型（scope 里存的 llvmType/cangType）与右值 `semanticType`/llvmType 比对，不兼容抛 `Cannot assign <X> to <Y> (at line N)`。注意 `castValue` 可能隐式拓宽——只拦"收窄/不相关"（i32→i8*、i8*→i32、double→int 等）。
 
-### 8. 🔴 字面量/收窄无范围检查 —— 待修
+### 8. ✅ 字面量/收窄无范围检查 —— 已修复（字面量三件套）
 - 现象：`int y = 9999999999` 编译链接成功，运行得 `1410065407`（静默环绕）；`byte b = 300` → 44（Java 拒）；`int m = doubleVar` 静默 `fptosi`。
 - 位置：`IntLit` codegen（约 2272）无范围检查；`castValue` 浮→整无告警。
 - 修复指引：
@@ -67,6 +67,7 @@
   - `byte b = 300`：在 var-decl/assign 的类型检查里做常量范围校验。
   - double→int：至少警告或报错（Java 是编译错误，`int m = 3.5` 拒；`int m = (int)3.5` 才行——若 Cang 暂无强转语法，可先只拦字面量、放行变量）。
 
+- **修复**：①IntLit 默认按量级选宽（≤i32 用 i32、否则 i64——ar big = 9999999999 不再 wrap 成 1410065407；超 64 位编译报 Integer number too large）；②checkLiteralFits 在 var-decl 与 assign 接线：byte -128..127、int ±2^31、long ±2^63 超范围报 out of range；浮点字面量进整型槽报 Lossy conversion（变量收窄按指引放行）；③hex/bin 同路径。t_range_int/byte/narrow/assign 四负例 + t_range_ok 边界正例（int MIN/MAX、byte 127、负边界）；回归 103/103。
 ### 9. ✅ str/String 检查绕过 —— 已修复
 - 修复：① 三处调用返回点统一经 `callResultCarriesSemantic` 附 semanticType（String/str/Array/Function——String 方法返回终于带上类型，`str s = String方法` 与 `String s = str方法` 报错，与字面量标准对齐）；② `assignableTo` 兜住 LLVM 类型级错配（`str t = 5` → `Cannot assign int to str`，此前直出非法 IR）。存量测试无 `str` 变量声明，零回归。
 - 原现象：

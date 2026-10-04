@@ -2487,6 +2487,50 @@ public class LLVMGen {
         }
     }
 
+    /** Constant range / narrowing check for a literal assigned to a typed slot (debug.md #8).
+     *  Variable RHS stays unchecked for now (per item guidance: literals first). */
+    private void checkLiteralFits(AST init, String cangTarget, int line) {
+        if (init == null || cangTarget == null) return;
+        boolean intTarget = cangTarget.equals("int") || cangTarget.equals("byte") || cangTarget.equals("long");
+        // Floating literal into an integer slot: Java-style lossy conversion error.
+        if ((init instanceof DoubleLit || init instanceof FloatLit) && intTarget) {
+            throw new RuntimeException("Lossy conversion: cannot assign literal to '" + cangTarget
+                + "' without an explicit conversion (at line " + line + ")");
+        }
+        if (!intTarget) return;
+        // Integer literal (optionally negated) with range check against the target type.
+        boolean neg = false;
+        AST probe = init;
+        if (probe instanceof UnaryExpr && ((UnaryExpr) probe).op.equals("-")
+                && ((UnaryExpr) probe).prefix && ((UnaryExpr) probe).operand instanceof IntLit) {
+            neg = true;
+            probe = ((UnaryExpr) probe).operand;
+        }
+        if (!(probe instanceof IntLit)) return;
+        java.math.BigInteger bi;
+        String t = ((IntLit) probe).text;
+        try {
+            if (t.startsWith("0x") || t.startsWith("0X")) bi = new java.math.BigInteger(t.substring(2), 16);
+            else if (t.startsWith("0b") || t.startsWith("0B")) bi = new java.math.BigInteger(t.substring(2), 2);
+            else bi = new java.math.BigInteger(t);
+        } catch (NumberFormatException e) {
+            throw new RuntimeException("Invalid integer literal '" + t + "' (at line " + line + ")");
+        }
+        java.math.BigInteger v = neg ? bi.negate() : bi;
+        if (cangTarget.equals("byte") && (v.intValue() < -128 || v.intValue() > 127 || v.bitLength() > 7)) {
+            throw new RuntimeException("Integer number out of range for 'byte' (-128 to 127): "
+                + v + " (at line " + line + ")");
+        }
+        if (cangTarget.equals("int") && v.compareTo(java.math.BigInteger.valueOf(Integer.MIN_VALUE)) < 0
+                || cangTarget.equals("int") && v.compareTo(java.math.BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+            throw new RuntimeException("Integer number out of range for 'int': " + v + " (at line " + line + ")");
+        }
+        if (cangTarget.equals("long") && (v.compareTo(java.math.BigInteger.valueOf(Long.MAX_VALUE)) > 0
+                || v.compareTo(java.math.BigInteger.valueOf(Long.MIN_VALUE)) < 0)) {
+            throw new RuntimeException("Integer number out of range for 'long': " + v + " (at line " + line + ")");
+        }
+    }
+
     private void generateVarDecl(VarDecl decl) {
         String cangType = decl.type;
         String llvmType;
@@ -2497,6 +2541,11 @@ public class LLVMGen {
         if (scope != null && scope.vars.containsKey(decl.name)) {
             throw new RuntimeException("Duplicate variable: '" + decl.name
                 + "' is already declared in this scope (at line " + decl.line + ")");
+        }
+
+        // Literal range / narrowing check against the declared type (debug.md #8).
+        if (!cangType.equals("var") && decl.init != null) {
+            checkLiteralFits(decl.init, cangType, decl.line);
         }
 
         if (decl.isFinal) {
@@ -3250,13 +3299,27 @@ public class LLVMGen {
     private LLVMValue generateExpr(AST node) {
         if (node instanceof IntLit) {
             String val = ((IntLit) node).text;
+            long n;
             if (val.startsWith("0x") || val.startsWith("0X")) {
-                return new LLVMValue(String.valueOf(Long.parseLong(val.substring(2), 16)), "i32");
+                n = Long.parseLong(val.substring(2), 16);
+            } else if (val.startsWith("0b") || val.startsWith("0B")) {
+                n = Long.parseLong(val.substring(2), 2);
+            } else {
+                // Default width by magnitude (debug.md #8): fits i32 -> i32, else i64.
+                // Beyond 64 bits there is nowhere to wrap silently — compile error.
+                java.math.BigInteger bi = new java.math.BigInteger(val);
+                if (bi.compareTo(java.math.BigInteger.valueOf(Long.MAX_VALUE)) > 0) {
+                    throw new RuntimeException("Integer number too large: " + val + " (at line " + node.line + ")");
+                }
+                if (bi.compareTo(java.math.BigInteger.valueOf(Long.MIN_VALUE)) < 0) {
+                    throw new RuntimeException("Integer number too small: " + val + " (at line " + node.line + ")");
+                }
+                n = bi.longValue();
             }
-            if (val.startsWith("0b") || val.startsWith("0B")) {
-                return new LLVMValue(String.valueOf(Long.parseLong(val.substring(2), 2)), "i32");
+            if (n > Integer.MAX_VALUE || n < Integer.MIN_VALUE) {
+                return new LLVMValue(String.valueOf(n), "i64");
             }
-            return new LLVMValue(val, "i32");
+            return new LLVMValue(String.valueOf(n), "i32");
         }
         if (node instanceof LongLit) {
             return new LLVMValue(((LongLit) node).text, "i64");
@@ -4542,6 +4605,10 @@ public class LLVMGen {
             LLVMValue target = scope.lookup(((Identifier) node.target).name);
             if (target != null && isFunctionType(target.semanticType)) {
                 assignExpected = target.semanticType;
+            }
+            if (target != null) {
+                // Literal range check against the target slot type (debug.md #8).
+                checkLiteralFits(node.value, cangTypeFromLLVM(target.type), node.line);
             }
         }
         String savedExpected = expectedFunctionType;
