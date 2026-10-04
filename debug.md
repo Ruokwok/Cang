@@ -199,7 +199,7 @@
 
 ### 29. ✅ `Thread.spawn` 无 join 兜底 —— 随 spawn 移除而关闭（对象式需显式 join，thread{} 有自动 join 收尾） —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）
 
-### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺
+### 30. ✅ `System.exit` 跳过收尾 —— 已修复（exit 前跑统一收尾）generateSystemCall 的 exit 分支在 call @exit 前插入 emitThreadBlockJoins + emitRegisteredThreadJoins（与 main 正常返回同款 sweep：thread{} 句柄 + 非守护对象式登记）。finally 按指引仍不承诺。实测 t_sys_exit：`before-exit|THREADED`（慢任务线程在 exit 前被 join 完成）；回归 93/93
 
 ### 31. ✅ `Stdout.print(对象)` 输出乱码 —— 已修复（对象打 `<ClassName@addr>`）pointer 分支区分 i8*（String/数组，%s 不变）与 %X* 对象：对象走新常量 `<%s@%p>` + 类名常量 + bitcast 指针（null 仍打 null；用户 % 串安全——格式是编译器常量）。顺带修 ensureStringConstant 的 contains 子串误判（`@.str.obj` 被 `@.str.obj.nl` 前缀骗过导致 undefined——改匹配 `name + " ="` 定义形态）。t_print_obj（对象/无换行/null/%串四断言）；回归 92/92
 

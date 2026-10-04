@@ -5868,6 +5868,11 @@ public class LLVMGen {
         if (method.equals("exit") && nodes.size() == 1) {
             LLVMValue status = generateExpr(nodes.get(0));
             String castedExit = castValue(status, "i32");
+            // Same end-of-main sweep as a normal return (debug.md #30): join thread{} handles
+            // and registered non-daemon object threads before the process dies. finally is
+            // explicitly out of scope per the item's guidance.
+            emitThreadBlockJoins();
+            emitRegisteredThreadJoins();
             body.append("  call void @exit(i32 ").append(castedExit).append(")\n");
             body.append("  unreachable\n");
             return new LLVMValue("void", "void");
