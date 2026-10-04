@@ -3,8 +3,9 @@
 > 返回 [文档索引](../README.md)
 
 ## 要点
-- length / substring / indexOf / startsWith / endsWith
-- toUpper / toLower / trim / 拆分与查找
+- length / substring / indexOf / lastIndexOf / indexOfIgnoreCase / startsWith / endsWith
+- toUpper / toLower / trim（均已在编译器内建实现，无需 import）
+- split 等拆分 API 暂未提供（v1 边界）
 - 方法链式调用与 str 的显式转换
 
 

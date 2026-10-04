@@ -1408,6 +1408,12 @@ public class LLVMGen {
         header.append("@.fmt.tostr.long = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
         header.append("@.fmt.tostr.double = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
         header.append("@.str.empty = private unnamed_addr constant [1 x i8] c\"\\00\"\n");
+        // String intrinsics support (libc)
+        if (!header.toString().contains("declare i32 @strncmp(")) {
+            header.append("declare i32 @strncmp(i8*, i8*, i64)\n");
+            header.append("declare i8* @strstr(i8*, i8*)\n");
+            header.append("declare i32 @memcmp(i8*, i8*, i64)\n");
+        }
 
         // Static fields as global variables
         for (Map.Entry<String, FieldDecl> entry : staticFields.entrySet()) {
@@ -5447,6 +5453,10 @@ public class LLVMGen {
         if ("str".equals(objVal.semanticType)) {
             throw new RuntimeException("str is a primitive type and has no methods (at line " + node.line + ")");
         }
+        // String methods (length/substring/...) — compiler intrinsics like Stdout dispatch.
+        if ("String".equals(objVal.semanticType) && STRING_METHODS.contains(node.method)) {
+            return generateStringMethod(objVal, node);
+        }
 
         // Null pointer check for object method calls
         if (objVal.type.equals("i8*") || (objVal.type.startsWith("%") && objVal.type.endsWith("*"))) {
@@ -6168,6 +6178,351 @@ public class LLVMGen {
                 ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
+    }
+
+    /** The native String surface (stdlib/cang/lang/String.cang) — dispatched intrinsically. */
+    private static final java.util.Set<String> STRING_METHODS = java.util.Set.of(
+        "length", "startsWith", "endsWith", "indexOf", "indexOfIgnoreCase",
+        "substring", "toUpper", "toLower", "trim");
+
+    /** String intrinsics: receiver is the i8* string itself (no struct header). */
+    private LLVMValue generateStringMethod(LLVMValue recv, MethodCallExpr node) {
+        String m = node.method;
+        int line = node.line;
+        // Null receiver -> catchable error (same pattern as object field access).
+        int id = labelCount++;
+        String nn = "str.nn." + id;
+        String isNull = "%str.null." + tmpCount++;
+        body.append("  ").append(isNull).append(" = icmp eq i8* ").append(recv.value).append(", null\n");
+        body.append("  br i1 ").append(isNull).append(", label %str.null.").append(id)
+             .append(", label %").append(nn).append("\n\n");
+        body.append("str.null.").append(id).append(":\n");
+        emitRuntimeError("Null pointer dereference: String." + m, line, nn);
+        body.append(nn).append(":\n");
+
+        switch (m) {
+            case "length": {
+                String l = "%len." + tmpCount++;
+                body.append("  ").append(l).append(" = call i64 @strlen(i8* ").append(recv.value).append(")\n");
+                String r = "%l32." + tmpCount++;
+                body.append("  ").append(r).append(" = trunc i64 ").append(l).append(" to i32\n");
+                return new LLVMValue(r, "i32");
+            }
+            case "startsWith": {
+                requireArgs(node, 1, m);
+                LLVMValue p = generateExpr(node.args.get(0));
+                String lp = "%lps." + tmpCount++;
+                body.append("  ").append(lp).append(" = call i64 @strlen(i8* ").append(p.value).append(")\n");
+                String c = "%cmps." + tmpCount++;
+                body.append("  ").append(c).append(" = call i32 @strncmp(i8* ").append(recv.value)
+                     .append(", i8* ").append(p.value).append(", i64 ").append(lp).append(")\n");
+                String e = "%eq." + tmpCount++;
+                body.append("  ").append(e).append(" = icmp eq i32 ").append(c).append(", 0\n");
+                return new LLVMValue(e, "i1");
+            }
+            case "endsWith": {
+                requireArgs(node, 1, m);
+                LLVMValue p = generateExpr(node.args.get(0));
+                String ls = "%lss." + tmpCount++;
+                body.append("  ").append(ls).append(" = call i64 @strlen(i8* ").append(p.value).append(")\n");
+                String lr = "%lsr." + tmpCount++;
+                body.append("  ").append(lr).append(" = call i64 @strlen(i8* ").append(recv.value).append(")\n");
+                String gt = "%gt." + tmpCount++;
+                body.append("  ").append(gt).append(" = icmp ugt i64 ").append(ls).append(", ").append(lr).append("\n");
+                // Inlined into the CALLER function — must not `ret` here; store the result and join.
+                String res = "%sfx.res." + tmpCount++;
+                body.append("  ").append(res).append(" = alloca i1\n");
+                String yes = "str.sfx.yes." + id, no = "str.sfx.no." + id, join = "str.sfx.join." + id;
+                body.append("  br i1 ").append(gt).append(", label %").append(yes)
+                     .append(", label %").append(no).append("\n");
+                body.append(yes).append(":\n");
+                body.append("  store i1 0, i1* ").append(res).append("\n");
+                body.append("  br label %").append(join).append("\n");
+                body.append(no).append(":\n");
+                String off = "%off." + tmpCount++;
+                body.append("  ").append(off).append(" = sub i64 ").append(lr).append(", ").append(ls).append("\n");
+                String base = "%sfx." + tmpCount++;
+                body.append("  ").append(base).append(" = getelementptr i8, i8* ").append(recv.value)
+                     .append(", i64 ").append(off).append("\n");
+                String c = "%cmpsfx." + tmpCount++;
+                body.append("  ").append(c).append(" = call i32 @memcmp(i8* ").append(base)
+                     .append(", i8* ").append(p.value).append(", i64 ").append(ls).append(")\n");
+                String e = "%eqs." + tmpCount++;
+                body.append("  ").append(e).append(" = icmp eq i32 ").append(c).append(", 0\n");
+                body.append("  store i1 ").append(e).append(", i1* ").append(res).append("\n");
+                body.append("  br label %").append(join).append("\n");
+                body.append(join).append(":\n");
+                String out = "%sfx.out." + tmpCount++;
+                body.append("  ").append(out).append(" = load i1, i1* ").append(res).append("\n");
+                return new LLVMValue(out, "i1");
+            }
+            case "indexOf": {
+                requireArgs(node, 1, m);
+                LLVMValue sub = generateExpr(node.args.get(0));
+                return emitIndexOf(recv.value, sub.value);
+            }
+            case "indexOfIgnoreCase": {
+                requireArgs(node, 1, m);
+                LLVMValue sub = generateExpr(node.args.get(0));
+                String la = emitCaseConv(recv.value, false, line);
+                String lb = emitCaseConv(sub.value, false, line);
+                LLVMValue r = emitIndexOf(la, lb);
+                body.append("  call void @").append(freeFn()).append("(i8* ").append(la).append(")\n");
+                body.append("  call void @").append(freeFn()).append("(i8* ").append(lb).append(")\n");
+                return r;
+            }
+            case "substring": {
+                requireArgs(node, 2, m);
+                LLVMValue st = generateExpr(node.args.get(0));
+                LLVMValue en = generateExpr(node.args.get(1));
+                String s64 = "%st." + tmpCount++;
+                body.append("  ").append(s64).append(" = sext i32 ").append(st.value).append(" to i64\n");
+                String e64 = "%en." + tmpCount++;
+                body.append("  ").append(e64).append(" = sext i32 ").append(en.value).append(" to i64\n");
+                String len = "%tlen." + tmpCount++;
+                body.append("  ").append(len).append(" = call i64 @strlen(i8* ").append(recv.value).append(")\n");
+                String b1 = "%b1." + tmpCount++;
+                body.append("  ").append(b1).append(" = icmp slt i64 ").append(s64).append(", 0\n");
+                String b2 = "%b2." + tmpCount++;
+                body.append("  ").append(b2).append(" = icmp slt i64 ").append(e64).append(", 0\n");
+                String b3 = "%b3." + tmpCount++;
+                body.append("  ").append(b3).append(" = icmp ugt i64 ").append(e64).append(", ").append(len).append("\n");
+                String b4 = "%b4." + tmpCount++;
+                body.append("  ").append(b4).append(" = icmp ugt i64 ").append(s64).append(", ").append(e64).append("\n");
+                String o1 = "%o1." + tmpCount++;
+                body.append("  ").append(o1).append(" = or i1 ").append(b1).append(", ").append(b2).append("\n");
+                String o2 = "%o2." + tmpCount++;
+                body.append("  ").append(o2).append(" = or i1 ").append(o1).append(", ").append(b3).append("\n");
+                String bad = "str.sub.bad." + id, sok = "str.sub.ok." + id;
+                String o3 = "%o3." + tmpCount++;
+                body.append("  ").append(o3).append(" = or i1 ").append(o2).append(", ").append(b4).append("\n");
+                body.append("  br i1 ").append(o3).append(", label %").append(bad)
+                     .append(", label %").append(sok).append("\n");
+                body.append(bad).append(":\n");
+                emitRuntimeError("String index out of bounds", line, sok);
+                body.append(sok).append(":\n");
+                String l = "%sub.l." + tmpCount++;
+                body.append("  ").append(l).append(" = sub i64 ").append(e64).append(", ").append(s64).append("\n");
+                String sz = "%sub.sz." + tmpCount++;
+                body.append("  ").append(sz).append(" = add i64 ").append(l).append(", 1\n");
+                String buf = "%sub.buf." + tmpCount++;
+                body.append("  ").append(buf).append(" = call i8* @").append(allocFn())
+                     .append("(i64 ").append(sz).append(")\n");
+                registerRegionAllocation(buf);
+                String src = "%sub.src." + tmpCount++;
+                body.append("  ").append(src).append(" = getelementptr i8, i8* ").append(recv.value)
+                     .append(", i64 ").append(s64).append("\n");
+                body.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(buf)
+                     .append(", i8* ").append(src).append(", i64 ").append(l).append(", i1 false)\n");
+                String term = "%sub.term." + tmpCount++;
+                body.append("  ").append(term).append(" = getelementptr i8, i8* ").append(buf)
+                     .append(", i64 ").append(l).append("\n");
+                body.append("  store i8 0, i8* ").append(term).append("\n");
+                return new LLVMValue(buf, "i8*", "String");
+            }
+            case "toUpper":
+                return new LLVMValue(emitCaseConv(recv.value, true, line), "i8*", "String");
+            case "toLower":
+                return new LLVMValue(emitCaseConv(recv.value, false, line), "i8*", "String");
+            case "trim":
+                return new LLVMValue(emitTrim(recv.value), "i8*", "String");
+            default:
+                throw new RuntimeException("Unknown String method: " + m + " (at line " + line + ")");
+        }
+    }
+
+    private void requireArgs(MethodCallExpr node, int n, String m) {
+        if (node.args.size() != n) {
+            throw new RuntimeException("String." + m + " expects " + n + " argument(s) (at line " + node.line + ")");
+        }
+    }
+
+    /** strstr + pointer delta -> index or -1 (inlined: stores the result, never `ret`s). */
+    private LLVMValue emitIndexOf(String s, String sub) {
+        String r = "%idx.r." + tmpCount++;
+        body.append("  ").append(r).append(" = call i8* @strstr(i8* ").append(s).append(", i8* ").append(sub).append(")\n");
+        String isn = "%idx.nil." + tmpCount++;
+        body.append("  ").append(isn).append(" = icmp eq i8* ").append(r).append(", null\n");
+        String res = "%idx.res." + tmpCount++;
+        body.append("  ").append(res).append(" = alloca i32\n");
+        String neg = "str.idx.neg." + labelCount++, hit = "str.idx.hit." + labelCount++;
+        String join = "str.idx.join." + labelCount++;
+        body.append("  br i1 ").append(isn).append(", label %").append(neg).append(", label %").append(hit).append("\n");
+        body.append(neg).append(":\n  store i32 -1, i32* ").append(res).append("\n");
+        body.append("  br label %").append(join).append("\n");
+        body.append(hit).append(":\n");
+        String p1 = "%idx.p1." + tmpCount++;
+        body.append("  ").append(p1).append(" = ptrtoint i8* ").append(s).append(" to i64\n");
+        String p2 = "%idx.p2." + tmpCount++;
+        body.append("  ").append(p2).append(" = ptrtoint i8* ").append(r).append(" to i64\n");
+        String d = "%idx.d." + tmpCount++;
+        body.append("  ").append(d).append(" = sub i64 ").append(p2).append(", ").append(p1).append("\n");
+        String t = "%idx.t." + tmpCount++;
+        body.append("  ").append(t).append(" = trunc i64 ").append(d).append(" to i32\n");
+        body.append("  store i32 ").append(t).append(", i32* ").append(res).append("\n");
+        body.append("  br label %").append(join).append("\n");
+        body.append(join).append(":\n");
+        String out = "%idx.out." + tmpCount++;
+        body.append("  ").append(out).append(" = load i32, i32* ").append(res).append("\n");
+        return new LLVMValue(out, "i32");
+    }
+
+    /** ASCII case conversion into a fresh heap buffer (toUpper=true -> upper). */
+    private String emitCaseConv(String s, boolean toUpper, int line) {
+        String len = "%cc.len." + tmpCount++;
+        body.append("  ").append(len).append(" = call i64 @strlen(i8* ").append(s).append(")\n");
+        String sz = "%cc.sz." + tmpCount++;
+        body.append("  ").append(sz).append(" = add i64 ").append(len).append(", 1\n");
+        String buf = "%cc.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 ").append(sz).append(")\n");
+        registerRegionAllocation(buf);
+        String ip = "%cc.i." + tmpCount++;
+        body.append("  ").append(ip).append(" = alloca i64\n");
+        body.append("  store i64 0, i64* ").append(ip).append("\n");
+        int id = labelCount++;
+        String cond = "cc.cond." + id, bodyL = "cc.body." + id, done = "cc.done." + id, upd = "cc.upd." + id;
+        body.append("  br label %").append(cond).append("\n\n");
+        body.append(cond).append(":\n");
+        String iv = "%cc.iv." + tmpCount++;
+        body.append("  ").append(iv).append(" = load i64, i64* ").append(ip).append("\n");
+        String c = "%cc.c." + tmpCount++;
+        body.append("  ").append(c).append(" = icmp slt i64 ").append(iv).append(", ").append(len).append("\n");
+        body.append("  br i1 ").append(c).append(", label %").append(bodyL).append(", label %").append(done).append("\n\n");
+        body.append(bodyL).append(":\n");
+        String sp = "%cc.sp." + tmpCount++;
+        body.append("  ").append(sp).append(" = getelementptr i8, i8* ").append(s).append(", i64 ").append(iv).append("\n");
+        String ch = "%cc.ch." + tmpCount++;
+        body.append("  ").append(ch).append(" = load i8, i8* ").append(sp).append("\n");
+        String ge, le, in, adj, conv;
+        ge = "%cc.ge." + tmpCount++;
+        le = "%cc.le." + tmpCount++;
+        in = "%cc.in." + tmpCount++;
+        adj = "%cc.adj." + tmpCount++;
+        conv = "%cc.cv." + tmpCount++;
+        if (toUpper) {
+            body.append("  ").append(ge).append(" = icmp uge i8 ").append(ch).append(", 97\n");
+            body.append("  ").append(le).append(" = icmp ule i8 ").append(ch).append(", 122\n");
+            body.append("  ").append(in).append(" = and i1 ").append(ge).append(", ").append(le).append("\n");
+            body.append("  ").append(adj).append(" = sub i8 ").append(ch).append(", 32\n");
+        } else {
+            body.append("  ").append(ge).append(" = icmp uge i8 ").append(ch).append(", 65\n");
+            body.append("  ").append(le).append(" = icmp ule i8 ").append(ch).append(", 90\n");
+            body.append("  ").append(in).append(" = and i1 ").append(ge).append(", ").append(le).append("\n");
+            body.append("  ").append(adj).append(" = add i8 ").append(ch).append(", 32\n");
+        }
+        body.append("  ").append(conv).append(" = select i1 ").append(in).append(", i8 ").append(adj)
+             .append(", i8 ").append(ch).append("\n");
+        String bp = "%cc.bp." + tmpCount++;
+        body.append("  ").append(bp).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(iv).append("\n");
+        body.append("  store i8 ").append(conv).append(", i8* ").append(bp).append("\n");
+        body.append("  br label %").append(upd).append("\n");
+        body.append(upd).append(":\n");
+        String iv2 = "%cc.iv2." + tmpCount++;
+        body.append("  ").append(iv2).append(" = add i64 ").append(iv).append(", 1\n");
+        body.append("  store i64 ").append(iv2).append(", i64* ").append(ip).append("\n");
+        body.append("  br label %").append(cond).append("\n\n");
+        body.append(done).append(":\n");
+        String np = "%cc.np." + tmpCount++;
+        body.append("  ").append(np).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(len).append("\n");
+        body.append("  store i8 0, i8* ").append(np).append("\n");
+        return buf;
+    }
+
+    /** Trim ASCII whitespace both ends into a fresh heap buffer. */
+    private String emitTrim(String s) {
+        String len = "%tr.len." + tmpCount++;
+        body.append("  ").append(len).append(" = call i64 @strlen(i8* ").append(s).append(")\n");
+        String sp = "%tr.sp." + tmpCount++;
+        body.append("  ").append(sp).append(" = alloca i64\n");
+        body.append("  store i64 0, i64* ").append(sp).append("\n");
+        String ep = "%tr.ep." + tmpCount++;
+        body.append("  ").append(ep).append(" = alloca i64\n");
+        body.append("  store i64 ").append(len).append(", i64* ").append(ep).append("\n");
+        int id = labelCount++;
+        String lc = "tr.lc." + id, lb = "tr.lb." + id, linc = "tr.linc." + id, ldone = "tr.ldone." + id;
+        body.append("  br label %").append(lc).append("\n\n");
+        body.append(lc).append(":\n");
+        String sl = "%tr.sl." + tmpCount++;
+        body.append("  ").append(sl).append(" = load i64, i64* ").append(sp).append("\n");
+        String c1 = "%tr.c1." + tmpCount++;
+        body.append("  ").append(c1).append(" = icmp slt i64 ").append(sl).append(", ").append(len).append("\n");
+        body.append("  br i1 ").append(c1).append(", label %").append(lb).append(", label %").append(ldone).append("\n\n");
+        body.append(lb).append(":\n");
+        String lp = "%tr.lp." + tmpCount++;
+        body.append("  ").append(lp).append(" = getelementptr i8, i8* ").append(s).append(", i64 ").append(sl).append("\n");
+        String ch = "%tr.ch." + tmpCount++;
+        body.append("  ").append(ch).append(" = load i8, i8* ").append(lp).append("\n");
+        String w1 = emitIsSpace(ch);
+        body.append("  br i1 ").append(w1).append(", label %").append(linc).append(", label %").append(ldone).append("\n\n");
+        body.append(linc).append(":\n");
+        String s2 = "%tr.s2." + tmpCount++;
+        body.append("  ").append(s2).append(" = add i64 ").append(sl).append(", 1\n");
+        body.append("  store i64 ").append(s2).append(", i64* ").append(sp).append("\n");
+        body.append("  br label %").append(lc).append("\n\n");
+        body.append(ldone).append(":\n");
+        String ec = "tr.ec." + id, eb = "tr.eb." + id, edec = "tr.edec." + id, edone = "tr.edone." + id;
+        body.append("  br label %").append(ec).append("\n\n");
+        body.append(ec).append(":\n");
+        String sl2 = "%tr.sl2." + tmpCount++;
+        body.append("  ").append(sl2).append(" = load i64, i64* ").append(sp).append("\n");
+        String el = "%tr.el." + tmpCount++;
+        body.append("  ").append(el).append(" = load i64, i64* ").append(ep).append("\n");
+        String c2 = "%tr.c2." + tmpCount++;
+        body.append("  ").append(c2).append(" = icmp sgt i64 ").append(el).append(", ").append(sl2).append("\n");
+        body.append("  br i1 ").append(c2).append(", label %").append(eb).append(", label %").append(edone).append("\n\n");
+        body.append(eb).append(":\n");
+        String ei = "%tr.ei." + tmpCount++;
+        body.append("  ").append(ei).append(" = sub i64 ").append(el).append(", 1\n");
+        String ep2 = "%tr.ep2." + tmpCount++;
+        body.append("  ").append(ep2).append(" = getelementptr i8, i8* ").append(s).append(", i64 ").append(ei).append("\n");
+        String ch2 = "%tr.ch2." + tmpCount++;
+        body.append("  ").append(ch2).append(" = load i8, i8* ").append(ep2).append("\n");
+        String w2 = emitIsSpace(ch2);
+        body.append("  br i1 ").append(w2).append(", label %").append(edec).append(", label %").append(edone).append("\n\n");
+        body.append(edec).append(":\n");
+        String e2 = "%tr.e2." + tmpCount++;
+        body.append("  ").append(e2).append(" = sub i64 ").append(el).append(", 1\n");
+        body.append("  store i64 ").append(e2).append(", i64* ").append(ep).append("\n");
+        body.append("  br label %").append(ec).append("\n\n");
+        body.append(edone).append(":\n");
+        String slf = "%tr.slf." + tmpCount++;
+        body.append("  ").append(slf).append(" = load i64, i64* ").append(sp).append("\n");
+        String elf = "%tr.elf." + tmpCount++;
+        body.append("  ").append(elf).append(" = load i64, i64* ").append(ep).append("\n");
+        String tl = "%tr.tl." + tmpCount++;
+        body.append("  ").append(tl).append(" = sub i64 ").append(elf).append(", ").append(slf).append("\n");
+        String tsz = "%tr.tsz." + tmpCount++;
+        body.append("  ").append(tsz).append(" = add i64 ").append(tl).append(", 1\n");
+        String buf = "%tr.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 ").append(tsz).append(")\n");
+        registerRegionAllocation(buf);
+        String src = "%tr.src." + tmpCount++;
+        body.append("  ").append(src).append(" = getelementptr i8, i8* ").append(s).append(", i64 ").append(slf).append("\n");
+        body.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(buf)
+             .append(", i8* ").append(src).append(", i64 ").append(tl).append(", i1 false)\n");
+        String term = "%tr.term." + tmpCount++;
+        body.append("  ").append(term).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(tl).append("\n");
+        body.append("  store i8 0, i8* ").append(term).append("\n");
+        return buf;
+    }
+
+    /** i1: byte is ASCII whitespace (space/tab/lf/cr). */
+    private String emitIsSpace(String ch) {
+        String a = "%ws.a." + tmpCount++;
+        body.append("  ").append(a).append(" = icmp eq i8 ").append(ch).append(", 32\n");
+        String b = "%ws.b." + tmpCount++;
+        body.append("  ").append(b).append(" = icmp eq i8 ").append(ch).append(", 9\n");
+        String c = "%ws.c." + tmpCount++;
+        body.append("  ").append(c).append(" = icmp eq i8 ").append(ch).append(", 10\n");
+        String d = "%ws.d." + tmpCount++;
+        body.append("  ").append(d).append(" = icmp eq i8 ").append(ch).append(", 13\n");
+        String ab = "%ws.ab." + tmpCount++;
+        body.append("  ").append(ab).append(" = or i1 ").append(a).append(", ").append(b).append("\n");
+        String cd = "%ws.cd." + tmpCount++;
+        body.append("  ").append(cd).append(" = or i1 ").append(c).append(", ").append(d).append("\n");
+        String r = "%ws.r." + tmpCount++;
+        body.append("  ").append(r).append(" = or i1 ").append(ab).append(", ").append(cd).append("\n");
+        return r;
     }
 
     private LLVMValue generateStdoutPrint(List<AST> args, boolean newline) {
