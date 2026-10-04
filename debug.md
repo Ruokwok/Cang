@@ -83,11 +83,13 @@
 - 位置：`generateArrayAssign`（约 3235-3292）直接 store；读检查模板在约 4856-4870（`icmp slt/ge + emitRuntimeError`）。
 - 修复指引：写路径照抄读路径：负数 + `≥ length` 双检 → `emitRuntimeError("Array index out of bounds", line, ok)`。注意先 load 长度头再比较（读路径现有实现里数组为 null 时先 load 崩——顺手把 null 数组检查也补上，读写都要）。
 
-### 11. 🔴 重复定义三套标准不一致 —— 待修
+### 11. ✅ 重复定义三套标准不一致 —— 已修复（三处统一编译期查重）
 - 现象：重复函数报错（`Duplicate function`）；重复 class `classes.put` 静默覆盖（同文件两个 `class Main` EXIT 0，跨文件同名类字段不同 → 下游误导性 `Unknown field` 且定位错）；重复变量生成两个 `%v.x=alloca`，clang 才报 multiple definition。
 - 位置：`LLVMGen` `classes.put`（约 467）、`collectFunction`（约 743，有查重）、var-decl 无查重。
 - 修复指引：统一策略——`collectClass` 对已存在的同 fullName 抛 `Duplicate class`；`generateVarDecl` 在 scope.define 前查 `scope.lookup(name) != null`（限同层作用域，考虑 shadowing 规则是否允许内层遮蔽——若允许，只查同层）。
 
+- **修复**：①collectClass 对已存在 fullName 抛 Duplicate class: 'Foo'（指向重复类头行——原静默覆盖→下游误导性错误）；②generateVarDecl 同层 scope.vars.containsKey 查重抛 Duplicate variable（跨层遮蔽保留——for/for-each/list-foreach 三循环改包独立 Scope，连续两个 `for(int i)` 不误伤且外层同名可遮蔽）；③函数重复原本已拦。
+- 测试：t_dup_class / t_dup_var 负例 + 双 for 探针  |1|0|1|2|9；回归 98/98。
 ### 12. ✅ 必返分析是 IR 文本匹配 —— 已修复（AST 化 + 终结符保证）
 - 修复三件套：① **AST 级 `alwaysReturns` 分析**（Return/Block 任一句/双分支 If/无 break 的 `while(true)` 与 `for(;;)`/全 return 的 switch（保守：每 case+default）/try+全部 catch）替换 IR 文本搜索——`if(c){return 1}` 缺 else 现在友好报 `Function 'bad' must return...`，`while(true){}` 按 Java 语义放行；② **尾部终结符保证**：非 void 且全路径已 return 但文本落在 join 标签上 → 追加 `unreachable`，void → `ret void`；termLast 判定须排除以 `:` 结尾的标签行（`switch.end.3:` 以 switch 开头但不是指令——首版踩坑，clang `expected instruction opcode`）；③ 返回类型：`return true` 进 int/long/byte 现在报 `found 'bool'`（与 Java 对齐，仅返回路径收紧、调用实参仍允许 bool→int），`return null` 报错文案改为 `found 'null'`。
 - 验证：`t_retpath`（双分支 return / 全 return switch / while(true) 编译 / bool 返回）`1|2|10|20|0|1|done`；负例 `t_retpath_missing`、`t_retpath_bool` 友好报错；回归 44/44。

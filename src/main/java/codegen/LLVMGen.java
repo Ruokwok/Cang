@@ -783,6 +783,15 @@ public class LLVMGen {
     private void collectClass(ClassDecl decl) {
         ClassInfo info = new ClassInfo();
         String ns = (decl.namespace != null && !decl.namespace.isEmpty()) ? decl.namespace : currentNamespace;String fullName = ns.isEmpty() ? decl.name : ns.replace("/", "_") + "_" + decl.name;
+        // Duplicate full name = the second definition silently overwrote the first before
+        // (same file or across imports → misleading downstream errors, debug.md #11).
+        if (classes.containsKey(fullName)) {
+            String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
+            String srcLine = readSourceLine(file, decl.line);
+            int col = srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1;
+            throw new util.CompileError("Duplicate class: '" + fullName + "'",
+                file, decl.line, col, srcLine, decl.name.length());
+        }
         info.llvmName = "%" + fullName;
         info.fullName = fullName;
         info.simpleName = decl.name;
@@ -2482,6 +2491,14 @@ public class LLVMGen {
         String cangType = decl.type;
         String llvmType;
 
+        // Same-scope redeclaration (debug.md #11): previously emitted a second alloca and
+        // only clang caught "multiple definition". Cross-scope shadowing stays allowed —
+        // Block/lambda/for bodies get fresh Scope instances, so this checks OWN scope only.
+        if (scope != null && scope.vars.containsKey(decl.name)) {
+            throw new RuntimeException("Duplicate variable: '" + decl.name
+                + "' is already declared in this scope (at line " + decl.line + ")");
+        }
+
         if (decl.isFinal) {
             finalVars.add(decl.name);
         }
@@ -2884,6 +2901,11 @@ public class LLVMGen {
         loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
         loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
 
+        // Loop-local scope: `for (int i ...)` declares i only for this loop, so two
+        // sequential for-inits are not same-scope duplicates (debug.md #11 + shadowing).
+        Scope prevForScope = scope;
+        scope = new Scope(prevForScope);
+
         // Init
         if (stmt.init != null) {
             if (stmt.init instanceof VarDecl) {
@@ -2933,6 +2955,7 @@ public class LLVMGen {
         emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
+        scope = prevForScope;
     }
 
     /**
@@ -2958,6 +2981,10 @@ public class LLVMGen {
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = end;
         loopStack.get(loopStack.size() - 1).continueLabel = cleanup;
+
+        // Loop-local scope for the iteration variable (debug.md #11 + shadowing).
+        Scope prevLfScope = scope;
+        scope = new Scope(prevLfScope);
 
         // Method-based iteration over the pure-Cang List (no %CangList ABI): snapshot size once.
         String recv = list.type + " " + list.value;
@@ -2992,6 +3019,7 @@ public class LLVMGen {
         emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
+        scope = prevLfScope;
     }
 
     private void generateForEach(ForEachStmt stmt) {
@@ -3010,6 +3038,10 @@ public class LLVMGen {
         loopStack.add(new LoopContext());
         loopStack.get(loopStack.size() - 1).breakLabel = endLabel;
         loopStack.get(loopStack.size() - 1).continueLabel = cleanupLabel;
+
+        // Loop-local scope for the iteration variable (debug.md #11 + shadowing).
+        Scope prevFeScope = scope;
+        scope = new Scope(prevFeScope);
 
         // Evaluate iterable (get array pointer)
         LLVMValue arrVal = iterable; // reuse: iterable was generated once (debug.md #16)
@@ -3130,6 +3162,7 @@ public class LLVMGen {
         emitStackRestore(stackSave);
 
         loopStack.remove(loopStack.size() - 1);
+        scope = prevFeScope;
     }
 
     private void generateReturn(ReturnStmt stmt) {
