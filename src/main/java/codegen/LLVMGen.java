@@ -5968,6 +5968,9 @@ public class LLVMGen {
             int id = labelCount++;
             String notNullLabel = "print.notnull." + id;
             String endLabel = "print.end." + id;
+            // Class objects must NOT go through %s (that reads struct bytes as a C string —
+            // garbage / out-of-bounds, debug.md #31); they print as <ClassName@addr>.
+            boolean isObj = argVal.type.startsWith("%");
 
             // Check if pointer is null
             String isNull = "%isnull." + tmpCount++;
@@ -5988,8 +5991,21 @@ public class LLVMGen {
 
             // Not null: print normally
             body.append(notNullLabel).append(":\n");
-            body.append("  ").append(callPre).append(fmtName)
-                 .append(", i8* ").append(argVal.value).append(")\n");
+            if (isObj) {
+                String clsName = cangTypeFromLLVMFull(argVal.type);
+                String fmtObj = ensureStringConstant(newline ? "@.str.obj.nl" : "@.str.obj",
+                    newline ? "<%s@%p>\\0A\\00" : "<%s@%p>\\00", newline ? 9 : 8);
+                String clsStr = ensureStringConstant("@.str.cls." + clsName, clsName + "\\00",
+                    clsName.length() + 1);
+                String objp = "%obj.p." + tmpCount++;
+                body.append("  ").append(objp).append(" = bitcast ").append(argVal.type).append(" ")
+                     .append(argVal.value).append(" to i8*\n");
+                body.append("  ").append(callPre).append(fmtObj)
+                     .append(", i8* ").append(clsStr).append(", i8* ").append(objp).append(")\n");
+            } else {
+                body.append("  ").append(callPre).append(fmtName)
+                     .append(", i8* ").append(argVal.value).append(")\n");
+            }
             body.append("  br label %").append(endLabel).append("\n\n");
 
             body.append(endLabel).append(":\n");
@@ -6730,7 +6746,9 @@ public class LLVMGen {
      * Ensure a string constant exists in header (idempotent).
      */
     private String ensureStringConstant(String name, String text, int byteCount) {
-        if (!header.toString().contains(name)) {
+        // Match the definition form (`name = ...`): a plain contains() would treat
+        // `@.str.obj` as present because `@.str.obj.nl` contains it as a prefix (debug.md #31).
+        if (!header.toString().contains(name + " =")) {
             // Ensure null terminator
             String content = text;
             if (!content.endsWith("\\00")) {

@@ -201,7 +201,7 @@
 
 ### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺
 
-### 31. 🟡 `Stdout.print(对象)` 输出乱码 —— 对 `%CangX*` 走固定 `%s` 直接打结构体字节，可能越界读。修复：对象类型改打 `<ClassName@addr>`（取 className 标签 + ptrtoint）或调用 toString()（若有）。用户串含 `%` 是安全的（格式串为编译器常量）
+### 31. ✅ `Stdout.print(对象)` 输出乱码 —— 已修复（对象打 `<ClassName@addr>`）pointer 分支区分 i8*（String/数组，%s 不变）与 %X* 对象：对象走新常量 `<%s@%p>` + 类名常量 + bitcast 指针（null 仍打 null；用户 % 串安全——格式是编译器常量）。顺带修 ensureStringConstant 的 contains 子串误判（`@.str.obj` 被 `@.str.obj.nl` 前缀骗过导致 undefined——改匹配 `name + " ="` 定义形态）。t_print_obj（对象/无换行/null/%串四断言）；回归 92/92
 
 ### 32. ✅ 自由/静态函数返回数组链式 `.length()` 报错 —— 已修复
 - 原现象：实例调用路径附了 Array semanticType，独立/静态调用路径没附 → `Unknown method: i8*.length`。
