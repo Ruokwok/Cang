@@ -262,14 +262,29 @@ public class Parser {
     private ClassDecl parseClassDecl() {
         int line = current().line;
         expect(TokenType.CLASS);
-        // Allow type keywords as class names (e.g., class String)
+        // Class name with optional private-constructor modifier '_' — the underscore is a
+        // MODIFIER, not part of the name (user rule: namespaces/types/imports keep `Server`):
+        //   class _Server(...)   and   class _ Server(...)   both declare `Server`, private.
+        boolean isPrivate = false;
         String name;
-        if (check(TokenType.IDENT)) {
+        if (check(TokenType.IDENT) && current().value.equals("_")) {
+            advance();
+            isPrivate = true;
+            name = expect(TokenType.IDENT).value;
+        } else if (check(TokenType.IDENT) && current().value.length() > 1
+                && current().value.startsWith("_")) {
+            isPrivate = true;
+            name = advance().value.substring(1);
+        } else if (check(TokenType.IDENT)) {
             name = advance().value;
         } else if (TokenType.isTypeKeyword(current().type) || check(TokenType.VOID)) {
             name = advance().value;
         } else {
             error("Expected class name");
+            name = "unknown";
+        }
+        if (name == null || name.isEmpty()) {
+            error("Expected class name after '_'");
             name = "unknown";
         }
         List<String> genericParams = new ArrayList<>();
@@ -315,6 +330,7 @@ public class Parser {
 
         ClassDecl cd = new ClassDecl(name, superClass, new ArrayList<>(), ctorParams, line);
         cd.isEntryPoint = true;
+        cd.isPrivateCtor = isPrivate;
         cd.superArgs = superArgs;
         cd.genericParams = genericParams;
         return cd;

@@ -387,6 +387,7 @@ public abstract class AST {
         public List<AST> topLevelBody; // for entry-point class (no braces): rest of file
         public boolean isEntryPoint; // true when class has no {} and rest of file is body
         public boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
+        public boolean isPrivateCtor; // '_' modifier: `class _Server` / `class _ Server` — new only inside the class
         public List<AST> superArgs; // parent constructor arguments
         public String namespace = ""; // namespace from its source file (e.g. "cang/lang")
         public ClassDecl(String name, String superClass, List<AST> members, int line) {

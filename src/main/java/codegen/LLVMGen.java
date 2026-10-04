@@ -39,6 +39,7 @@ public class LLVMGen {
         List<FieldDecl> staticFields = new ArrayList<>(); // static fields (global)
         List<AST> superArgs = new ArrayList<>(); // parent constructor args
         boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
+        boolean isPrivateCtor; // '_' modifier on the class name: new only inside the class itself
     }
 
     static class FuncInfo {
@@ -799,6 +800,7 @@ public class LLVMGen {
         info.parentName = decl.superClass;
         info.superArgs = decl.superArgs;
         info.isAbstract = decl.isAbstract;
+        info.isPrivateCtor = decl.isPrivateCtor;
         int idx = 1; // Index 0 is type ID, start fields at 1
 
         // Add parent fields first (inheritance layout)
@@ -6492,12 +6494,13 @@ public class LLVMGen {
             throw new RuntimeException("Cannot instantiate abstract class '" + node.className
                 + "' (at line " + node.line + ")");
         }
-        // Private constructor: class _Server — only instantiable from inside the class itself
-        // (static or instance methods; the entry class's top-level body counts as its own).
-        if (ci.simpleName.startsWith("_")) {
+        // Private constructor: `class _Server` / `class _ Server` — real name is `Server`, the
+        // '_' is a modifier only; new is allowed solely inside the class's own methods
+        // (entry-class top-level counts as its own body).
+        if (ci.isPrivateCtor) {
             if (currentClassName == null || !currentClassName.equals(ci.fullName)) {
                 throw new RuntimeException("Class '" + node.className
-                    + "' has a private constructor (leading '_'); new is only allowed inside the class itself (at line "
+                    + "' has a private constructor; new is only allowed inside the class itself (at line "
                     + node.line + ")");
             }
         }
