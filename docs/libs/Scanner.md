@@ -5,7 +5,7 @@
 ## 要点
 
 - `cang/io/Scanner`：键盘/标准输入读取，**单例**（`class _ Scanner` 私有构造 + 静态工厂）
-- 读取方法**阻塞当前线程**等待输入：`readLine()` 整行、`readKey()` 单键（含 esc/enter/方向键）
+- 读取方法**阻塞当前线程**等待输入：`readLine()` 整行、`readKey(ms?)` 单键（含 esc/enter/方向键；带毫秒参数可超时返回 -1）
 - `KEY_*` 静态常量用于比较键码；显式 `import cang/io/Scanner`（cang/io 不自动加载）
 
 ## 用法
@@ -35,7 +35,7 @@ if (k == Scanner.KEY_UP) {
 | 方法 / 常量 | 说明 |
 |---|---|
 | `static Scanner get()` | 获取单例实例（外部 `new Scanner()` 编译报错——私有构造） |
-| `int readKey()` | **阻塞**读一键，返回键码（无回显）。普通字符=ASCII 0..127；`enter=13` `esc=27` `tab=9` `backspace=8`；方向键/功能键 = **256+扫描码**（up=328 down=332 left=331 right=333） |
+| `int readKey()` / `int readKey(int timeoutMs)` | **阻塞**读一键（无回显）。`readKey()` 永久等待；`readKey(ms)` 最多等 ms 毫秒，**超时或 EOF 返回 -1**（`-1` 参数 = 永久）。键码：普通字符=ASCII 0..127；`enter=13` `esc=27` `tab=9` `backspace=8`；方向键/功能键 = **256+扫描码**（up=328 down=332 left=331 right=333） |
 | `String readLine()` | **阻塞**读一行（回显，enter 结束），去掉末尾换行；**EOF 返回 null**（管道/文件重定向到尾时） |
 | `KEY_ENTER/KEY_ESC/KEY_TAB/KEY_BACKSPACE` | 13 / 27 / 9 / 8 |
 | `KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT` | 328 / 332 / 331 / 333（Windows `_getch` 扫描码+256） |

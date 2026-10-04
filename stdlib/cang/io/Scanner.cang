@@ -17,11 +17,16 @@ static func Scanner get() {
     return instance
 }
 
-# 阻塞读一个按键（无回显）。返回键码：
+# 阻塞读一个按键（无回显）。
+#   readKey()        —— 永久等待（等价 readKey(-1)）
+#   readKey(ms)      —— 超时毫秒：-1 永久等待；>=0 等待至多 ms 毫秒，超时/EOF 返回 -1
+# 返回键码：
 #   普通字符 = ASCII 0..127
 #   enter=13 esc=27 tab=9 backspace=8
-#   方向键/功能键 = 256 + 扫描码（Windows：up=328 down=332 left=331 right=333）
+#   方向键/功能键 = 256 + 扫描码（Windows：up=328 down=332 left=331 right=333；POSIX raw 下
+#   ESC[A/B/C/D 映射为同一组值）
 native func int readKey()
+native func int readKey(int timeoutMs)
 
 # 阻塞读一行（回显，enter 结束），去掉末尾换行；EOF 返回 null
 native func String readLine()

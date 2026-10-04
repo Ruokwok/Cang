@@ -1149,7 +1149,10 @@ public class LLVMGen {
             // Native overload surface (Stdout.print/println, Stderr...): declaration-only docs
             // for name-based builtin dispatch — first declaration wins instead of erroring,
             // so `import cang/lang/Stdout` no longer crashes (was: Duplicate function).
-            if (existing.isNative && decl.isNative) {
+            if (existing.isNative && decl.isNative && existing.paramTypes.equals(newTypes)) {
+                // Same native signature re-registered (e.g. duplicated imports) — first wins.
+                // DIFFERENT signatures are genuine native overloads (readKey(), readKey(int),
+                // the Stdout.print family) and must fall through to overload registration.
                 return;
             }
             String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
@@ -7219,6 +7222,9 @@ public class LLVMGen {
         }
         if (win) {
             header.append("declare i32 @_getch()\n");
+            header.append("declare i32 @kbhit()\n");
+            header.append("declare void @Sleep(i32)\n");
+            header.append("declare i64 @GetTickCount64()\n");
             // FILE* __acrt_iob_func(int) — same i8* form the stderr path already declares.
             if (!header.toString().contains("declare i8* @__acrt_iob_func(")) {
                 header.append("declare i8* @__acrt_iob_func(i32)\n");
@@ -7234,10 +7240,41 @@ public class LLVMGen {
             header.append("declare i32 @poll(i8*, i64, i32)\n");
         }
 
-        // ---- readKey ----
+        // ---- readKey (overloads: readKey() -> readKey.1(-1); readKey(ms) timed) ----
         StringBuilder rk = new StringBuilder();
+        // 0-arg: permanent wait (forwards to the timed entry with -1)
         rk.append("define i32 @cang_io_Scanner.readKey(i8* %this) {\nentry:\n");
+        rk.append("  %r0 = call i32 @cang_io_Scanner.readKey.1(i8* %this, i32 -1)\n");
+        rk.append("  ret i32 %r0\n");
+        rk.append("}\n\n");
+        // 1-arg: timeout in milliseconds; -1 = block forever; timeout/EOF -> -1
+        rk.append("define i32 @cang_io_Scanner.readKey.1(i8* %this, i32 %timeoutMs) {\nentry:\n");
         if (win) {
+            // -1 skips the wait; otherwise poll kbhit + GetTickCount64 + Sleep(1).
+            // (WaitForSingleObject on a redirected pipe handle reads as always-signaled —
+            // verified — so a kernel wait would fall into _getch and hang; kbhit is 0 on
+            // pipes, giving a correct timeout there and instant readiness on a console.)
+            rk.append("  %neg = icmp slt i32 %timeoutMs, 0\n");
+            rk.append("  br i1 %neg, label %direct, label %wait\n");
+            rk.append("wait:\n");
+            rk.append("  %t0 = call i64 @GetTickCount64()\n");
+            rk.append("  br label %loopk\n");
+            rk.append("loopk:\n");
+            rk.append("  %hit = call i32 @kbhit()\n");
+            rk.append("  %has = icmp ne i32 %hit, 0\n");
+            rk.append("  br i1 %has, label %direct, label %tick\n");
+            rk.append("tick:\n");
+            rk.append("  %now = call i64 @GetTickCount64()\n");
+            rk.append("  %t0z = zext i32 %timeoutMs to i64\n");
+            rk.append("  %dt = sub i64 %now, %t0\n");
+            rk.append("  %exp = icmp uge i64 %dt, %t0z\n");
+            rk.append("  br i1 %exp, label %notready, label %nap\n");
+            rk.append("nap:\n");
+            rk.append("  call void @Sleep(i32 1)\n");
+            rk.append("  br label %loopk\n");
+            rk.append("notready:\n");
+            rk.append("  ret i32 -1\n");
+            rk.append("direct:\n");
             // _getch: plain ASCII/13/27..., or 0/0xE0 prefix + scan code for special keys.
             // Special keys are returned as 256 + scancode so KEY_UP=328 (256+72) etc. match.
             rk.append("  %c0 = call i32 @_getch()\n");
@@ -7268,6 +7305,16 @@ public class LLVMGen {
             rk.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %tr, i8* %to, i64 64, i1 false)\n");
             rk.append("  call void @cfmakeraw(i8* %tr)\n");
             rk.append("  %tw = call i32 @tcsetattr(i32 0, i32 0, i8* %tr)\n");
+            // poll(timeoutMs) gates readability: -1 = infinite (native poll semantics),
+            // >=0 wakes on data/EOF or returns -1 on timeout. Then read the byte.
+            rk.append("  store i64 4294967296, i64* %pfd\n");
+            rk.append("  %prk = call i32 @poll(i8* %pfd, i64 1, i32 %timeoutMs)\n");
+            rk.append("  %rdy = icmp sgt i32 %prk, 0\n");
+            rk.append("  br i1 %rdy, label %doread, label %toT\n");
+            rk.append("toT:\n");
+            rk.append("  store i32 -1, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("doread:\n");
             rk.append("  %n0 = call i64 @read(i32 0, i8* %cb, i64 1)\n");
             rk.append("  %e0 = icmp slt i64 %n0, 1\n");
             rk.append("  br i1 %e0, label %eofb, label %chk\n");
