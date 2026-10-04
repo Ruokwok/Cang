@@ -7493,6 +7493,128 @@ public class LLVMGen {
         rl.append("  ret i8* %buf\n");
         rl.append("}\n\n");
         header.append(rl);
+
+        // ---- readChar: String-returning single-character read (reuses readKey.1 for all
+        // waiting/ESC/special-key/pending logic, then converts the key code to a string) ----
+        String escS = ensureStringConstant("@.s.ch.esc", "<ESC>\\00", 6);
+        String entS = ensureStringConstant("@.s.ch.enter", "<ENTER>\\00", 8);
+        String tabS = ensureStringConstant("@.s.ch.tab", "<TAB>\\00", 6);
+        String bkspS = ensureStringConstant("@.s.ch.bksp", "<BACKSPACE>\\00", 12);
+        String upS = ensureStringConstant("@.s.ch.up", "<UP>\\00", 5);
+        String dnS = ensureStringConstant("@.s.ch.dn", "<DOWN>\\00", 7);
+        String lfS = ensureStringConstant("@.s.ch.lf", "<LEFT>\\00", 7);
+        String rtS = ensureStringConstant("@.s.ch.rt", "<RIGHT>\\00", 8);
+        String keyFmt = ensureStringConstant("@.fmt.ch.key", "<KEY:%d>\\00", 9);
+        StringBuilder cc = new StringBuilder();
+        // 0-arg forward
+        cc.append("define i8* @cang_io_Scanner.readChar(i8* %this) {\nentry:\n");
+        cc.append("  %r0 = call i8* @cang_io_Scanner.readChar.1(i8* %this, i32 -1)\n");
+        cc.append("  ret i8* %r0\n");
+        cc.append("}\n\n");
+        cc.append("define i8* @cang_io_Scanner.readChar.1(i8* %this, i32 %ms) {\nentry:\n");
+        // Reuse readKey.1: timeout/-1, ESC sequences, 0xE0 protection, pending byte, raw mode.
+        cc.append("  %k = call i32 @cang_io_Scanner.readKey.1(i8* %this, i32 %ms)\n");
+        cc.append("  %isneg = icmp eq i32 %k, -1\n");
+        cc.append("  br i1 %isneg, label %nullb, label %ck256\n");
+        cc.append("nullb:\n  ret i8* null\n");
+        cc.append("ck256:\n");
+        cc.append("  %ge256 = icmp sge i32 %k, 256\n");
+        cc.append("  br i1 %ge256, label %keynamed, label %ck128\n");
+        // >=256: named special keys, else <KEY:code>
+        cc.append("keynamed:\n");
+        cc.append("  %ku = icmp eq i32 %k, 328\n  br i1 %ku, label %sUp, label %ckdn\n");
+        cc.append("sUp:\n  ret i8* getelementptr ([5 x i8], [5 x i8]* ").append(upS).append(", i32 0, i32 0)\n");
+        cc.append("ckdn:\n  %kd = icmp eq i32 %k, 332\n  br i1 %kd, label %sDn, label %cklf\n");
+        cc.append("sDn:\n  ret i8* getelementptr ([7 x i8], [7 x i8]* ").append(dnS).append(", i32 0, i32 0)\n");
+        cc.append("cklf:\n  %kl = icmp eq i32 %k, 331\n  br i1 %kl, label %sLf, label %ckrt\n");
+        cc.append("sLf:\n  ret i8* getelementptr ([7 x i8], [7 x i8]* ").append(lfS).append(", i32 0, i32 0)\n");
+        cc.append("ckrt:\n  %kr = icmp eq i32 %k, 333\n  br i1 %kr, label %sRt, label %keycode\n");
+        cc.append("sRt:\n  ret i8* getelementptr ([8 x i8], [8 x i8]* ").append(rtS).append(", i32 0, i32 0)\n");
+        cc.append("keycode:\n");
+        cc.append("  %kbuf = call i8* @").append(allocFn()).append("(i64 16)\n");
+        cc.append("  call i32 (i8*, i8*, ...) @sprintf(i8* %kbuf, i8* getelementptr ([9 x i8], [9 x i8]* ")
+             .append(keyFmt).append(", i32 0, i32 0), i32 %k)\n");
+        cc.append("  ret i8* %kbuf\n");
+        // <128: named control keys or a plain one-byte string
+        cc.append("ck128:\n");
+        cc.append("  %ge128 = icmp sge i32 %k, 128\n");
+        cc.append("  br i1 %ge128, label %multibyte, label %ctrl\n");
+        cc.append("ctrl:\n");
+        cc.append("  %c27 = icmp eq i32 %k, 27\n  br i1 %c27, label %sEsc, label %ck13\n");
+        cc.append("sEsc:\n  ret i8* getelementptr ([6 x i8], [6 x i8]* ").append(escS).append(", i32 0, i32 0)\n");
+        cc.append("ck13:\n  %c13 = icmp eq i32 %k, 13\n  br i1 %c13, label %sEn, label %ck9\n");
+        cc.append("sEn:\n  ret i8* getelementptr ([8 x i8], [8 x i8]* ").append(entS).append(", i32 0, i32 0)\n");
+        cc.append("ck9:\n  %c9 = icmp eq i32 %k, 9\n  br i1 %c9, label %sTab, label %ck8\n");
+        cc.append("sTab:\n  ret i8* getelementptr ([6 x i8], [6 x i8]* ").append(tabS).append(", i32 0, i32 0)\n");
+        cc.append("ck8:\n  %c8k = icmp eq i32 %k, 8\n  br i1 %c8k, label %sBk, label %ascii\n");
+        cc.append("sBk:\n  ret i8* getelementptr ([12 x i8], [12 x i8]* ").append(bkspS).append(", i32 0, i32 0)\n");
+        cc.append("ascii:\n");
+        cc.append("  %abuf = call i8* @").append(allocFn()).append("(i64 2)\n");
+        cc.append("  %a8 = trunc i32 %k to i8\n");
+        cc.append("  store i8 %a8, i8* %abuf\n");
+        cc.append("  %ap1 = getelementptr i8, i8* %abuf, i64 1\n");
+        cc.append("  store i8 0, i8* %ap1\n");
+        cc.append("  ret i8* %abuf\n");
+        // >=128: multi-byte (CJK) — length from the lead byte, continuation via readKey.1
+        cc.append("multibyte:\n");
+        cc.append("  %geF0 = icmp uge i32 %k, 240\n");
+        cc.append("  %geE0 = icmp uge i32 %k, 224\n");
+        cc.append("  %geC0 = icmp uge i32 %k, 192\n");
+        cc.append("  %n3 = select i1 %geE0, i32 3, i32 2\n");
+        cc.append("  %n4 = select i1 %geF0, i32 4, i32 %n3\n");
+        cc.append("  %n = select i1 %geC0, i32 %n4, i32 2\n");
+        cc.append("  %ns = zext i32 %n to i64\n");
+        cc.append("  %asz = add i64 %ns, 1\n");
+        cc.append("  %mbuf = call i8* @").append(allocFn()).append("(i64 %asz)\n");
+        cc.append("  %m8 = trunc i32 %k to i8\n");
+        cc.append("  store i8 %m8, i8* %mbuf\n");
+        cc.append("  %w = alloca i8*\n");
+        cc.append("  %w1 = getelementptr i8, i8* %mbuf, i64 1\n");
+        cc.append("  store i8* %w1, i8** %w\n");
+        // continuation byte 1 (only when n >= 2 — always true for lead >= 0xC0, kept generic)
+        cc.append("  %g1 = icmp sge i32 %n, 2\n");
+        cc.append("  br i1 %g1, label %r1, label %endm\n");
+        cc.append("r1:\n");
+        cc.append("  %b1 = call i32 @cang_io_Scanner.readKey.1(i8* %this, i32 -1)\n");
+        cc.append("  %b1n = icmp eq i32 %b1, -1\n");
+        cc.append("  br i1 %b1n, label %endm, label %f1\n");
+        cc.append("f1:\n");
+        cc.append("  %b1v = trunc i32 %b1 to i8\n");
+        cc.append("  %w1p = load i8*, i8** %w\n");
+        cc.append("  store i8 %b1v, i8* %w1p\n");
+        cc.append("  %w1n = getelementptr i8, i8* %w1p, i64 1\n");
+        cc.append("  store i8* %w1n, i8** %w\n");
+        cc.append("  br label %chk3\n");
+        cc.append("chk3:\n  %g2 = icmp sge i32 %n, 3\n  br i1 %g2, label %r2, label %endm\n");
+        cc.append("r2:\n");
+        cc.append("  %b2 = call i32 @cang_io_Scanner.readKey.1(i8* %this, i32 -1)\n");
+        cc.append("  %b2n = icmp eq i32 %b2, -1\n");
+        cc.append("  br i1 %b2n, label %endm, label %f2\n");
+        cc.append("f2:\n");
+        cc.append("  %b2v = trunc i32 %b2 to i8\n");
+        cc.append("  %w2p = load i8*, i8** %w\n");
+        cc.append("  store i8 %b2v, i8* %w2p\n");
+        cc.append("  %w2n = getelementptr i8, i8* %w2p, i64 1\n");
+        cc.append("  store i8* %w2n, i8** %w\n");
+        cc.append("  br label %chk4\n");
+        cc.append("chk4:\n  %g3 = icmp sge i32 %n, 4\n  br i1 %g3, label %r3, label %endm\n");
+        cc.append("r3:\n");
+        cc.append("  %b3 = call i32 @cang_io_Scanner.readKey.1(i8* %this, i32 -1)\n");
+        cc.append("  %b3n = icmp eq i32 %b3, -1\n");
+        cc.append("  br i1 %b3n, label %endm, label %f3\n");
+        cc.append("f3:\n");
+        cc.append("  %b3v = trunc i32 %b3 to i8\n");
+        cc.append("  %w3p = load i8*, i8** %w\n");
+        cc.append("  store i8 %b3v, i8* %w3p\n");
+        cc.append("  %w3n = getelementptr i8, i8* %w3p, i64 1\n");
+        cc.append("  store i8* %w3n, i8** %w\n");
+        cc.append("  br label %endm\n");
+        cc.append("endm:\n");
+        cc.append("  %wend = load i8*, i8** %w\n");
+        cc.append("  store i8 0, i8* %wend\n");
+        cc.append("  ret i8* %mbuf\n");
+        cc.append("}\n\n");
+        header.append(cc);
     }
 
     private void emitFileRuntime() {

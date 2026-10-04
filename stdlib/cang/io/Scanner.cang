@@ -28,6 +28,16 @@ static func Scanner get() {
 native func int readKey()
 native func int readKey(int timeoutMs)
 
+# 读一个"字符"并返回 String（readKey 的字符串形态）：
+#   普通可打印字符 -> 该字符本身（"a"、"q"）；多字节中文按 UTF-8/GBK 结构聚合成一个字符串（"中"）
+#   特殊键 -> 命名串，用 == 内容比较：
+#     "<ENTER>" "<ESC>" "<TAB>" "<BACKSPACE>" "<UP>" "<DOWN>" "<LEFT>" "<RIGHT>"
+#     其余功能键 "<KEY:码>"
+#   超时（readChar(ms)）或 EOF -> null
+# 比较示例：if (ch == "<ESC>") { ... }
+native func String readChar()
+native func String readChar(int timeoutMs)
+
 # 阻塞读一行（回显，enter 结束），去掉末尾换行；EOF 返回 null。
 #   readLine()     —— 永久等待
 #   readLine(ms)   —— 最多等 ms 毫秒，超时返回 null（与 EOF 的 null 统一为"无数据"）

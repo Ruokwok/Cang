@@ -36,9 +36,30 @@ if (k == Scanner.KEY_UP) {
 |---|---|
 | `static Scanner get()` | 获取单例实例（外部 `new Scanner()` 编译报错——私有构造） |
 | `int readKey()` / `int readKey(int timeoutMs)` | **阻塞**读一键（无回显）。`readKey()` 永久等待；`readKey(ms)` 最多等 ms 毫秒，**超时或 EOF 返回 -1**（`-1` 参数 = 永久）。键码：普通字符=ASCII 0..127；`enter=13` `esc=27` `tab=9` `backspace=8`；方向键/功能键 = **256+扫描码**（up=328 down=332 left=331 right=333） |
+| `String readChar()` / `String readChar(int timeoutMs)` | **读一个"字符"返回 String**：可打印字符返回其本身（`"a"`）；**多字节中文按 UTF-8/GBK 结构聚合为一个字符串**（`"中"`）；特殊键返回**命名串**用 `==` 比较：`"<ENTER>" "<ESC>" "<TAB>" "<BACKSPACE>" "<UP>" "<DOWN>" "<LEFT>" "<RIGHT>"`，其余功能键 `"<KEY:码>"`；超时/EOF → `null` |
 | `String readLine()` | **阻塞**读一行（回显，enter 结束），去掉末尾换行；**EOF 返回 null**（管道/文件重定向到尾时） |
 | `KEY_ENTER/KEY_ESC/KEY_TAB/KEY_BACKSPACE` | 13 / 27 / 9 / 8 |
 | `KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT` | 328 / 332 / 331 / 333（Windows `_getch` 扫描码+256） |
+
+## readChar：字符形态的按键读取（推荐做输入循环）
+
+```cang
+import cang/io/Scanner
+
+class Main()
+var sc = Scanner.get()
+Stdout.println("type, esc to quit")
+while (true) {
+    String ch = sc.readChar()        # 单字符；中文聚合成一个字符串
+    if (ch == "<ESC>") { break }     # 特殊键用命名串比较
+    if (ch == "<ENTER>") { Stdout.println() }
+    Stdout.println(ch)
+}
+```
+
+- `readChar(ms)` 超时或 EOF 返回 `null`（监听循环可 `if (ch == null) break`）；
+- 中文/多字节：按首字节结构聚合 2-4 字节，UTF-8 严格正确、GBK 常见字正确（见下节）；
+- `readKey`（int 码）与 `readChar`（String）共享同一套等待/ESC/超时逻辑，选顺手的用。
 
 ## 键码读取循环示例
 
