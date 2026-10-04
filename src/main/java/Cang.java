@@ -137,6 +137,9 @@ public class Cang {
             mainProgram.setSourceFile(filename);
         } catch (RuntimeException e) {
             throw wrapError(e);
+        } catch (StackOverflowError e) {
+            // Depth guard in parsePrimary normally fires first; this is the hard floor (debug.md #6).
+            throw new CompileError("Expression nesting too deep", filename, 1, 1, "", 1);
         }
 
         // 2b. Resolve imports - parse imported files and merge
@@ -260,6 +263,8 @@ public class Cang {
                                 prog.setSourceFile(f.getPath());
                             } catch (RuntimeException e) {
                                 throw wrapError(e);
+                            } catch (StackOverflowError e) {
+                                throw new CompileError("Expression nesting too deep", f.getPath(), 1, 1, "", 1);
                             }
 
                             // Find class and attach methods
@@ -367,6 +372,8 @@ public class Cang {
             } catch (RuntimeException e) {
                 // Format error with imported file context
                 throw wrapError(e);
+            } catch (StackOverflowError e) {
+                throw new CompileError("Expression nesting too deep", importFile, 1, 1, "", 1);
             }
 
             // Find ClassDecl and attach functions as methods

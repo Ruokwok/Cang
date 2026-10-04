@@ -43,10 +43,9 @@
 - 验证：`t_loopalloc`（300 万 while + 200 万 for 循环体声明 + break/continue=9）✓、`t_feloop`（数组/List for-each 各 10 万 + list 内 break=3）✓；回归 33/33。
 - 已知残留（可接受）：循环体内 throw 跳出时未 restore（同函数 handler 场景栈帧泄漏一次，有界）；循环内 `return` 无需 restore（函数帧整体释放）。
 
-### 6. 🔴 编译器自身深嵌套 StackOverflowError —— 待修
-- 现象：2 万层括号 → 未捕获 `java.lang.StackOverflowError` 裸栈回溯。
-- 位置：`Parser.java` 递归下降（约 833 行，表达式递归）。
-- 修复指引：顶层 parse 入口 `catch (StackOverflowError e)` → 转成 `CompileError("expression nesting too deep")`（带文件行列）；可选：给递归深度计数、超过阈值主动抛 CompileError（更可控）。
+### 6. ✅ 编译器自身深嵌套 StackOverflowError —— 已修复（深度计数 + 三处硬兜底）
+- 双保险：①`Parser.parsePrimary` 入口 exprDepth 计数，>10000 主动抛 `Expression nesting too deep (at line N)`（精确行号，wrapError 标准渲染；触顶即编译终止故无需回退）；②主 parse / auto-load / loadImport 三处 catch `StackOverflowError` → `CompileError`（Error 不进 RuntimeException catch——此前穿透成裸栈的根因）。
+- 实测 t_deep_nest（20000 层括号）：`Expression nesting too deep` + 无裸栈回溯；回归 104/104。
 
 ---
 

@@ -12,6 +12,7 @@ public class Parser {
     private final List<Token> tokens;
     private int pos;
     private int lastArraySize = -1; // set by parseType: >=0 for T[N], -1 otherwise
+    private int exprDepth = 0;      // recursion guard (debug.md #6)
 
     public Parser(List<Token> tokens) {
         this.tokens = tokens;
@@ -990,6 +991,12 @@ public class Parser {
 
     private AST parsePrimary() {
         int line = current().line;
+        // Recursion guard (debug.md #6): a deep nest (e.g. 20k parentheses) would otherwise
+        // blow the JVM stack with an uncaught StackOverflowError. No decrement needed —
+        // tripping the guard aborts compilation anyway.
+        if (++exprDepth > 10000) {
+            throw new RuntimeException("Expression nesting too deep (at line " + line + ")");
+        }
 
         if (check(TokenType.INT_LIT)) return new IntLit(advance().value, line);
         if (check(TokenType.LONG_LIT)) return new LongLit(advance().value, line);
