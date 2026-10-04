@@ -207,7 +207,7 @@
 - 原现象：实例调用路径附了 Array semanticType，独立/静态调用路径没附 → `Unknown method: i8*.length`。
 - 修复（lambda 捕获批次顺带）：三处方法/函数调用返回点统一 `retSem = (isArraySemanticType || isFunctionType) ? returnType : null` —— 同时解决"方法返回 `Function<...>` 赋值报 `found object`"（checkFunctionValue 依赖 semanticType）
 
-### 33. 🟡 `free f`（File 对象）不 free `path` 字段 —— path 为堆串（拼接而来）时 `--no-gc` 必漏。修复：free 对象时按 ClassInfo.fieldTypes 遍历 free 指针字段（字符串字段可 free；注意递归字段/环——v1 只 free 一层 String 字段，文档注明）。
+### 33. ✅ `free f`（File 对象）不 free `path` 字段 —— 已修复（GC 模式门控 free）对象字段遍历在 #18 基础上扩到 String 字段，但**必须用 `GC_is_heap_ptr` 门控**——直接 GC_free 常量实测 0xC0000005 崩（Boehm 对非堆指针是 UB 而非 no-op）；--no-gc 的 libc free 无法区分常量/堆串 → 该模式跳过 String 字段（文档边界）。实测双模式 `literal freed|concat freed` 不崩、堆串真释放；v1 一层不变。t_free_file；回归 94/94
 
 ---
 

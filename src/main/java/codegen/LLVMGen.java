@@ -1255,6 +1255,7 @@ public class LLVMGen {
         if (gcEnabled) {
             header.append("declare void @GC_gcollect()\n");
             header.append("declare void @GC_init()\n");
+        header.append("declare i1 @GC_is_heap_ptr(i8*)\n");
             header.append("declare i8* @GC_malloc(i64)\n");
             header.append("declare i8* @GC_realloc(i8*, i64)\n");
             header.append("declare void @GC_free(i8*)\n");
@@ -2397,15 +2398,23 @@ public class LLVMGen {
                 body.append("  ").append(value).append(" = load ").append(ptr.type)
                      .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
                 // Free Array fields of the object along with it (debug.md #18: List/Dict data
-                // buffers). v1 one level only: array-header fields (always heap) — String fields
-                // may point into the read-only constant pool and are skipped; nested object
-                // fields are left to the GC. NULL fields are skipped at runtime.
+                // buffers) and — in GC mode only — String fields such as File.path (debug.md #33).
+                // String frees are gated by GC_is_heap_ptr: GC_free on a constant-pool pointer
+                // crashes (verified), and --no-gc's libc free cannot tell constants from heap
+                // strings, so that mode skips String fields (documented). One level only;
+                // nested object fields stay with the GC. NULL fields are skipped at runtime.
                 String freeCls = extractClassName(ptr.type);
                 ClassInfo freeCi = freeCls != null ? classes.get(freeCls) : null;
                 if (freeCi != null && !freeCi.fieldIndices.isEmpty()) {
                     for (Map.Entry<String, Integer> fe : freeCi.fieldIndices.entrySet()) {
                         String ft = freeCi.fieldTypes.get(fe.getValue() - 1);
-                        if (ft == null || !ft.startsWith("Array<")) continue;
+                        if (ft == null) continue;
+                        boolean freeArray = ft.startsWith("Array<");
+                        // String fields (e.g. File.path): free ONLY under GC mode — GC_free on a
+                        // constant-pool pointer is a safe no-op, while --no-gc's libc free cannot
+                        // distinguish constants from heap strings and would crash (debug.md #33).
+                        boolean freeString = gcEnabled && (ft.equals("String") || ft.equals("str"));
+                        if (!freeArray && !freeString) continue;
                         String fllvm = toLLVMType(ft);
                         String fptr = "%free.fptr." + tmpCount++;
                         String fval = "%free.fval." + tmpCount++;
@@ -2427,8 +2436,21 @@ public class LLVMGen {
                             body.append("  ").append(fcast).append(" = bitcast ").append(fllvm).append(" ")
                                  .append(fval).append(" to i8*\n");
                         }
-                        body.append("  call void @").append(freeFn()).append("(i8* ").append(fcast).append(")\n");
-                        body.append("  br label %").append(fskip).append("\n\n");
+                        if (freeString) {
+                            // Gate on the Boehm heap: freeing a constant-pool pointer is UB/crash.
+                            String heap = "%free.hp." + tmpCount++;
+                            String fdo = "free.heap." + labelCount++;
+                            body.append("  ").append(heap).append(" = call i1 @GC_is_heap_ptr(i8* ")
+                                 .append(fcast).append(")\n");
+                            body.append("  br i1 ").append(heap).append(", label %").append(fdo)
+                                 .append(", label %").append(fskip).append("\n");
+                            body.append(fdo).append(":\n");
+                            body.append("  call void @").append(freeFn()).append("(i8* ").append(fcast).append(")\n");
+                            body.append("  br label %").append(fskip).append("\n\n");
+                        } else {
+                            body.append("  call void @").append(freeFn()).append("(i8* ").append(fcast).append(")\n");
+                            body.append("  br label %").append(fskip).append("\n\n");
+                        }
                         body.append(fskip).append(":\n");
                     }
                 }
