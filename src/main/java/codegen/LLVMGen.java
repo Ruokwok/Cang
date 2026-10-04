@@ -3145,6 +3145,18 @@ public class LLVMGen {
 
     // ==================== Expression generation ====================
 
+    /** LLVM floating constants must contain a '.' — `1e10` parses as an integer to LLVM and
+     *  fails (debug.md #25). Java's toString always emits the dot (`1.0E10`). */
+    private String normalizeFloatText(String text, boolean isDouble) {
+        try {
+            return isDouble
+                ? Double.toString(Double.parseDouble(text))
+                : Float.toString(Float.parseFloat(text));
+        } catch (NumberFormatException e) {
+            return text;
+        }
+    }
+
     private LLVMValue generateExpr(AST node) {
         if (node instanceof IntLit) {
             String val = ((IntLit) node).text;
@@ -3162,10 +3174,10 @@ public class LLVMGen {
         if (node instanceof FloatLit) {
             // Convert float literal to double for LLVM (float is promoted in printf)
             String text = ((FloatLit) node).text;
-            return new LLVMValue(text, "float");
+            return new LLVMValue(normalizeFloatText(text, false), "float");
         }
         if (node instanceof DoubleLit) {
-            return new LLVMValue(((DoubleLit) node).text, "double");
+            return new LLVMValue(normalizeFloatText(((DoubleLit) node).text, true), "double");
         }
         if (node instanceof BoolLit) {
             return new LLVMValue(((BoolLit) node).value ? "1" : "0", "i1");

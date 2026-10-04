@@ -86,8 +86,10 @@ public class Lexer {
         // Multi-line string literal (backticks)
         if (c == '`') return readMultiLineString(startLine, startCol);
 
-        // Number literal
-        if (Character.isDigit(c)) return readNumber(startLine, startCol);
+        // Number literal: digits, or '.5' style leading-dot floats (debug.md #25)
+        if (Character.isDigit(c) || (c == '.' && pos + 1 < code.length() && Character.isDigit(code.charAt(pos + 1)))) {
+            return readNumber(startLine, startCol);
+        }
 
         // Identifier or keyword
         if (Character.isLetter(c) || c == '_') return readIdentOrKeyword(startLine, startCol);
@@ -112,7 +114,11 @@ public class Lexer {
                     case '"': sb.append('"'); break;
                     case '\'': sb.append('\''); break;
                     case '0': sb.append('\0'); break;
-                    default: sb.append(esc); break;
+                    case '\n': sb.append('\n'); break; // escaped newline continuation (debug.md #26)
+                    default:
+                        // Unknown escape: reject instead of silently dropping the backslash (debug.md #25).
+                        throw new RuntimeException("Lexer error at line " + startLine + ", column " + startCol
+                            + ": Unknown escape sequence '\\" + esc + "'");
                 }
                 if (esc == '\n') {
                     // Escaped newline also advances the line counter (debug.md #26).
@@ -159,7 +165,10 @@ public class Lexer {
                     case 'r': sb.append('\r'); break;
                     case '\\': sb.append('\\'); break;
                     case '`': sb.append('`'); break;
-                    default: sb.append(esc); break;
+                    case '\n': sb.append('\n'); break; // escaped newline continuation
+                    default:
+                        throw new RuntimeException("Lexer error at line " + startLine + ", column " + startCol
+                            + ": Unknown escape sequence '\\" + esc + "'");
                 }
             } else {
                 if (code.charAt(pos) == '\n') {
@@ -202,12 +211,28 @@ public class Lexer {
         // Digits with underscore separators
         while (pos < code.length() && (Character.isDigit(code.charAt(pos)) || code.charAt(pos) == '_')) advance();
 
-        // Decimal point
+        // Decimal point: `3.` is a float (Java rule) — digits after it optional. A following
+        // second dot is NOT consumed so `..`-like sequences can't be swallowed (debug.md #25).
         if (pos < code.length() && code.charAt(pos) == '.' &&
-            pos + 1 < code.length() && (Character.isDigit(code.charAt(pos + 1)) || code.charAt(pos + 1) == '_')) {
+            !(pos + 1 < code.length() && code.charAt(pos + 1) == '.')) {
             isFloat = true;
-            advance(); // skip .
+            advance(); // '.'
             while (pos < code.length() && (Character.isDigit(code.charAt(pos)) || code.charAt(pos) == '_')) advance();
+        }
+
+        // Exponent: 1e10, 2.5E-3, 1E+12 (debug.md #25). Trailing 'e' without digits rolls back.
+        if (pos < code.length() && (code.charAt(pos) == 'e' || code.charAt(pos) == 'E')) {
+            int savePos = pos;
+            int saveCol = column;
+            advance();
+            if (pos < code.length() && (code.charAt(pos) == '+' || code.charAt(pos) == '-')) advance();
+            if (pos < code.length() && (Character.isDigit(code.charAt(pos)) || code.charAt(pos) == '_')) {
+                isFloat = true;
+                while (pos < code.length() && (Character.isDigit(code.charAt(pos)) || code.charAt(pos) == '_')) advance();
+            } else {
+                pos = savePos;   // not an exponent — roll back so `1e` stays `1` + ident
+                column = saveCol;
+            }
         }
 
         String raw = code.substring(start, pos);
