@@ -59,7 +59,7 @@ func void call(Function<Void, int> f) {
 }
 
 int x = 41
-call((i) -> void {
+call((i) -> {
     Stdout.println(i + x)     # 按值捕获 x
 })
 ```
@@ -76,7 +76,7 @@ call((i) -> void {
 
 ```cang
 int x = 41
-Function<Void, int> f = (i) -> void {
+Function<Void, int> f = (i) -> {
     Stdout.println(i + x)
 }
 f(1)        # 42
