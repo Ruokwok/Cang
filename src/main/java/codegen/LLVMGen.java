@@ -7225,6 +7225,12 @@ public class LLVMGen {
             header.append("declare i32 @kbhit()\n");
             header.append("declare void @Sleep(i32)\n");
             header.append("declare i64 @GetTickCount64()\n");
+            header.append("declare i32 @GetFileType(i8*)\n");
+            header.append("declare i32 @PeekNamedPipe(i8*, i8*, i32, i8*, i32*, i32*)\n");
+            // readLine still waits on the console input handle (readKey polls kbhit instead)
+            if (!header.toString().contains("declare i8* @GetStdHandle(")) {
+                header.append("declare i8* @GetStdHandle(i32)\n");
+            }
             // FILE* __acrt_iob_func(int) — same i8* form the stderr path already declares.
             if (!header.toString().contains("declare i8* @__acrt_iob_func(")) {
                 header.append("declare i8* @__acrt_iob_func(i32)\n");
@@ -7380,9 +7386,67 @@ public class LLVMGen {
         rk.append("}\n\n");
         header.append(rk);
 
-        // ---- readLine ----
+        // ---- readLine (overloads: readLine() forever; readLine(ms) -> null on timeout) ----
         StringBuilder rl = new StringBuilder();
+        // 0-arg forward (-1 = wait forever; EOF still returns null via fgets)
         rl.append("define i8* @cang_io_Scanner.readLine(i8* %this) {\nentry:\n");
+        rl.append("  %r0 = call i8* @cang_io_Scanner.readLine.1(i8* %this, i32 -1)\n");
+        rl.append("  ret i8* %r0\n");
+        rl.append("}\n\n");
+        // 1-arg main: gate readiness before fgets; timeout -> null (same as EOF)
+        rl.append("define i8* @cang_io_Scanner.readLine.1(i8* %this, i32 %timeoutMs) {\nentry:\n");
+        rl.append("  %pfdrl = alloca i64\n");
+        if (win) {
+            // -1 skips the wait. Console: WaitForSingleObject; pipe: PeekNamedPipe polling
+            // (verified: the pipe read-end signals immediately, so a plain wait would hang
+            // inside fgets — availability must be peeked, not waited on).
+            rl.append("  %neg = icmp slt i32 %timeoutMs, 0\n");
+            rl.append("  br i1 %neg, label %ready, label %wait\n");
+            rl.append("wait:\n");
+            rl.append("  %hin = call i8* @GetStdHandle(i32 -10)\n");
+            rl.append("  %ft = call i32 @GetFileType(i8* %hin)\n");
+            rl.append("  %isp = icmp eq i32 %ft, 3\n");
+            rl.append("  br i1 %isp, label %pipewait, label %conwait\n");
+            rl.append("conwait:\n");
+            rl.append("  %wr = call i32 @WaitForSingleObject(i8* %hin, i32 %timeoutMs)\n");
+            rl.append("  %wok = icmp eq i32 %wr, 0\n");
+            rl.append("  br i1 %wok, label %ready, label %timeoutNull\n");
+            rl.append("pipewait:\n");
+            rl.append("  %t0 = call i64 @GetTickCount64()\n");
+            rl.append("  br label %loopk\n");
+            rl.append("loopk:\n");
+            rl.append("  %avail = alloca i32\n");
+            rl.append("  %pk = call i32 @PeekNamedPipe(i8* %hin, i8* null, i32 0, i8* null, i32* %avail, i32* null)\n");
+            rl.append("  %pok = icmp ne i32 %pk, 0\n");
+            rl.append("  %has = load i32, i32* %avail\n");
+            rl.append("  %hasd = icmp sgt i32 %has, 0\n");
+            rl.append("  %rdyc = and i1 %pok, %hasd\n");
+            rl.append("  br i1 %rdyc, label %ready, label %tick\n");
+            rl.append("tick:\n");
+            rl.append("  %now = call i64 @GetTickCount64()\n");
+            rl.append("  %t0z = zext i32 %timeoutMs to i64\n");
+            rl.append("  %dt = sub i64 %now, %t0\n");
+            rl.append("  %exp = icmp uge i64 %dt, %t0z\n");
+            rl.append("  br i1 %exp, label %timeoutNull, label %nap\n");
+            rl.append("nap:\n");
+            rl.append("  call void @Sleep(i32 1)\n");
+            rl.append("  br label %loopk\n");
+            rl.append("timeoutNull:\n");
+            rl.append("  ret i8* null\n");
+            rl.append("ready:\n");
+        } else {
+            // canonical stdin: a full line or EOF wakes poll; -1 jumps straight to fgets
+            rl.append("  %neg = icmp slt i32 %timeoutMs, 0\n");
+            rl.append("  br i1 %neg, label %ready, label %wait\n");
+            rl.append("wait:\n");
+            rl.append("  store i64 4294967296, i64* %pfdrl\n");
+            rl.append("  %pr = call i32 @poll(i8* %pfdrl, i64 1, i32 %timeoutMs)\n");
+            rl.append("  %prok = icmp sgt i32 %pr, 0\n");
+            rl.append("  br i1 %prok, label %ready, label %timeoutNull\n");
+            rl.append("timeoutNull:\n");
+            rl.append("  ret i8* null\n");
+            rl.append("ready:\n");
+        }
         rl.append("  %buf = call i8* @").append(allocFn()).append("(i64 4096)\n");
         if (win) {
             rl.append("  %stdin = call i8* @__acrt_iob_func(i32 0)\n");

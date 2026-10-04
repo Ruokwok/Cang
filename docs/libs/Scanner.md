@@ -5,7 +5,7 @@
 ## 要点
 
 - `cang/io/Scanner`：键盘/标准输入读取，**单例**（`class _ Scanner` 私有构造 + 静态工厂）
-- 读取方法**阻塞当前线程**等待输入：`readLine()` 整行、`readKey(ms?)` 单键（含 esc/enter/方向键；带毫秒参数可超时返回 -1）
+- 读取方法**阻塞当前线程**等待输入：`readLine(ms?)` 整行（超时/EOF → null）、`readKey(ms?)` 单键（超时/EOF → -1；含 esc/enter/方向键）
 - `KEY_*` 静态常量用于比较键码；显式 `import cang/io/Scanner`（cang/io 不自动加载）
 
 ## 用法
