@@ -832,6 +832,20 @@ public class Parser {
             AST right = parseAssignment();
             return new AssignExpr(left, right, line);
         }
+        // Compound assignment (debug.md #23): x += e  desugars to  x = x + e (likewise -=, *=, /=).
+        // Known v1 limit: the target AST is evaluated on both sides — fine for identifiers and
+        // fields, but side-effecting targets like a[f()] run the index twice; prefer plain form there.
+        String compOp = null;
+        if (check(TokenType.PLUS_ASSIGN)) compOp = "+";
+        else if (check(TokenType.MINUS_ASSIGN)) compOp = "-";
+        else if (check(TokenType.STAR_ASSIGN)) compOp = "*";
+        else if (check(TokenType.SLASH_ASSIGN)) compOp = "/";
+        if (compOp != null) {
+            int line = current().line;
+            advance();
+            AST right = parseAssignment();
+            return new AssignExpr(left, new BinaryExpr(left, compOp, right, line), line);
+        }
         return left;
     }
 

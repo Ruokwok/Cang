@@ -179,7 +179,7 @@
 
 ## 七、体验 / 一致性问题
 
-### 23. 🟡 `+=` 词法有 Parser 不认 —— Lexer 产出 `PLUS_ASSIGN`（约 234）但 Parser 从不消费 → `x += 1` 报 `Unexpected token: PLUS_ASSIGN`。修复：Parser 赋值层识别 `PLUS_ASSIGN` 等复合算符，desugar 成 `x = x + 1`（注意先求值一次目标，数组元素下标同理）
+### 23. ✅ `+=` 词法有 Parser 不认 —— 已修复（parseAssignment 识别四复合算符 desugar）`x op= e` → `x = x e`（+= -= *= /= 全支持；标识符/字段/数组元素/循环步进实测七断言全对）。v1 已知限制：目标 AST 双侧各求值一次（有副作用的下标如 a[f()] 会跑两次，代码注释注明，后续可改临时变量）。t_compound；回归 85/85
 
 ### 24. 🟡 switch：重复 `case` 无检查（Java 报 duplicate case）；`case` 类型不匹配报错定位到 switch 行（应用 case 行）；`a[0]++` 报错行号错指第 1 行（Increment target 校验用错 line）
 
