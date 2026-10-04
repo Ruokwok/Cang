@@ -378,6 +378,7 @@ public abstract class AST {
         public List<Parameter> ctorParams; // constructor params (implicit ctor)
         public List<AST> topLevelBody; // for entry-point class (no braces): rest of file
         public boolean isEntryPoint; // true when class has no {} and rest of file is body
+        public boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
         public List<AST> superArgs; // parent constructor arguments
         public String namespace = ""; // namespace from its source file (e.g. "cang/lang")
         public ClassDecl(String name, String superClass, List<AST> members, int line) {
@@ -404,9 +405,11 @@ public abstract class AST {
         public boolean isStatic;
         public boolean isFinal;
         public boolean isNative;
+        public boolean isAbstract;
         public FuncDecl(String returnType, String name, List<Parameter> params, AST body, boolean isStatic, int line) {
             super(line); this.returnType = returnType; this.name = name; this.params = params;
             this.body = body; this.isStatic = isStatic; this.isFinal = false; this.isNative = false;
+            this.isAbstract = false;
         }
     }
 

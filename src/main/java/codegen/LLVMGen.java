@@ -38,6 +38,7 @@ public class LLVMGen {
         List<Parameter> ctorParams = new ArrayList<>();
         List<FieldDecl> staticFields = new ArrayList<>(); // static fields (global)
         List<AST> superArgs = new ArrayList<>(); // parent constructor args
+        boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
     }
 
     static class FuncInfo {
@@ -51,6 +52,7 @@ public class LLVMGen {
         boolean isStatic;
         boolean isFinal;
         boolean isNative;
+        boolean isAbstract; // declaration only: subclasses must provide a concrete implementation
         /** Unique LLVM symbol: base name for the first registration, base.N for overloads. */
         String llvmName;
     }
@@ -301,6 +303,14 @@ public class LLVMGen {
         List<AST> mainStatements = new ArrayList<>(); // top-level statements for main()
         ClassDecl entryClass = null;
 
+        // Statements in `members` (outside any class) can only sit BEFORE the first class —
+        // once a class exists they would be dropped by generateEntryPointMain. Reject them
+        // (mirror of debug.md #36). A program with no class at all keeps them for auto-main.
+        boolean hasClassDecl = false;
+        for (AST m : program.members) {
+            if (m instanceof ClassDecl) { hasClassDecl = true; break; }
+        }
+
         for (AST member : program.members) {
             if (member instanceof ClassDecl) {
                 ClassDecl cd = (ClassDecl) member;
@@ -343,7 +353,12 @@ public class LLVMGen {
                 // Skip namespace/import declarations
                 continue;
             } else {
-                // Top-level statement outside class
+                // Top-level statement outside class — legal only in a class-less program;
+                // with a class present it would be silently dropped (debug.md #36 pair).
+                if (hasClassDecl) {
+                    throw new RuntimeException("statements must appear after the first class (or in a class-less program); move this statement below the entry class (at line "
+                        + member.line + ")");
+                }
                 mainStatements.add(member);
             }
         }
@@ -373,6 +388,7 @@ public class LLVMGen {
         }
 
         // Assign type IDs for runtime type checking (like operator)
+        validateAbstractMethods(classDecls);
         assignTypeIds();
 
         // Pass 2: generate code
@@ -693,6 +709,67 @@ public class LLVMGen {
         return t;
     }
 
+    /** Abstract-method contract: a concrete (non-abstract) class must provide a concrete
+     *  implementation for every abstract method inherited from its ancestors, and may not
+     *  declare abstract methods itself. */
+    private void validateAbstractMethods(List<ClassDecl> classDecls) {
+        for (ClassDecl cd : classDecls) {
+            if (cd.isAbstract) continue;
+            String fullName = declFullNames.get(cd);
+            if (fullName == null) fullName = cd.name;
+            ClassInfo ci = classes.get(fullName);
+            if (ci == null) continue;
+
+            // 1) A concrete class cannot declare abstract methods itself.
+            for (FuncInfo f : functions.values()) {
+                if (f.isAbstract && f.className != null && f.className.equals(fullName)) {
+                    throw new RuntimeException("Abstract method '" + f.name
+                        + "' declared in non-abstract class '" + cd.name + "' (at line " + cd.line
+                        + "); declare the class abstract");
+                }
+            }
+
+            // 2) Every inherited abstract method needs a concrete implementation somewhere
+            //    on this class's ancestry (nearest definition wins via hasConcreteImpl walk).
+            ClassInfo cur = ci;
+            int guard = 0;
+            java.util.Set<String> checked = new java.util.HashSet<>();
+            while (cur != null && guard++ < 64) {
+                for (FuncInfo f : functions.values()) {
+                    if (!f.isAbstract || f.isStatic) continue;
+                    if (f.className == null || !f.className.equals(cur.fullName)) continue;
+                    // FuncInfo.name is the fully-qualified key (Shape.area); groups use the short name.
+                    String shortName = f.name.startsWith(cur.fullName + ".")
+                        ? f.name.substring(cur.fullName.length() + 1) : f.name;
+                    String sig = shortName + "(" + String.join(",", f.paramTypes) + ")";
+                    if (!checked.add(sig)) continue;
+                    if (!hasConcreteImpl(f, shortName, ci)) {
+                        throw new RuntimeException("Class '" + cd.name + "' must implement abstract method '"
+                            + sig + "' from '" + cur.simpleName + "' (at line " + cd.line
+                            + "); implement it or declare the class abstract");
+                    }
+                }
+                cur = cur.parentName != null ? classes.get(cur.parentName) : null;
+            }
+        }
+    }
+
+    /** True when fromClass or any ancestor defines a concrete (non-abstract) same-signature method. */
+    private boolean hasConcreteImpl(FuncInfo required, String shortName, ClassInfo fromClass) {
+        ClassInfo c = fromClass;
+        int guard = 0;
+        while (c != null && guard++ < 64) {
+            List<FuncInfo> grp = overloadGroups.get(c.fullName + "." + shortName);
+            if (grp != null) {
+                for (FuncInfo g : grp) {
+                    if (!g.isAbstract && g.paramTypes.equals(required.paramTypes)) return true;
+                }
+            }
+            c = c.parentName != null ? classes.get(c.parentName) : null;
+        }
+        return false;
+    }
+
     /** Unknown-class error with an ambiguity hint when the simple name is contested. */
     private RuntimeException unknownClassError(String name, int line) {
         java.util.Set<String> alts = ambiguousShortNames.get(name);
@@ -712,6 +789,7 @@ public class LLVMGen {
         info.ctorParams = decl.ctorParams;
         info.parentName = decl.superClass;
         info.superArgs = decl.superArgs;
+        info.isAbstract = decl.isAbstract;
         int idx = 1; // Index 0 is type ID, start fields at 1
 
         // Add parent fields first (inheritance layout)
@@ -931,8 +1009,11 @@ public class LLVMGen {
                 possibleTypes.add(ci);
             }
         }
-        for (ClassInfo ci : possibleTypes) {
-            String fn = ci.fullName + "." + node.method;
+        // Abstract classes can never be a runtime instance — drop their dispatch arms.
+        possibleTypes.removeIf(c -> c != null && c.isAbstract);
+        if (possibleTypes.isEmpty()) {
+            throw new RuntimeException("Cannot dispatch '" + node.method + "': '"
+                + staticClassName + "' is abstract and has no concrete subclass (at line " + node.line + ")");
         }
 
         // Generate branch for each possible type
@@ -996,6 +1077,12 @@ public class LLVMGen {
             if (ci != classes.get(staticClassName) && isSubclass(ci.simpleName, staticClassName)) {
                 possibleTypes.add(ci);
             }
+        }
+        // Abstract classes can never be a runtime instance — drop their dispatch arms.
+        possibleTypes.removeIf(c -> c != null && c.isAbstract);
+        if (possibleTypes.isEmpty()) {
+            throw new RuntimeException("Cannot dispatch void method: '"
+                + staticClassName + "' is abstract and has no concrete subclass (at line " + node.line + ")");
         }
 
         // Allocate slot for return (not needed for void, but for consistency)
@@ -1108,6 +1195,7 @@ public class LLVMGen {
         info.isStatic = decl.isStatic;
         info.isFinal = decl.isFinal;
         info.isNative = decl.isNative;
+        info.isAbstract = decl.isAbstract;
         for (Parameter p : decl.params) {
             info.paramTypes.add(p.type);
             info.paramNames.add(p.name);
@@ -1616,9 +1704,10 @@ public class LLVMGen {
         // Set source file for error reporting
         String prevSourceFile = this.sourceFile;
         
-        // Native methods have no body - skip generation
-        if (decl.isNative) {
-            this.sourceFile = prevSourceFile;
+        // Native/abstract methods have no body - skip generation
+        if (decl.isNative || decl.isAbstract) {
+            // Declaration-only: native is implemented intrinsically; abstract must be
+            // implemented by a subclass (validateAbstractMethods enforces it).
             return;
         }
 
@@ -2212,13 +2301,45 @@ public class LLVMGen {
                 throw new RuntimeException("Undefined variable: " + name + " (at line " + stmt.line + ")");
             }
             if (ptr.type.equals("i8*") || (ptr.type.startsWith("%") && ptr.type.endsWith("*"))) {
-                // i8* String/str values may point into read-only string constants; require explicit heap objects only.
-                if (ptr.semanticType != null && (ptr.semanticType.equals("String") || ptr.semanticType.equals("str"))) {
-                    throw new RuntimeException("Cannot free String/str value; only heap objects and arrays can be freed (at line " + stmt.line + ")");
-                }
                 String value = "%free." + tmpCount++;
                 body.append("  ").append(value).append(" = load ").append(ptr.type)
                      .append(", ").append(ptr.type).append("* ").append(ptr.value).append("\n");
+                // Free Array fields of the object along with it (debug.md #18: List/Dict data
+                // buffers). v1 one level only: array-header fields (always heap) — String fields
+                // may point into the read-only constant pool and are skipped; nested object
+                // fields are left to the GC. NULL fields are skipped at runtime.
+                String freeCls = extractClassName(ptr.type);
+                ClassInfo freeCi = freeCls != null ? classes.get(freeCls) : null;
+                if (freeCi != null && !freeCi.fieldIndices.isEmpty()) {
+                    for (Map.Entry<String, Integer> fe : freeCi.fieldIndices.entrySet()) {
+                        String ft = freeCi.fieldTypes.get(fe.getValue() - 1);
+                        if (ft == null || !ft.startsWith("Array<")) continue;
+                        String fllvm = toLLVMType(ft);
+                        String fptr = "%free.fptr." + tmpCount++;
+                        String fval = "%free.fval." + tmpCount++;
+                        body.append("  ").append(fptr).append(" = getelementptr ").append(freeCi.llvmName)
+                             .append(", ").append(freeCi.llvmName).append("* ").append(value)
+                             .append(", i32 0, i32 ").append(fe.getValue()).append("\n");
+                        body.append("  ").append(fval).append(" = load ").append(fllvm).append(", ")
+                             .append(fllvm).append("* ").append(fptr).append("\n");
+                        String fnull = "%free.fnull." + tmpCount++;
+                        String fok = "free.fok." + labelCount++;
+                        String fskip = "free.fskip." + labelCount++;
+                        body.append("  ").append(fnull).append(" = icmp eq ").append(fllvm).append(" ")
+                             .append(fval).append(", null\n");
+                        body.append("  br i1 ").append(fnull).append(", label %").append(fskip)
+                             .append(", label %").append(fok).append("\n");
+                        body.append(fok).append(":\n");
+                        String fcast = fllvm.equals("i8*") ? fval : "%free.fcast." + tmpCount++;
+                        if (!fllvm.equals("i8*")) {
+                            body.append("  ").append(fcast).append(" = bitcast ").append(fllvm).append(" ")
+                                 .append(fval).append(" to i8*\n");
+                        }
+                        body.append("  call void @").append(freeFn()).append("(i8* ").append(fcast).append(")\n");
+                        body.append("  br label %").append(fskip).append("\n\n");
+                        body.append(fskip).append(":\n");
+                    }
+                }
                 String freeValue = value;
                 if (!ptr.type.equals("i8*")) {
                     freeValue = "%free.cast." + tmpCount++;
@@ -5963,6 +6084,10 @@ public class LLVMGen {
 
         ClassInfo ci = classes.get(node.className);
         if (ci == null) throw unknownClassError(node.className, node.line);
+        if (ci.isAbstract) {
+            throw new RuntimeException("Cannot instantiate abstract class '" + node.className
+                + "' (at line " + node.line + ")");
+        }
 
         // Calculate struct size
         String sizeVar = "%size." + tmpCount++;
@@ -7214,6 +7339,8 @@ public class LLVMGen {
         header.append("  store i64 %sl1b, i64* %slot\n");
         header.append("  br label %fin\n");
         header.append("fin:\n");
+        // The whole-file buffer is a temporary: every line was strndup'd above (debug.md #17).
+        header.append("  call void @").append(freeFn()).append("(i8* %text)\n");
         header.append("  ret i8* %arr\n");
         header.append("}\n\n");
     }

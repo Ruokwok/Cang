@@ -130,17 +130,13 @@
 
 ## 四、内存（`--no-gc` 必现泄漏 + UAF）
 
-### 17. 🔴 readLines 行副本不可 free —— 待修
-- 现象：`String[] l = f.readLines(); free l` 只释放数组头；每行 `strndup` 副本与内部整文件缓冲永不可达（`generateFree` 拒 String）。实测 `--no-gc` 3.84MB×200 次峰值 1705MB（≈8.5MB/次），GC 模式 13MB。
-- 修复指引（择一）：
-  - `free` 数组时若是"字符串数组"（arrayElemTypes 可查到元素为 String/i8*）遍历释放各元素再释放头——需要在 free 处知道元素类型（`arrayElemCangTypes` 有记录 ✓）。
-  - 或 readLines 内部 `%text` 整文件缓冲用完即 `free`（它是临时 buffer，不是交付物），行副本仍不可 free → 至少减半泄漏；文档继续注明"推荐默认 GC 模式"。
-  - 终态建议：允许 `free` 带 semanticType String 的值（当前 generateFree 拒绝）→ 用户可逐个释放；需要同步文档。
+### 17. ✅ readLines 行副本不可 free —— 已修复（临时缓冲即释放 + 放开 String free）
+- 修复：①`cang.f.readlines` 的整文件 `%text` 缓冲在 `fin:` 返回前 `free`（行副本已 strndup，缓冲是临时物非交付物）；②**放开 `free` String/str**（原编译期拒绝删除）——用户可逐个释放堆串（readLines 行）；文档同步：只 free 堆串，`--no-gc` 下字面量 free 会崩（GC 模式 GC_free 对常量为 no-op）。
+- 实测 t_free_objs：`24`（readLines 行数正常）+ `string and lines freed`；回归 67/67（file_std 覆盖 readLines 改动）。
 
-### 18. 🔴 List free 漏内部 `_data` 缓冲 —— 待修
-- 现象：`free l` 只 free 24B 对象头，`_data`（初 64B、realloc 扩容）无 free 路径。实测 200 万次 new+free 峰值 83MB（GC 5MB）。
-- 位置：`generateFree` 对 `%CangList*` 只 free 对象（约 4552/3561/1660 相关）。
-- 修复指引：`free` 分支识别 `%CangList*` → 先 load 字段 0（data 指针）`free`，再 free 对象本体。同样考虑递归释放元素？v1 只释放 data 缓冲（元素若是对象由 GC/no-gc 语义另行决定，文档注明）。
+### 18. ✅ List free 漏内部 `_data` 缓冲 —— 已修复（对象 free 连带 Array 字段，一层）
+- 修复：`generateFree` 对类对象按 `ClassInfo.fieldTypes` 遍历，**Array 字段**逐个 null 检查后 free，再 free 对象本体。覆盖纯 Cang List 的 `T[] data` 与 Dict 的 `keys[]`/`vals[]`（字段类型 `Array<...>` 单态后仍匹配）。v1 一层：String 字段（常量池风险）与嵌套对象字段不碰，文档注明。
+- 实测 t_free_objs：`list freed` / `dict freed`；回归 67/67。
 
 ### 19. 🟡 freedVars 按名全局污染 + 别名 UAF —— 待修
 - 现象：`g(){ free x }` 后 `h()` 同名 `x` 编译报 `Use of freed variable`（freedVars 是函数间共享的 Set）；`b = a; free a; print(b[0])` 编译通过（别名不查，UAF）。
@@ -291,5 +287,5 @@
 7. ~~10 + 7 + 9~~ ✅（assignableTo 三处检查 / callResultCarriesSemantic / 数组写 null+越界，见第 7/9/10 条）
 8. ~~13/20/21~~ ✅（finally 五出口统一——finallyStack + inlineFinallyLayers 内联 + jexit.dead 死块，见第 13/20/21 条）
 9. ~~36~~ ✅ → ~~26/27~~ ✅ → ~~40~~ ✅（见第 40 条）
-10. 17/18（free 缺口）→ 22（语句分隔，最后动，需设计评审）
+10. ~~17/18~~ ✅（free 缺口——readLines 缓冲即释放 + 放开 String free + 对象 Array 字段连带 free，见第 17/18 条）→ 22（语句分隔，最后动，需设计评审）
 11. 其余 🟡 按批次清理

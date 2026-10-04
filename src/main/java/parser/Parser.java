@@ -34,16 +34,21 @@ public class Parser {
         // Parse classes and top-level code
         ClassDecl currentClass = null;
         while (!check(TokenType.EOF)) {
-            if (check(TokenType.CLASS)) {
+            if (check(TokenType.CLASS) || (check(TokenType.ABSTRACT) && peek(1).type == TokenType.CLASS)) {
                 // Save previous class if exists
                 if (currentClass != null) {
                     members.add(currentClass);
                 }
-                // New class - not entry point initially
-                currentClass = parseClassDecl();
+                // New class (possibly 'abstract class') - not entry point initially
+                AST parsed = parseTopLevel();
+                if (!(parsed instanceof ClassDecl)) {
+                    error("Expected class declaration");
+                }
+                currentClass = (ClassDecl) parsed;
                 currentClass.isEntryPoint = true;
-            } else if (currentClass != null && check(TokenType.FUNC)) {
-                // Function after class → attach as method
+            } else if (currentClass != null && (check(TokenType.FUNC)
+                    || (check(TokenType.ABSTRACT) && peek(1).type == TokenType.FUNC))) {
+                // Function (or abstract func) after class → attach as method
                 currentClass.topLevelBody.add(parseTopLevel());
             } else if (currentClass != null && check(TokenType.STATIC)) {
                 // static function after class → attach as method
@@ -117,6 +122,20 @@ public class Parser {
     // ==================== Top Level ====================
 
     private AST parseTopLevel() {
+        // abstract class Shape(...) / abstract func ... — modifier before the keyword
+        if (check(TokenType.ABSTRACT)) {
+            if (peek(1).type == TokenType.FUNC) {
+                // abstract method inside a class body — handled by the class-member parser
+                return parseClassMember();
+            }
+            int absLine = advance().line;
+            if (!check(TokenType.CLASS)) {
+                error("Expected 'class' or 'func' after 'abstract'");
+            }
+            ClassDecl cd = parseClassDecl();
+            cd.isAbstract = true;
+            return cd;
+        }
         if (check(TokenType.CLASS)) return parseClassDecl();
 
         // native modifier for top-level functions
@@ -288,14 +307,16 @@ public class Parser {
     private AST parseClassMember() {
         int line = current().line;
 
-        // modifiers: static, final, native
+        // modifiers: static, final, native, abstract
         boolean isStatic = false;
         boolean isFinal = false;
         boolean isNative = false;
-        while (check(TokenType.STATIC) || check(TokenType.FINAL) || check(TokenType.NATIVE)) {
+        boolean isAbstract = false;
+        while (check(TokenType.STATIC) || check(TokenType.FINAL) || check(TokenType.NATIVE) || check(TokenType.ABSTRACT)) {
             if (check(TokenType.STATIC)) { advance(); isStatic = true; }
             else if (check(TokenType.FINAL)) { advance(); isFinal = true; }
             else if (check(TokenType.NATIVE)) { advance(); isNative = true; }
+            else { advance(); isAbstract = true; }
         }
 
         // func returnType name(params) { body }
@@ -305,7 +326,15 @@ public class Parser {
             String name = expect(TokenType.IDENT).value;
             List<Parameter> params = parseParams();
             AST body;
-            if (isNative) {
+            if (isAbstract) {
+                if (isNative) error("'abstract' and 'native' cannot be combined on '" + name + "'");
+                if (isStatic) error("abstract method '" + name + "' cannot be static");
+                if (check(TokenType.LBRACE)) {
+                    error("abstract method '" + name + "' must not have a body");
+                }
+                body = null;
+                optionalSemicolon();
+            } else if (isNative) {
                 // native methods have no body
                 body = null;
                 optionalSemicolon();
@@ -315,7 +344,11 @@ public class Parser {
             FuncDecl fd = new FuncDecl(type, name, params, body, isStatic, line);
             fd.isFinal = isFinal;
             fd.isNative = isNative;
+            fd.isAbstract = isAbstract;
             return fd;
+        }
+        if (isAbstract) {
+            error("abstract is only valid on 'func' declarations");
         }
 
         // constructor: ClassName(params) { body }
