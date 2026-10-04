@@ -181,7 +181,7 @@
 
 ### 23. ✅ `+=` 词法有 Parser 不认 —— 已修复（parseAssignment 识别四复合算符 desugar）`x op= e` → `x = x e`（+= -= *= /= 全支持；标识符/字段/数组元素/循环步进实测七断言全对）。v1 已知限制：目标 AST 双侧各求值一次（有副作用的下标如 a[f()] 会跑两次，代码注释注明，后续可改临时变量）。t_compound；回归 85/85
 
-### 24. 🟡 switch：重复 `case` 无检查（Java 报 duplicate case）；`case` 类型不匹配报错定位到 switch 行（应用 case 行）；`a[0]++` 报错行号错指第 1 行（Increment target 校验用错 line）
+### 24. ✅ switch —— 已修复（三子项）①重复 case 编译期报 `Duplicate case value '1'` 并指向 case 行（字面量查重，literalCaseKey 带类型前缀防 1 vs "1" 混淆，显示时去前缀）；②case 类型不匹配报错行号由 stmt.line 改 sc.line（实测 case 行 4:1 而非 switch 行）；③Increment 校验补 `(at line N)`（target.line——for 头等非 generateStmt 语境不再落 1:1，实测 a[0]++ 指 3:1）。t_switch 正例 + 3 负例；回归 91/91
 
 ### 25. ✅ 数字字面量 —— 已修复（四子项）①指数 `1e10`/`2.5E-3`/`1E+12`（e 后无数字回退保安全）；②前导点 `.5`；③`3.` 按 Java 规则算浮点（后随第二点不吞）；④未知转义 `\q` 报 `Unknown escape sequence`（单双引号与反引号三处，转义换行续行保留）。配套：LLVM 侧 normalizeFloatText 保证浮点常量含小数点（`1e10`→`1.0E10`，否则 clang 按整数解析报错）。t_num_lit 九断言 + t_num_escape 负例；回归 87/87
 

@@ -2693,9 +2693,32 @@ public class LLVMGen {
     /**
      * Generate switch statement as if/else-if chain.
      */
+    /** Canonical duplicate-case key for a literal case value; null when not a literal. */
+    private String literalCaseKey(AST v) {
+        if (v instanceof IntLit) return "i:" + ((IntLit) v).text;
+        if (v instanceof LongLit) return "l:" + ((LongLit) v).text;
+        if (v instanceof FloatLit) return "f:" + ((FloatLit) v).text;
+        if (v instanceof DoubleLit) return "d:" + ((DoubleLit) v).text;
+        if (v instanceof BoolLit) return "b:" + ((BoolLit) v).value;
+        if (v instanceof StringLit) return "s:" + ((StringLit) v).value;
+        if (v instanceof StrLit) return "t:" + ((StrLit) v).value;
+        return null;
+    }
+
     private void generateSwitch(SwitchStmt stmt) {
         int id = labelCount++;
         String endLabel = "switch.end." + id;
+
+        // Duplicate case values are a compile error (debug.md #24); literal cases only.
+        java.util.Set<String> seenCases = new java.util.HashSet<>();
+        for (SwitchCase sc : stmt.cases) {
+            String lit = literalCaseKey(sc.value);
+            if (lit != null && !seenCases.add(lit)) {
+                String shown = lit.length() > 2 ? lit.substring(2) : lit; // strip "i:" etc. prefix
+                throw new util.CompileError("Duplicate case value '" + shown + "'",
+                    sourceFile, sc.line, 1, readSourceLine(sourceFile, sc.line), 4);
+            }
+        }
 
         // Evaluate subject once
         LLVMValue subject = generateExpr(stmt.subject);
@@ -2719,9 +2742,9 @@ public class LLVMGen {
             // Emit check label
             body.append(checkLabel).append(":\n");
 
-            // Compare subject with case value
+            // Compare subject with case value (error location = the case line, not the switch line)
             LLVMValue caseVal = generateExpr(sc.value);
-            LLVMValue cmp = generateComparison(subject, "==", caseVal, stmt.line);
+            LLVMValue cmp = generateComparison(subject, "==", caseVal, sc.line);
             String cmpVar = ensureI1(cmp);
 
             // Determine else target
@@ -4416,11 +4439,11 @@ public class LLVMGen {
 
     private LLVMValue generateIncrement(AST target, String arithOp, boolean prefix) {
         if (!(target instanceof Identifier)) {
-            throw new RuntimeException("Increment target must be a variable");
+            throw new RuntimeException("Increment target must be a variable (at line " + target.line + ")");
         }
         Identifier id = (Identifier) target;
         LLVMValue ptr = scope.lookup(id.name);
-        if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name);
+        if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + target.line + ")");
 
         String loaded = "%inc.old." + tmpCount++;
         body.append("  ").append(loaded).append(" = load ").append(ptr.type)
