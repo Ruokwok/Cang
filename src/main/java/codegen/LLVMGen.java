@@ -1715,6 +1715,11 @@ public class LLVMGen {
             return;
         }
 
+        // Freed-variable records are per-function (debug.md #19): `free x` inside g() must not
+        // make a same-named variable in h() look already-freed. Clear on entry, restore on exit.
+        java.util.Set<String> savedFreed = new java.util.HashSet<>(freedVars);
+        freedVars.clear();
+
         if (!decl.sourceFile.isEmpty()) this.sourceFile = decl.sourceFile;
 
         String funcName = (className != null ? className + "." : "") + decl.name;
@@ -1809,6 +1814,8 @@ public class LLVMGen {
         body.append("}\n\n");
         scope = null;
         this.sourceFile = prevSourceFile;
+        freedVars.clear();
+        freedVars.addAll(savedFreed);
     }
 
     // ==================== Statement generation ====================
@@ -2229,6 +2236,9 @@ public class LLVMGen {
         Scope savedScope = scope;
         String savedReturn = currentFuncReturnType;
         List<LoopContext> savedLoops = new ArrayList<>(loopStack);
+        java.util.Set<String> savedFreed = new java.util.HashSet<>(freedVars);
+        freedVars.clear();
+        // Freed-records are per-function/lambda (debug.md #19).
         Deque<String> savedHandlers = new ArrayDeque<>(exceptionHandlers);
         loopStack.clear();
         exceptionHandlers.clear();
@@ -2254,6 +2264,8 @@ public class LLVMGen {
         loopStack.addAll(savedLoops);
         exceptionHandlers.clear();
         exceptionHandlers.addAll(savedHandlers);
+        freedVars.clear();
+        freedVars.addAll(savedFreed);
 
         // Register as a plain top-level void function so Thread.spawn accepts it.
         FuncInfo fi = new FuncInfo();
@@ -3384,6 +3396,10 @@ public class LLVMGen {
         Scope savedScope = scope;
         String savedReturn = currentFuncReturnType;
         List<LoopContext> savedLoops = new ArrayList<>(loopStack);
+        // Freed-records are per-lambda too (debug.md #19): a free inside the lambda body must
+        // not leak into the enclosing function's same-named variables.
+        java.util.Set<String> savedFreed = new java.util.HashSet<>(freedVars);
+        freedVars.clear();
         loopStack.clear();
         // A lambda is a separate LLVM function; enclosing handlers cannot be branched to.
         Deque<String> savedHandlers = new ArrayDeque<>(exceptionHandlers);
@@ -3469,6 +3485,8 @@ public class LLVMGen {
         loopStack.addAll(savedLoops);
         exceptionHandlers.clear();
         exceptionHandlers.addAll(savedHandlers);
+        freedVars.clear();
+        freedVars.addAll(savedFreed);
 
         // Creation site (outer function): snapshot the captured values into a heap env struct.
         String envRaw = "null";

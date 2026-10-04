@@ -138,12 +138,10 @@
 - 修复：`generateFree` 对类对象按 `ClassInfo.fieldTypes` 遍历，**Array 字段**逐个 null 检查后 free，再 free 对象本体。覆盖纯 Cang List 的 `T[] data` 与 Dict 的 `keys[]`/`vals[]`（字段类型 `Array<...>` 单态后仍匹配）。v1 一层：String 字段（常量池风险）与嵌套对象字段不碰，文档注明。
 - 实测 t_free_objs：`list freed` / `dict freed`；回归 67/67。
 
-### 19. 🟡 freedVars 按名全局污染 + 别名 UAF —— 待修
-- 现象：`g(){ free x }` 后 `h()` 同名 `x` 编译报 `Use of freed variable`（freedVars 是函数间共享的 Set）；`b = a; free a; print(b[0])` 编译通过（别名不查，UAF）。
-- 位置：`freedVars`（约 106 声明、1663 加入、2725 检查）。
-- 修复指引：
-  - freedVars 改为**按函数作用域**：`generateFunction` 入口快照/出口恢复（或直接 clear——函数间本就不应共享）。
-  - 别名追踪成本高（v1）：至少文档声明"free 后不得使用任何别名"；可选做保守版本——free 时把"同 llvmType 的指针变量"标记可疑（过度保守会误报，需权衡）。首版建议只修作用域污染。
+### 19. ✅ freedVars 按名全局污染 + 别名 UAF —— 已修复作用域污染（首版范围）
+- 修复：freedVars 按函数/lambda 作用域隔离——generateFunction、generateLambda、generateThreadBlock（旧路径对称）入口 `savedFreed + clear()`、出口恢复；`g(){free x}` 后 `h()` 同名变量不再误报（t_freed_scope 实测 `scope ok`），同函数重复 free 仍拦（t_freed_dup 负例 `already been freed`）。
+- 别名 UAF（`b = a; free a; print(b[0])`）按指引**不在首版**：v1 文档声明"free 后不得使用任何别名"（docs/16 12.3 已有）；保守版标记后续再议。
+- 回归 96/96
 
 ---
 
