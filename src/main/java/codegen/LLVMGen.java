@@ -3181,17 +3181,31 @@ public class LLVMGen {
     private LLVMValue generateLambda(LambdaExpr node) {
         String expected = expectedFunctionType;
         if (expected == null || !isFunctionType(expected)) {
-            throw new RuntimeException("Cannot infer lambda type; use it where Function<...> is expected (at line "
-                + node.line + ")");
+            // The parameter type comes from the expectation too, so there is nothing to build
+            // from. When the return type was omitted, point at writing it (inference rule:
+            // an expected Function<...> is required to omit the return type).
+            String hint = node.returnType == null
+                ? "Cannot infer lambda return type here - write it explicitly (e.g. '-> int { ... }') and use the lambda where Function<...> is expected"
+                : "Cannot infer lambda type; use it where Function<...> is expected";
+            throw new RuntimeException(hint + " (at line " + node.line + ")");
         }
         String[] parts = functionTypeParts(expected);
         if (parts.length != 2) {
-            throw new RuntimeException("Lambda must match Function<Void, T> with exactly one parameter: expected "
+            throw new RuntimeException("Lambda must match Function<R, T> with exactly one parameter: expected "
                 + expected + " (at line " + node.line + ")");
         }
-        if (!parts[0].equals("void") && !parts[0].equals("Void")) {
-            throw new RuntimeException("Lambdas return void, but expected " + expected + " (at line " + node.line + ")");
+        // Return type: explicit annotation must match the expectation; omitted inherits it.
+        String expRetRaw = parts[0];
+        boolean expVoid = expRetRaw.equals("void") || expRetRaw.equals("Void");
+        String retCang;
+        if (node.returnType != null) {
+            boolean annVoid = node.returnType.equals("void");
+            if (annVoid != expVoid || (!annVoid && !node.returnType.equals(expRetRaw))) {
+                throw new RuntimeException("Lambda return type '" + node.returnType
+                    + "' does not match expected " + expected + " (at line " + node.line + ")");
+            }
         }
+        retCang = expVoid ? "void" : expRetRaw;
         // By-value closure capture: resolve free variables against the ENCLOSING scope BEFORE
         // the scope swap. Values are snapshotted into a heap env at creation (Java semantics:
         // later mutations of the outer variable are not visible inside the lambda).
@@ -3201,10 +3215,11 @@ public class LLVMGen {
 
         String paramCang = parts[1];
         String paramLLVM = toLLVMType(paramCang);
+        String retLLVM = toLLVMType(retCang);
         int lambdaId = lambdaCount++;
         String fnName = "@cang.lambda." + lambdaId;
         String envType = "%cang.env." + lambdaId;
-        String codeType = "void (i8*, " + paramLLVM + ")*";
+        String codeType = retLLVM + " (i8*, " + paramLLVM + ")*";
 
         Scope savedScope = scope;
         String savedReturn = currentFuncReturnType;
@@ -3214,13 +3229,13 @@ public class LLVMGen {
         Deque<String> savedHandlers = new ArrayDeque<>(exceptionHandlers);
         exceptionHandlers.clear();
         scope = new Scope(null);
-        currentFuncReturnType = "void";
+        currentFuncReturnType = retCang;
 
         int pid = tmpCount++;
         String argName = "%lparg." + pid;
         String allocaName = "%lp." + pid;
         int start = body.length();
-        body.append("define void ").append(fnName).append("(i8* %env, ")
+        body.append("define ").append(retLLVM).append(" ").append(fnName).append("(i8* %env, ")
              .append(paramLLVM).append(" ").append(argName).append(") {\nentry:\n");
         body.append("  ").append(allocaName).append(" = alloca ").append(paramLLVM).append("\n");
         body.append("  store ").append(paramLLVM).append(" ").append(argName)
@@ -3265,7 +3280,16 @@ public class LLVMGen {
         int lastBreak = trimmed.lastIndexOf('\n');
         String lastLine = (lastBreak >= 0 ? trimmed.substring(lastBreak + 1) : trimmed).trim();
         boolean terminated = lastLine.startsWith("ret ") || lastLine.startsWith("br ") || lastLine.equals("unreachable");
-        if (!terminated) body.append("  ret void\n");
+        if (retCang.equals("void")) {
+            if (!terminated) body.append("  ret void\n");
+        } else if (!alwaysReturns(node.body)) {
+            throw new RuntimeException("Lambda must return a value of type '" + retCang
+                + "' on every path (at line " + node.line + ")");
+        } else if (!terminated) {
+            // All paths already returned (e.g. if/else with returns) but the final block is
+            // open — keep it well-formed for LLVM.
+            body.append("  unreachable\n");
+        }
         body.append("}\n\n");
         int end = body.length();
         extraDefs.append(body, start, end);

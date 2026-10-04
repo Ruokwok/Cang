@@ -979,17 +979,21 @@ public class Parser {
             return new ThisExpr(line);
         }
 
-        // A lambda is deliberately limited to one explicit parameter and a void body.
+        // Lambda: (p) -> [returnType] { body }
+        // The return type is OPTIONAL: omitted means "infer it from the expected Function<...>"
+        // (generateLambda errors when there is no expectation to infer from).
         if (check(TokenType.LPAREN) && peek(1).type == TokenType.IDENT &&
             peek(2).type == TokenType.RPAREN && peek(3).type == TokenType.ARROW) {
             advance();
             String parameter = expect(TokenType.IDENT).value;
             expect(TokenType.RPAREN);
             expect(TokenType.ARROW);
-            if (!check(TokenType.VOID)) error("Lambda return type must be void");
-            advance();
+            String retType = null;
+            if (!check(TokenType.LBRACE)) {
+                retType = parseType();
+            }
             AST body = parseBlock();
-            return new LambdaExpr(parameter, body, line);
+            return new LambdaExpr(parameter, body, retType, line);
         }
 
         if (check(TokenType.NEW)) {
