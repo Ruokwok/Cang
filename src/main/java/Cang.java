@@ -513,7 +513,8 @@ public class Cang {
         "cang/lang/Void.cang", "cang/lang/Thread.cang", "cang/lang/Error.cang",
         "cang/lang/List.cang",
         "cang/lang/Dict.cang",
-        "cang/io/File.cang"
+        "cang/io/File.cang",
+        "cang/io/Scanner.cang"
     };
 
     /**

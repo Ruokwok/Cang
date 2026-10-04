@@ -39,6 +39,7 @@
 | [Dict.md](libs/Dict.md) | `Dict<K, V>` | 泛型 KV 映射（参考 HashMap） |
 | [Thread.md](libs/Thread.md) | `Thread<T>` | 对象式 task/start/join（spawn 已移除）、thread{} |
 | [File.md](libs/File.md) | `cang/io/File` | 文件路径、状态、目录、文本读写 |
+| [Scanner.md](libs/Scanner.md) | `cang/io/Scanner` | 单例标准输入：readLine/readKey 阻塞读取 |
 | [Function.md](libs/Function.md) | `Function<R,...>` | 函数对象类型声明 |
 | [Error.md](libs/Error.md) | `Error` | 异常基类、message/stack |
 | [Object.md](libs/Object.md) | `Object` | 所有类的隐式根类 |

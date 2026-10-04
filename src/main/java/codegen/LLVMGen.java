@@ -1464,6 +1464,7 @@ public class LLVMGen {
         }
         header.append("\n");
         emitFileRuntime();
+        emitScannerRuntime();
     }
 
     private final Map<String, String> fmtConstants = new LinkedHashMap<>();
@@ -7204,6 +7205,84 @@ public class LLVMGen {
      * symbols so no dispatch interception is needed. Helpers are define-only (never declared —
      * declare+define in one module is an invalid redefinition).
      */
+    /** Scanner wrappers (Design B like File): native readKey/readLine over libc stdin.
+     *  Windows: _getch (conio, no echo, full special keys) + fgets(stdin).
+     *  POSIX v1: getchar (line-buffered downgrade) + fgets — documented. */
+    private void emitScannerRuntime() {
+        ClassInfo scCi = classes.get("cang_io_Scanner");
+        if (scCi == null || !imports.contains("cang/io/Scanner")) return;
+        boolean win = targetPlatform.equals("windows");
+
+        // libc declares (strlen/malloc/free already declared in emitHeader)
+        if (!header.toString().contains("declare i8* @fgets(")) {
+            header.append("declare i8* @fgets(i8*, i32, i8*)\n");
+        }
+        if (win) {
+            header.append("declare i32 @_getch()\n");
+            // FILE* __acrt_iob_func(int) — same i8* form the stderr path already declares.
+            if (!header.toString().contains("declare i8* @__acrt_iob_func(")) {
+                header.append("declare i8* @__acrt_iob_func(i32)\n");
+            }
+        } else {
+            header.append("declare i32 @getchar()\n");
+            header.append("@stdin = external global i8*\n");
+        }
+
+        // ---- readKey ----
+        StringBuilder rk = new StringBuilder();
+        rk.append("define i32 @cang_io_Scanner.readKey(i8* %this) {\nentry:\n");
+        if (win) {
+            // _getch: plain ASCII/13/27..., or 0/0xE0 prefix + scan code for special keys.
+            // Special keys are returned as 256 + scancode so KEY_UP=328 (256+72) etc. match.
+            rk.append("  %c0 = call i32 @_getch()\n");
+            rk.append("  %p0 = icmp eq i32 %c0, 0\n");
+            rk.append("  %pe = icmp eq i32 %c0, 224\n");
+            rk.append("  %pre = or i1 %p0, %pe\n");
+            rk.append("  br i1 %pre, label %sc, label %ret\n");
+            rk.append("sc:\n");
+            rk.append("  %c1 = call i32 @_getch()\n");
+            rk.append("  %m = or i32 256, %c1\n");
+            rk.append("  ret i32 %m\n");
+            rk.append("ret:\n");
+            rk.append("  ret i32 %c0\n");
+        } else {
+            rk.append("  %c0 = call i32 @getchar()\n");
+            rk.append("  ret i32 %c0\n");
+        }
+        rk.append("}\n\n");
+        header.append(rk);
+
+        // ---- readLine ----
+        StringBuilder rl = new StringBuilder();
+        rl.append("define i8* @cang_io_Scanner.readLine(i8* %this) {\nentry:\n");
+        rl.append("  %buf = call i8* @").append(allocFn()).append("(i64 4096)\n");
+        if (win) {
+            rl.append("  %stdin = call i8* @__acrt_iob_func(i32 0)\n");
+        } else {
+            rl.append("  %stdin = load i8*, i8** @stdin\n");
+        }
+        rl.append("  %got = call i8* @fgets(i8* %buf, i32 4096, i8* %stdin)\n");
+        rl.append("  %eof = icmp eq i8* %got, null\n");
+        rl.append("  br i1 %eof, label %fail, label %trim\n");
+        rl.append("fail:\n");
+        rl.append("  call void @").append(freeFn()).append("(i8* %buf)\n");
+        rl.append("  ret i8* null\n");
+        rl.append("trim:\n");
+        rl.append("  %len = call i64 @strlen(i8* %buf)\n");
+        rl.append("  %dec = sub i64 %len, 1\n");
+        rl.append("  %np = getelementptr i8, i8* %buf, i64 %dec\n");
+        rl.append("  %nl = load i8, i8* %np\n");
+        rl.append("  %isnl = icmp eq i8 %nl, 10\n");
+        rl.append("  br i1 %isnl, label %cut, label %done\n");
+        rl.append("cut:\n");
+        rl.append("  store i8 0, i8* %np\n");
+        rl.append("  br label %done\n");
+        rl.append("done:\n");
+        rl.append("  ret i8* %buf\n");
+        rl.append("}\n\n");
+        header.append(rl);
+    }
+
     private void emitFileRuntime() {
         ClassInfo fileCi = classes.get("cang_io_File");
         if (fileCi == null || !imports.contains("cang/io/File")) return;

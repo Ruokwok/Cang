@@ -1,0 +1,36 @@
+namespace cang/io
+
+# Scanner - 标准输入/键盘读取（单例，阻塞当前线程等待输入）
+# 用法：Scanner.get() 取单例 → readLine() 整行读 / readKey() 单键读（返回键码）
+# 键码与 KEY_* 常量比较：enter/esc/tab/方向键等（Windows 走 _getch 全功能；
+# POSIX v1 走 getchar 行缓冲降级——特殊键需终端 raw 模式，见文档）。
+# 外部不可 new（类名 _ 修饰符 = 私有构造）。
+class _ Scanner()
+
+# 单例：静态字段 + 静态工厂
+static Scanner instance = null
+
+static func Scanner get() {
+    if (instance == null) {
+        instance = new Scanner()
+    }
+    return instance
+}
+
+# 阻塞读一个按键（无回显）。返回键码：
+#   普通字符 = ASCII 0..127
+#   enter=13 esc=27 tab=9 backspace=8
+#   方向键/功能键 = 256 + 扫描码（Windows：up=328 down=332 left=331 right=333）
+native func int readKey()
+
+# 阻塞读一行（回显，enter 结束），去掉末尾换行；EOF 返回 null
+native func String readLine()
+
+static final int KEY_ENTER = 13
+static final int KEY_ESC = 27
+static final int KEY_TAB = 9
+static final int KEY_BACKSPACE = 8
+static final int KEY_UP = 328
+static final int KEY_DOWN = 332
+static final int KEY_LEFT = 331
+static final int KEY_RIGHT = 333
