@@ -7224,8 +7224,14 @@ public class LLVMGen {
                 header.append("declare i8* @__acrt_iob_func(i32)\n");
             }
         } else {
-            header.append("declare i32 @getchar()\n");
-            header.append("@stdin = external global i8*\n");
+            if (!header.toString().contains("@stdin = external")) {
+                header.append("@stdin = external global i8*\n");
+            }
+            header.append("declare i32 @tcgetattr(i32, i8*)\n");
+            header.append("declare i32 @tcsetattr(i32, i32, i8*)\n");
+            header.append("declare void @cfmakeraw(i8*)\n");
+            header.append("declare i64 @read(i32, i8*, i64)\n");
+            header.append("declare i32 @poll(i8*, i64, i32)\n");
         }
 
         // ---- readKey ----
@@ -7246,8 +7252,83 @@ public class LLVMGen {
             rk.append("ret:\n");
             rk.append("  ret i32 %c0\n");
         } else {
-            rk.append("  %c0 = call i32 @getchar()\n");
-            rk.append("  ret i32 %c0\n");
+            // POSIX raw mode, per-call and restored before returning so readLine stays
+            // canonical: tcgetattr(orig) -> memcpy -> cfmakeraw(raw) -> tcsetattr;
+            // read(0,1) blocks on a key; ESC(27) probes the rest of an escape sequence with
+            // poll(100ms). CSI direction keys map to the same KEY_* codes as Windows
+            // (A/B/C/D -> 328/332/333/331). Incomplete sequences degrade to 27 (ESC).
+            rk.append("  %to = alloca [64 x i8]\n");
+            rk.append("  %tr = alloca [64 x i8]\n");
+            rk.append("  %res = alloca i32\n");
+            rk.append("  %cb = alloca i8\n");
+            rk.append("  %pfd = alloca i64\n");
+            rk.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* %to, i8 0, i64 64, i1 false)\n");
+            rk.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* %tr, i8 0, i64 64, i1 false)\n");
+            rk.append("  %tg = call i32 @tcgetattr(i32 0, i8* %to)\n");
+            rk.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %tr, i8* %to, i64 64, i1 false)\n");
+            rk.append("  call void @cfmakeraw(i8* %tr)\n");
+            rk.append("  %tw = call i32 @tcsetattr(i32 0, i32 0, i8* %tr)\n");
+            rk.append("  %n0 = call i64 @read(i32 0, i8* %cb, i64 1)\n");
+            rk.append("  %e0 = icmp slt i64 %n0, 1\n");
+            rk.append("  br i1 %e0, label %eofb, label %chk\n");
+            rk.append("eofb:\n");
+            rk.append("  store i32 -1, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("chk:\n");
+            rk.append("  %v0 = load i8, i8* %cb\n");
+            rk.append("  %k0 = zext i8 %v0 to i32\n");
+            rk.append("  %isEsc = icmp eq i32 %k0, 27\n");
+            rk.append("  br i1 %isEsc, label %esc, label %plain\n");
+            rk.append("plain:\n");
+            rk.append("  store i32 %k0, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("esc:\n");
+            // pollfd {fd=0, events=POLLIN@bit32} == 0x0000000100000000; 100ms probe
+            rk.append("  store i64 4294967296, i64* %pfd\n");
+            rk.append("  %pr = call i32 @poll(i8* %pfd, i64 1, i32 100)\n");
+            rk.append("  %h1 = icmp sgt i32 %pr, 0\n");
+            rk.append("  br i1 %h1, label %br1, label %bare\n");
+            rk.append("bare:\n");
+            rk.append("  store i32 27, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("br1:\n");
+            rk.append("  %n1 = call i64 @read(i32 0, i8* %cb, i64 1)\n");
+            rk.append("  %v1 = load i8, i8* %cb\n");
+            rk.append("  %k1 = zext i8 %v1 to i32\n");
+            rk.append("  %isL = icmp eq i32 %k1, 91\n");
+            rk.append("  br i1 %isL, label %br2, label %bare2\n");
+            rk.append("bare2:\n");
+            rk.append("  store i32 27, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("br2:\n");
+            rk.append("  store i64 4294967296, i64* %pfd\n");
+            rk.append("  %pr2 = call i32 @poll(i8* %pfd, i64 1, i32 100)\n");
+            rk.append("  %h2 = icmp sgt i32 %pr2, 0\n");
+            rk.append("  br i1 %h2, label %br3, label %bare3\n");
+            rk.append("bare3:\n");
+            rk.append("  store i32 27, i32* %res\n");
+            rk.append("  br label %restore\n");
+            rk.append("br3:\n");
+            rk.append("  %n2 = call i64 @read(i32 0, i8* %cb, i64 1)\n");
+            rk.append("  %v2 = load i8, i8* %cb\n");
+            rk.append("  %k2 = zext i8 %v2 to i32\n");
+            rk.append("  %isA = icmp eq i32 %k2, 65\n");
+            rk.append("  %isBc = icmp eq i32 %k2, 66\n");
+            rk.append("  %isCc = icmp eq i32 %k2, 67\n");
+            rk.append("  %isD = icmp eq i32 %k2, 68\n");
+            rk.append("  br i1 %isA, label %ku, label %chkB\n");
+            rk.append("ku:\n  store i32 328, i32* %res\n  br label %restore\n");
+            rk.append("chkB:\n  br i1 %isBc, label %kd, label %chkC\n");
+            rk.append("kd:\n  store i32 332, i32* %res\n  br label %restore\n");
+            rk.append("chkC:\n  br i1 %isCc, label %kr, label %chkD\n");
+            rk.append("kr:\n  store i32 333, i32* %res\n  br label %restore\n");
+            rk.append("chkD:\n  br i1 %isD, label %kl, label %other\n");
+            rk.append("kl:\n  store i32 331, i32* %res\n  br label %restore\n");
+            rk.append("other:\n  store i32 27, i32* %res\n  br label %restore\n");
+            rk.append("restore:\n");
+            rk.append("  %toret = call i32 @tcsetattr(i32 0, i32 0, i8* %to)\n");
+            rk.append("  %rv = load i32, i32* %res\n");
+            rk.append("  ret i32 %rv\n");
         }
         rk.append("}\n\n");
         header.append(rk);

@@ -66,6 +66,9 @@ while (true) {
 ## 平台差异（必读）
 
 - **Windows（主实现）**：`readKey` 走 conio `_getch()`——无回显、**特殊键完整**（0/0xE0 前缀 + 扫描码在库内合并为 256+code）；`readLine` 走 `fgets(stdin)`；
-- **POSIX v1 降级**：`readKey` 走 `getchar()`（**行缓冲**——需 enter 才返回，方向键等特殊键需终端 raw 模式，暂不支持）；`readLine` 同 `fgets`；
-- **交互验证**：`readKey` 依赖真实终端（conio 不读管道），自动化测试覆盖 `readLine`/单例/KEY 常量，`readKey` 请在真实控制台手测（`test/t_scanner_key.cang`）；
-- 实现为编译器 Design B wrapper（`emitScannerRuntime`），符号 `_getch`/`fgets`/`__acrt_iob_func` 已链接实证。
+- **POSIX raw 模式（Linux/macOS）**：`readKey` 每次调用自治切换——`tcgetattr` 保存原 termios → 拷贝 → `cfmakeraw` → `tcsetattr` 进入 raw（**无行缓冲、无回显，单字符即时返回**）→ `read(0,1)` 阻塞读键 → **返回前恢复原 termios**（所以 `readLine` 仍走 canonical 行模式，互不干扰）；
+  - **ESC 序列**：读到 27 后用 `poll(100ms)` 探测后续字节；`ESC [ A/B/C/D` 映射为 **328/332/333/331**——与 Windows 的 `KEY_UP/DOWN/RIGHT/LEFT` **同一组值**；单按 ESC（100ms 内无后续）返回 27；不完整序列降级为 27；
+  - 边界：F 键等长序列（`ESC [ 1 1 ~`）v1 不解析（仅方向键 A-D），残余字节会被下次读取消费；
+  - 进程若被强杀（如调试器中断）终端可能残留 raw 模式——执行 `stty sane` 恢复；
+- **验证状态**：POSIX 分支已通过 `--target linux` IR 编译 + `clang -c` 目标文件（符号 `tcgetattr/tcsetattr/cfmakeraw/read/poll` 均为 libc 标准）；实际按键运行待 Linux/macOS 环境复测。Windows `_getch`/`fgets` 链接与运行已实证；
+- `readKey` 依赖真实终端（管道/重定向下 `_getch` 阻塞、raw read 也无键可读），自动化测试覆盖 `readLine`/单例/KEY 常量，`readKey` 请在真实控制台手测（`test/t_scanner_key.cang`）。
