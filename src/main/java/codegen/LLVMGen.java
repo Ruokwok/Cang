@@ -6492,6 +6492,15 @@ public class LLVMGen {
             throw new RuntimeException("Cannot instantiate abstract class '" + node.className
                 + "' (at line " + node.line + ")");
         }
+        // Private constructor: class _Server — only instantiable from inside the class itself
+        // (static or instance methods; the entry class's top-level body counts as its own).
+        if (ci.simpleName.startsWith("_")) {
+            if (currentClassName == null || !currentClassName.equals(ci.fullName)) {
+                throw new RuntimeException("Class '" + node.className
+                    + "' has a private constructor (leading '_'); new is only allowed inside the class itself (at line "
+                    + node.line + ")");
+            }
+        }
 
         // Calculate struct size
         String sizeVar = "%size." + tmpCount++;
