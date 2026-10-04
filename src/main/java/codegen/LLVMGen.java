@@ -6161,10 +6161,15 @@ public class LLVMGen {
         String argStr;
         String argType;
         if (argVal.type.equals("i1")) {
-            String ext = "%bool.ext." + tmpCount++;
-            body.append("  ").append(ext).append(" = zext i1 ").append(argVal.value).append(" to i32\n");
-            argStr = ext;
-            argType = "i32";
+            // Java-style boolean printing: true / false (not 1 / 0).
+            String trueStr = ensureStringConstant("@.str.btrue", "true\\00", 5);
+            String falseStr = ensureStringConstant("@.str.bfalse", "false\\00", 6);
+            String sel = "%bool.str." + tmpCount++;
+            body.append("  ").append(sel).append(" = select i1 ").append(argVal.value)
+                 .append(", i8* ").append(trueStr).append(", i8* ").append(falseStr).append("\n");
+            argStr = sel;
+            argType = "i8*";
+            fmtName = fmtMap.get("String"); // %s (with or without newline)
         } else if (argVal.type.equals("i8")) {
             String ext = "%byte.ext." + tmpCount++;
             body.append("  ").append(ext).append(" = sext i8 ").append(argVal.value).append(" to i32\n");
