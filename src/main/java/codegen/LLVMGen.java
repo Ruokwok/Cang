@@ -7216,6 +7216,8 @@ public class LLVMGen {
         if (scCi == null || !imports.contains("cang/io/Scanner")) return;
         boolean win = targetPlatform.equals("windows");
 
+        // Pending byte for a 0xE0-prefixed CJK sequence (readKey only; -1 = none)
+        header.append("@cang.sc.pending = internal global i32 -1\n");
         // libc declares (strlen/malloc/free already declared in emitHeader)
         if (!header.toString().contains("declare i8* @fgets(")) {
             header.append("declare i8* @fgets(i8*, i32, i8*)\n");
@@ -7255,6 +7257,15 @@ public class LLVMGen {
         rk.append("}\n\n");
         // 1-arg: timeout in milliseconds; -1 = block forever; timeout/EOF -> -1
         rk.append("define i32 @cang_io_Scanner.readKey.1(i8* %this, i32 %timeoutMs) {\nentry:\n");
+        // Pending byte from a multi-byte sequence whose first byte looked like a 0xE0 prefix
+        // (CJK encoding data, not a scan code) — serve it before any waiting.
+        rk.append("  %pd = load i32, i32* @cang.sc.pending\n");
+        rk.append("  %hasp = icmp ne i32 %pd, -1\n");
+        rk.append("  br i1 %hasp, label %pdret, label %nopend\n");
+        rk.append("pdret:\n");
+        rk.append("  store i32 -1, i32* @cang.sc.pending\n");
+        rk.append("  ret i32 %pd\n");
+        rk.append("nopend:\n");
         if (win) {
             // -1 skips the wait; otherwise poll kbhit + GetTickCount64 + Sleep(1).
             // (WaitForSingleObject on a redirected pipe handle reads as always-signaled —
@@ -7282,7 +7293,10 @@ public class LLVMGen {
             rk.append("  ret i32 -1\n");
             rk.append("direct:\n");
             // _getch: plain ASCII/13/27..., or 0/0xE0 prefix + scan code for special keys.
-            // Special keys are returned as 256 + scancode so KEY_UP=328 (256+72) etc. match.
+            // Special keys are returned as 256 + scancode (KEY_UP=328 = 256+72 etc.).
+            // Scan codes are always <128, so a SECOND byte >= 128 means multi-byte CJK text
+            // whose first byte happened to be 0xE0 — return the prefix byte and stash the
+            // second byte in @cang.sc.pending instead of swallowing it as a scan code.
             rk.append("  %c0 = call i32 @_getch()\n");
             rk.append("  %p0 = icmp eq i32 %c0, 0\n");
             rk.append("  %pe = icmp eq i32 %c0, 224\n");
@@ -7290,6 +7304,12 @@ public class LLVMGen {
             rk.append("  br i1 %pre, label %sc, label %ret\n");
             rk.append("sc:\n");
             rk.append("  %c1 = call i32 @_getch()\n");
+            rk.append("  %c1hi = icmp sge i32 %c1, 128\n");
+            rk.append("  br i1 %c1hi, label %enc, label %scan\n");
+            rk.append("enc:\n");
+            rk.append("  store i32 %c1, i32* @cang.sc.pending\n");
+            rk.append("  ret i32 %c0\n");
+            rk.append("scan:\n");
             rk.append("  %m = or i32 256, %c1\n");
             rk.append("  ret i32 %m\n");
             rk.append("ret:\n");
