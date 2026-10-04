@@ -4331,6 +4331,16 @@ public class LLVMGen {
      * Convert a non-string value to its string representation using snprintf.
      */
     private LLVMValue convertToString(LLVMValue val) {
+        // Java-style: bool concatenates as "true"/"false" — pure constants, no buffer needed.
+        // Handled before the snprintf path (which would itoa it to 1/0).
+        if (val.type.equals("i1")) {
+            String trueStr = ensureStringConstant("@.str.btrue", "true\\00", 5);
+            String falseStr = ensureStringConstant("@.str.bfalse", "false\\00", 6);
+            String sel = "%tostr.bool." + tmpCount++;
+            body.append("  ").append(sel).append(" = select i1 ").append(val.value)
+                 .append(", i8* ").append(trueStr).append(", i8* ").append(falseStr).append("\n");
+            return new LLVMValue(sel, "i8*");
+        }
         // Allocate buffer (enough for any number)
         String buf = "%tostr.buf." + tmpCount++;
         body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 64)\n");
@@ -4341,11 +4351,6 @@ public class LLVMGen {
             // byte: zext to i32 first
             String ext = "%tostr.ext." + tmpCount++;
             body.append("  ").append(ext).append(" = sext i8 ").append(val.value).append(" to i32\n");
-            fmt = "@.fmt.tostr.int";
-            val = new LLVMValue(ext, "i32");
-        } else if (val.type.equals("i1")) {
-            String ext = "%tostr.ext." + tmpCount++;
-            body.append("  ").append(ext).append(" = zext i1 ").append(val.value).append(" to i32\n");
             fmt = "@.fmt.tostr.int";
             val = new LLVMValue(ext, "i32");
         } else if (val.type.equals("i32")) {
