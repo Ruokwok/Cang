@@ -1351,7 +1351,10 @@ public class LLVMGen {
         header.append("%CangFunction = type { i8*, i8* }\n");
         header.append("%CangThreadHandle = type { i64, i8*, i32 }\n");
         // Object-style Thread: new Thread().task(fn).start() — { task code, task receiver, handle }
-        header.append("%CangThreadObj = type { i8*, i8*, i8* }\n");
+        header.append("%CangThreadObj = type { i8*, i8*, i8*, i1 }\n");
+        // Registry of non-daemon object-style threads: joined at main exit unless daemon.
+        header.append("@cang.thr.regs = internal global [256 x i8*] zeroinitializer\n");
+        header.append("@cang.thr.regc = internal global i64 0\n");
         header.append("%CangList = type { i8*, i64, i64 }\n\n");
 
         // Object constructor (no-op)
@@ -2289,6 +2292,82 @@ public class LLVMGen {
             body.append("  br label %").append(skip).append("\n");
             body.append(skip).append(":\n");
         }
+    }
+
+    /** Main-exit sweep for registered non-daemon object-style threads: join each slot that is
+     *  non-null and not already joined (manual join() sets the joined flag and we skip it). */
+    private void emitRegisteredThreadJoins() {
+        int id = labelCount++;
+        String cond = "sweep.cond." + id;
+        String loopBody = "sweep.body." + id;
+        String update = "sweep.upd." + id;
+        String end = "sweep.end." + id;
+        String skip = "sweep.skip." + id;
+        String doJoin = "sweep.do." + id;
+        String already = "sweep.already." + id;
+        String joinedChk = "sweep.joined." + id;
+        String n = "%sweep.n." + tmpCount++;
+        body.append("  ").append(n).append(" = load i64, i64* @cang.thr.regc\n");
+        String idxPtr = "%sweep.i." + tmpCount++;
+        body.append("  ").append(idxPtr).append(" = alloca i64\n");
+        body.append("  store i64 0, i64* ").append(idxPtr).append("\n");
+        body.append("  br label %").append(cond).append("\n\n");
+        body.append(cond).append(":\n");
+        String iv = "%sweep.iv." + tmpCount++;
+        body.append("  ").append(iv).append(" = load i64, i64* ").append(idxPtr).append("\n");
+        String cmp = "%sweep.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp slt i64 ").append(iv).append(", ").append(n).append("\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(loopBody)
+             .append(", label %").append(end).append("\n\n");
+        body.append(loopBody).append(":\n");
+        String slot = "%sweep.slot." + tmpCount++;
+        body.append("  ").append(slot).append(" = getelementptr [256 x i8*], [256 x i8*]* @cang.thr.regs, i64 0, i64 ")
+             .append(iv).append("\n");
+        String hraw = "%sweep.h." + tmpCount++;
+        body.append("  ").append(hraw).append(" = load i8*, i8** ").append(slot).append("\n");
+        String isNull = "%sweep.isnull." + tmpCount++;
+        body.append("  ").append(isNull).append(" = icmp eq i8* ").append(hraw).append(", null\n");
+        body.append("  br i1 ").append(isNull).append(", label %").append(skip)
+             .append(", label %").append(joinedChk).append("\n");
+        body.append(joinedChk).append(":\n");
+        String h = "%sweep.ht." + tmpCount++;
+        body.append("  ").append(h).append(" = bitcast i8* ").append(hraw).append(" to %CangThreadHandle*\n");
+        String joinedPtr = "%sweep.jp." + tmpCount++;
+        body.append("  ").append(joinedPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ")
+             .append(h).append(", i32 0, i32 2\n");
+        String joined = "%sweep.j." + tmpCount++;
+        body.append("  ").append(joined).append(" = load i32, i32* ").append(joinedPtr).append("\n");
+        String isJoined = "%sweep.isj." + tmpCount++;
+        body.append("  ").append(isJoined).append(" = icmp eq i32 ").append(joined).append(", 1\n");
+        body.append("  br i1 ").append(isJoined).append(", label %").append(already)
+             .append(", label %").append(doJoin).append("\n");
+        body.append(doJoin).append(":\n");
+        String idPtr = "%sweep.id." + tmpCount++;
+        body.append("  ").append(idPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ")
+             .append(h).append(", i32 0, i32 0\n");
+        String tid = "%sweep.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i64, i64* ").append(idPtr).append("\n");
+        if (targetPlatform.equals("windows")) {
+            String hp = "%sweep.hp." + tmpCount++;
+            body.append("  ").append(hp).append(" = inttoptr i64 ").append(tid).append(" to i8*\n");
+            body.append("  call i32 @WaitForSingleObject(i8* ").append(hp).append(", i32 -1)\n");
+            body.append("  call i32 @CloseHandle(i8* ").append(hp).append(")\n");
+        } else {
+            body.append("  call i32 @pthread_join(i64 ").append(tid).append(", i8** null)\n");
+        }
+        // Clear the slot so a re-run (or nested sweep) is idempotent.
+        body.append("  store i8* null, i8** ").append(slot).append("\n");
+        body.append("  br label %").append(skip).append("\n");
+        body.append(already).append(":\n");
+        body.append("  br label %").append(skip).append("\n");
+        body.append(skip).append(":\n");
+        body.append("  br label %").append(update).append("\n");
+        body.append(update).append(":\n");
+        String iv2 = "%sweep.iv2." + tmpCount++;
+        body.append("  ").append(iv2).append(" = add i64 ").append(iv).append(", 1\n");
+        body.append("  store i64 ").append(iv2).append(", i64* ").append(idxPtr).append("\n");
+        body.append("  br label %").append(cond).append("\n\n");
+        body.append(end).append(":\n");
     }
 
     private void generateFree(FreeStmt stmt) {
@@ -4942,7 +5021,10 @@ public class LLVMGen {
         // Thread<T> is a compiler intrinsic. Phase one intentionally targets Windows/MinGW.
         if (node.object instanceof Identifier && ((Identifier) node.object).name.equals("Thread")
                 && node.method.equals("spawn")) {
-            return generateThreadSpawn(node);
+            // Thread.spawn was removed — the object-style API is the only explicit form.
+            // (thread { } still uses generateThreadSpawn internally through a direct call.)
+            throw new RuntimeException("Thread.spawn has been removed; use new Thread().task(fn).start() (at line "
+                + node.line + ")");
         }
         // Object-style Thread: task(fn) / start() on new Thread() results (exact type gate so
         // unrelated classes' task/start methods fall through to the normal instance path).
@@ -5386,7 +5468,15 @@ public class LLVMGen {
         if (receiver.semanticType == null || !isThreadType(receiver.semanticType)) {
             throw new RuntimeException("Thread.task must be called on new Thread() (at line " + node.line + ")");
         }
-        LLVMValue fn = generateExpr(node.args.get(0));
+        // Task takes a no-arg no-return function — give lambdas the expectation they infer from.
+        String savedTaskExpected = expectedFunctionType;
+        expectedFunctionType = "Function<void>";
+        LLVMValue fn;
+        try {
+            fn = generateExpr(node.args.get(0));
+        } finally {
+            expectedFunctionType = savedTaskExpected;
+        }
         String sig = fn.semanticType;
         if (sig == null || !isFunctionType(sig)) {
             throw new RuntimeException("Thread.task requires a no-argument no-return function, e.g. this::run or a lambda (at line " + node.line + ")");
@@ -5486,6 +5576,39 @@ public class LLVMGen {
              .append(", i32 0, i32 2\n");
         body.append("  store i32 0, i32* ").append(joined).append("\n");
         body.append("  store i8* ").append(handleRaw).append(", i8** ").append(hfield).append("\n");
+
+        // Non-daemon threads join at main exit; daemon (new Thread(true)) does not register.
+        String dptr = "%thr.start.dp." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 3\n");
+        String daemon = "%thr.start.daemon." + tmpCount++;
+        body.append("  ").append(daemon).append(" = load i1, i1* ").append(dptr).append("\n");
+        int regId = labelCount++;
+        String doReg = "thrreg.enter." + regId;
+        String skipReg = "thrreg.skip." + regId;
+        body.append("  br i1 ").append(daemon).append(", label %").append(skipReg)
+             .append(", label %").append(doReg).append("\n");
+        body.append(doReg).append(":\n");
+        String regCnt = "%thrreg.cnt." + tmpCount++;
+        body.append("  ").append(regCnt).append(" = load i64, i64* @cang.thr.regc\n");
+        String regFull = "%thrreg.full." + tmpCount++;
+        String regOk = "thrreg.ok." + regId;
+        String regBad = "thrreg.bad." + regId;
+        body.append("  ").append(regFull).append(" = icmp uge i64 ").append(regCnt).append(", 256\n");
+        body.append("  br i1 ").append(regFull).append(", label %").append(regBad)
+             .append(", label %").append(regOk).append("\n");
+        body.append(regBad).append(":\n");
+        emitFatalError("Too many live threads (registry full)", node.line, regOk);
+        body.append(regOk).append(":\n");
+        String regSlot = "%thrreg.slot." + tmpCount++;
+        body.append("  ").append(regSlot).append(" = getelementptr [256 x i8*], [256 x i8*]* @cang.thr.regs, i64 0, i64 ")
+             .append(regCnt).append("\n");
+        body.append("  store i8* ").append(handleRaw).append(", i8** ").append(regSlot).append("\n");
+        String regCnt2 = "%thrreg.cnt2." + tmpCount++;
+        body.append("  ").append(regCnt2).append(" = add i64 ").append(regCnt).append(", 1\n");
+        body.append("  store i64 ").append(regCnt2).append(", i64* @cang.thr.regc\n");
+        body.append("  br label %").append(skipReg).append("\n");
+        body.append(skipReg).append(":\n");
 
         emitThreadEntryFunction(threadCount);
         emitThreadCreate(raw, tid, node.line);
@@ -6106,11 +6229,24 @@ public class LLVMGen {
         // new Thread() — intrinsic object-style handle; no Cang class body. Fields start null;
         // .task(fn) stores { code, receiver }, .start() creates the thread and stores the handle.
         if (node.className.equals("Thread")) {
-            if (!node.args.isEmpty() || (node.typeArgs != null && !node.typeArgs.isEmpty())) {
-                throw new RuntimeException("new Thread() takes no arguments or type parameters; use Thread.spawn(fn, ...) for value-returning threads (at line " + node.line + ")");
+            if (node.typeArgs != null && !node.typeArgs.isEmpty()) {
+                throw new RuntimeException("new Thread() does not take type parameters (at line " + node.line + ")");
+            }
+            if (node.args.size() > 1) {
+                throw new RuntimeException("new Thread() takes at most one bool daemon flag (at line " + node.line + ")");
+            }
+            // Daemon flag: new Thread(true) = daemon (main exit does NOT wait);
+            // new Thread() / new Thread(false) = non-daemon (joined at main exit).
+            String daemonVal = "false";
+            if (node.args.size() == 1) {
+                LLVMValue flag = generateExpr(node.args.get(0));
+                if (!flag.type.equals("i1")) {
+                    throw new RuntimeException("new Thread() daemon flag must be a bool (at line " + node.line + ")");
+                }
+                daemonVal = flag.value;
             }
             String raw = "%thr.obj.raw." + tmpCount++;
-            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 32)\n");
             String obj = "%thr.obj." + tmpCount++;
             body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangThreadObj*\n");
             for (int f = 0; f < 3; f++) {
@@ -6119,6 +6255,10 @@ public class LLVMGen {
                      .append(", i32 0, i32 ").append(f).append("\n");
                 body.append("  store i8* null, i8** ").append(fp).append("\n");
             }
+            String dptr = "%thr.obj.daemon." + tmpCount++;
+            body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+                 .append(", i32 0, i32 3\n");
+            body.append("  store i1 ").append(daemonVal).append(", i1* ").append(dptr).append("\n");
             return new LLVMValue(obj, "%CangThreadObj*", "Thread<void>");
         }
 
@@ -6624,6 +6764,7 @@ public class LLVMGen {
 
         emitGcFramePop();
         emitThreadBlockJoins();
+        emitRegisteredThreadJoins();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;
@@ -6703,6 +6844,7 @@ public class LLVMGen {
 
         emitGcFramePop();
         emitThreadBlockJoins();
+        emitRegisteredThreadJoins();
         body.append("  ret i32 0\n");
         body.append("}\n\n");
         scope = null;

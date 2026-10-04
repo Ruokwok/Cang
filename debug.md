@@ -197,7 +197,7 @@
 
 ### 28. 🟡 CLI —— `--target` 缺值 → 裸 `ArrayIndexOutOfBounds` 栈（约 38）；未知 flag 静默忽略（switch 无 default，`--no-linl` 照样链接）；无参运行无任何提示（约 22-24）。修复：参数缺值/未知 flag/无参 → usage 文案 + exit 1
 
-### 29. 🟡 `Thread.spawn` 无 join 兜底 —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）
+### 29. ✅ `Thread.spawn` 无 join 兜底 —— 随 spawn 移除而关闭（对象式需显式 join，thread{} 有自动 join 收尾） —— `thread{}` 有全局句柄 join 收尾，`Thread.spawn` 没有 → main 返回即杀线程（实测 5 万行输出只剩 1 行）。修复：spawn 的句柄也进全局 join 数组（或文档明确"必须手动 join"）
 
 ### 30. 🟡 `System.exit` 跳过收尾 —— 直接 `exit()`：跳过 thread{} join 与后续 finally。修复指引：改为设置退出码 → 走统一收尾路径（join 全部句柄 → exit）；finally 语义可暂不承诺
 

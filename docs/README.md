@@ -37,7 +37,7 @@
 | [String.md](libs/String.md) | `String` | 字符串类 API（length/substring/查找/大小写） |
 | [List.md](libs/List.md) | `List<T>` | 泛型动态数组（参考 ArrayList） |
 | [Dict.md](libs/Dict.md) | `Dict<K, V>` | 泛型 KV 映射（参考 HashMap） |
-| [Thread.md](libs/Thread.md) | `Thread<T>` | spawn/thread{}、对象式 task/start/join |
+| [Thread.md](libs/Thread.md) | `Thread<T>` | 对象式 task/start/join（spawn 已移除）、thread{} |
 | [File.md](libs/File.md) | `cang/io/File` | 文件路径、状态、目录、文本读写 |
 | [Function.md](libs/Function.md) | `Function<R,...>` | 函数对象类型声明 |
 | [Error.md](libs/Error.md) | `Error` | 异常基类、message/stack |

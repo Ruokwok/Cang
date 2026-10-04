@@ -24,7 +24,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
 - `Math`、`System`、`Stdout`、`Stderr`、`String`、`List`、`Dict` 等基础标准库；
 - `try/catch/finally` 与 `Error` 的第一版实现；
-- 线程：`Thread.spawn(fn, ...)`、`thread { }` 语法糖、`new Thread().task(this::run).start()` 对象式写法；
+- 线程：`new Thread().task(fn).start()` 对象式写法与 `thread { }` 语法糖（`Thread.spawn` 已移除）；
 - Boehm GC 自动内存管理（默认）+ `free` 提前释放，`--no-gc` 可切回手动模式；
 - Windows、Linux、macOS 目标平台常量和基础交叉编译参数。
 

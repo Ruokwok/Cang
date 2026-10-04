@@ -1,10 +1,9 @@
 namespace cang/lang
 
 # Thread<T> - compiler intrinsic thread handle.
-# Thread.spawn(fn, args...) 创建线程；thread.join() 等待并取得 T，且只能调用一次。
-# 对象式：new Thread().task(this::run).start() —— task 接收无参无返回的函数
-# （方法引用/顶层函数/无参 lambda），start 返回 Thread<void> 句柄，可 join。
-# T 与参数支持 void/int/long/float/double/bool/byte/String/str；
-# 对象、数组、Function、lambda、方法引用不允许跨线程（对象式任务的 receiver 除外）。
+# 对象式（唯一显式写法）：new Thread().task(fn).start() —— fn 收方法引用/顶层函数/无参 lambda；
+# start 返回 Thread<void> 句柄，join 只能调用一次；Thread.spawn 已移除（编译期报错并提示迁移）。
+# thread { } 语法糖不受影响（退出前自动 join）。
+# 对象式任务为 void 无参；对象、数组、Function、lambda 不允许跨线程（任务的 receiver 除外）。
 # 与 Boehm GC 兼容：Windows 经 GC_CreateThread 附着，posix 在线程入口注册线程栈。
 class Thread<T>
