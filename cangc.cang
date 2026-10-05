@@ -7,8 +7,53 @@ import cang/lang/System
 #   <cwd>/jar/cang.jar          编译器 jar
 #   <cwd>/openjdk/bin/java.exe  JVM（非 Windows 为 bin/java）
 # 用法与 java -jar cang.jar 完全一致，退出码透传；
-# -v 归一为 --version 后转发（打印编译器版本）。
+# -v 归一为 --version 后转发（打印编译器版本）；
+# -h/--help 或无参数启动时打印本帮助（无参 exit 1，显式 help exit 0）。
 class Main()
+
+# ---- help / version 拦截（不需要 jar/JVM，最先处理） ----
+bool showHelp = false
+bool helpExplicit = false
+int argCount = 0
+for (var a : System.ARGS) {
+    argCount = argCount + 1
+}
+if (argCount <= 1) {
+    showHelp = true
+} else {
+    for (var a : System.ARGS) {
+        if (a == "-h" || a == "--help") {
+            showHelp = true
+            helpExplicit = true
+        }
+    }
+}
+if (showHelp) {
+    Stdout.println(`cangc — Cang compiler launcher
+
+Usage:
+  cangc <source.cang> [options]    compile a Cang program
+  cangc -v | --version             print compiler version
+  cangc -h | --help                show this help
+
+Layout (relative to the current working directory):
+  jar/cang.jar             compiler
+  openjdk/bin/java(.exe)   JVM
+
+Compiler options (forwarded to the compiler):
+  --no-link            compile to .ll only (skip clang/gcc)
+  --target <t>         windows | linux | macos   (default: windows)
+  --clang <path>       clang executable
+  --gcc <path>         gcc executable
+  --gc / --no-gc       Boehm GC on (default) / manual free
+  --gc-lib <dir>       override libgc lookup directory
+
+The exit code is passed through from the compiler.`)
+    if (helpExplicit) {
+        System.exit(0)
+    }
+    System.exit(1)
+}
 
 String cwd = System.getCwd()
 if (cwd == null) {

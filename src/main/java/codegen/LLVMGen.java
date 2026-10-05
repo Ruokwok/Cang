@@ -1432,24 +1432,16 @@ public class LLVMGen {
                 String strKey = sl.value;
                 if (!stringLiterals.containsKey(strKey)) {
                     String strName = "@.str.stat." + stringLiterals.size();
-                    int byteCount = sl.value.length() + 1;
-                    StringBuilder escaped = new StringBuilder();
-                    for (char c : sl.value.toCharArray()) {
-                        if (c == '\\') escaped.append("\\5C");
-                        else if (c == '\n') escaped.append("\\0A");
-                        else if (c == '\t') escaped.append("\\09");
-                        else if (c == '"') escaped.append("\\22");
-                        else if (c >= 32 && c < 127) escaped.append(c);
-                        else escaped.append(String.format("\\%02X", (int) c));
-                    }
+                    int byteCount = utf8Len(sl.value) + 1;
+                    String escaped = escapeBytes(sl.value);
                     header.append(strName).append(" = private unnamed_addr constant [").append(byteCount)
                           .append(" x i8] c\"").append(escaped).append("\\00\"\n");
                     stringLiterals.put(strKey, strName);
                 }
                 String strName = stringLiterals.get(strKey);
                 header.append(globalName).append(" = global i8* getelementptr ([")
-                      .append(sl.value.length() + 1).append(" x i8], [")
-                      .append(sl.value.length() + 1).append(" x i8]* ")
+                      .append(utf8Len(sl.value) + 1).append(" x i8], [")
+                      .append(utf8Len(sl.value) + 1).append(" x i8]* ")
                       .append(strName).append(", i32 0, i32 0)\n");
             } else {
                 // Constant literal init (static int n = 7, slot = null, ...) — emitted directly
@@ -2007,7 +1999,7 @@ public class LLVMGen {
     private void emitFatalError(String message, int line, String continuationLabel) {
         int id = runtimeErrorCount++;
         String msg = ensureStringConstant("@.str.rterror." + id, message + "\\0A\\00", message.length() + 2);
-        String file = ensureStringConstant("@.str.rtfile." + id, sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+        String file = ensureStringConstant("@.str.rtfile." + id, escapeBytes(sourceFile.replace('\\', '/')) + "\\00", utf8Len(sourceFile) + 1);
         ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
         body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0), i8* ")
              .append(msg).append(")\n");
@@ -2068,7 +2060,7 @@ public class LLVMGen {
         body.append("  br label %").append(uncaught).append("\n");
         body.append(uncaught).append(":\n");
         String message = ensureStringConstant("@.str.uncaught", "uncaught exception\\0A\\00", 20);
-        String fileName = ensureStringConstant("@.str.srcfile", sourceFile.replace('\\', '/') + "\\00", sourceFile.length() + 1);
+        String fileName = ensureStringConstant("@.str.srcfile", escapeBytes(sourceFile.replace('\\', '/')) + "\\00", utf8Len(sourceFile) + 1);
         ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
         // Prefer the thrown Error.message when the Error class layout is known.
         ClassInfo errorInfo = classes.get("Error");
@@ -3446,18 +3438,8 @@ public class LLVMGen {
         String key = text;
         if (!stringLiterals.containsKey(key)) {
             String name = "@.str." + strCount++;
-            int byteCount = text.length() + 1; // +1 for null terminator
-            // Build escaped string
-            StringBuilder escaped = new StringBuilder();
-            for (char c : text.toCharArray()) {
-                if (c == '\\') escaped.append("\\5C");
-                else if (c == '\n') escaped.append("\\0A");
-                else if (c == '\t') escaped.append("\\09");
-                else if (c == '\0') escaped.append("\\00");
-                else if (c == '"') escaped.append("\\22");
-                else if (c >= 32 && c < 127) escaped.append(c);
-                else escaped.append(String.format("\\%02X", (int) c));
-            }
+            int byteCount = utf8Len(text) + 1; // +1 for null terminator
+            String escaped = escapeBytes(text);
             header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
                   .append(" x i8] c\"").append(escaped).append("\\00\"\n");
             stringLiterals.put(key, name);
@@ -3465,8 +3447,8 @@ public class LLVMGen {
         String globalName = stringLiterals.get(key);
         String ptr = "%str." + tmpCount++;
         body.append("  ").append(ptr).append(" = getelementptr [")
-            .append(text.length() + 1).append(" x i8], [")
-            .append(text.length() + 1).append(" x i8]* ")
+            .append(utf8Len(text) + 1).append(" x i8], [")
+            .append(utf8Len(text) + 1).append(" x i8]* ")
             .append(globalName).append(", i32 0, i32 0\n");
         return new LLVMValue(ptr, "i8*");
     }
@@ -6869,16 +6851,8 @@ public class LLVMGen {
         String key = value;
         if (!stringLiterals.containsKey(key)) {
             String name = "@.str.sys." + stringLiterals.size();
-            int byteCount = value.length() + 1;
-            StringBuilder escaped = new StringBuilder();
-            for (char c : value.toCharArray()) {
-                if (c == '\\') escaped.append("\\5C");
-                else if (c == '\n') escaped.append("\\0A");
-                else if (c == '\t') escaped.append("\\09");
-                else if (c == '"') escaped.append("\\22");
-                else if (c >= 32 && c < 127) escaped.append(c);
-                else escaped.append(String.format("\\%02X", (int) c));
-            }
+            int byteCount = utf8Len(value) + 1;
+            String escaped = escapeBytes(value);
             header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
                   .append(" x i8] c\"").append(escaped).append("\\00\"\n");
             stringLiterals.put(key, name);
@@ -6886,8 +6860,8 @@ public class LLVMGen {
         String globalName = stringLiterals.get(key);
         String ptr = "%str." + tmpCount++;
         body.append("  ").append(ptr).append(" = getelementptr [")
-            .append(value.length() + 1).append(" x i8], [")
-            .append(value.length() + 1).append(" x i8]* ")
+            .append(utf8Len(value) + 1).append(" x i8], [")
+            .append(utf8Len(value) + 1).append(" x i8]* ")
             .append(globalName).append(", i32 0, i32 0\n");
         return new LLVMValue(ptr, "i8*");
     }
@@ -7560,6 +7534,26 @@ public class LLVMGen {
     /**
      * Ensure a string constant exists in header (idempotent).
      */
+    /** UTF-8 byte length — LLVM [N x i8] constants count bytes, not Java chars. */
+    private static int utf8Len(String v) {
+        return v.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    }
+
+    /** LLVM c"..." escaping over UTF-8 bytes: printable ASCII stays raw, the rest becomes \XX. */
+    private static String escapeBytes(String v) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : v.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+            int c = b & 0xFF;
+            if (c == '\\') sb.append("\\5C");
+            else if (c == '\n') sb.append("\\0A");
+            else if (c == '\t') sb.append("\\09");
+            else if (c == '"') sb.append("\\22");
+            else if (c >= 32 && c < 127) sb.append((char) c);
+            else sb.append(String.format("\\%02X", c));
+        }
+        return sb.toString();
+    }
+
     private String ensureStringConstant(String name, String text, int byteCount) {
         // Match the definition form (`name = ...`): a plain contains() would treat
         // `@.str.obj` as present because `@.str.obj.nl` contains it as a prefix (debug.md #31).
