@@ -220,6 +220,7 @@ stdlib/cang/lang/
 - `Dict.cang`：泛型 KV 映射（参考 HashMap）；
 - `Thread.cang`：线程句柄类型声明。
 - `cang/io/Scanner.cang`：单例标准输入（readLine/readKey 阻塞读取）；
+- `cang/io/Process.cang`：本地命令执行（exec 按行回调、超时终止、退出码；argv 直执行无 shell）；
 
 ## 项目结构
 

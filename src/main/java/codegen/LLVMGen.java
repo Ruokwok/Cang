@@ -1479,6 +1479,7 @@ public class LLVMGen {
         header.append("\n");
         emitFileRuntime();
         emitScannerRuntime();
+        emitProcessRuntime();
     }
 
     private final Map<String, String> fmtConstants = new LinkedHashMap<>();
@@ -8076,6 +8077,998 @@ public class LLVMGen {
         cc.append("  ret i8* %mbuf\n");
         cc.append("}\n\n");
         header.append(cc);
+    }
+
+    /**
+     * cang/io/Process — exec(String[] cmd, Function<Void,String> cb, int timeoutMs).
+     * argv direct exec (no shell). stdout line-split -> callback per line; stderr inherits
+     * the terminal. Returns the child exit code; -1 = spawn failure or timeout (killed).
+     * Labels prl.* / values prv.* — kept apart from the start (collision #6 lesson).
+     */
+    private void emitProcessRuntime() {
+        ClassInfo pCi = classes.get("cang_io_Process");
+        if (pCi == null || !imports.contains("cang/io/Process")) return;
+        boolean win = targetPlatform.equals("windows");
+        StringBuilder pb = new StringBuilder();
+        // libc / kernel32 declares (contains-guarded; scanner may already declare Sleep/Peek/GetTickCount64)
+        if (!header.toString().contains("declare i8* @memchr(")) {
+            header.append("declare i8* @memchr(i8*, i32, i64)\n");
+        }
+        if (!header.toString().contains("@.pr.exe = ")) {
+            header.append("@.pr.exe = private constant [5 x i16] [i16 46, i16 101, i16 120, i16 101, i16 0]\n");
+        }
+        if (win) {
+            if (!header.toString().contains("declare i32 @CreatePipe(")) {
+                header.append("declare i32 @CreatePipe(i8*, i8*, i8*, i32)\n");
+                header.append("declare i32 @CreateProcessW(i16*, i16*, i8*, i8*, i32, i32, i8*, i16*, i8*, i8*)\n");
+                header.append("declare i32 @ReadFile(i8*, i8*, i32, i32*, i8*)\n");
+                header.append("declare i32 @GetExitCodeProcess(i8*, i32*)\n");
+                header.append("declare i32 @TerminateProcess(i8*, i32)\n");
+                header.append("declare i32 @MultiByteToWideChar(i32, i32, i8*, i32, i16*, i32)\n");
+                header.append("declare i32 @WideCharToMultiByte(i32, i32, i16*, i32, i8*, i32, i8*, i8*)\n");
+                header.append("declare i32 @SearchPathW(i16*, i16*, i16*, i32, i16*, i16*)\n");
+            }
+            if (!header.toString().contains("declare i32 @CloseHandle(")) {
+                header.append("declare i32 @CloseHandle(i8*)\n");
+            }
+            if (!header.toString().contains("declare void @Sleep(i32)")) {
+                header.append("declare void @Sleep(i32)\n");
+            }
+            if (!header.toString().contains("declare i64 @GetTickCount64()")) {
+                header.append("declare i64 @GetTickCount64()\n");
+            }
+            if (!header.toString().contains("declare i32 @PeekNamedPipe(")) {
+                header.append("declare i32 @PeekNamedPipe(i8*, i8*, i32, i8*, i32*, i32*)\n");
+            }
+            if (!header.toString().contains("declare i8* @GetStdHandle(")) {
+                header.append("declare i8* @GetStdHandle(i32)\n");
+            }
+        } else {
+            if (!header.toString().contains("declare i32 @pipe(")) {
+                header.append("declare i32 @pipe(i32*)\n");
+                header.append("declare i32 @fork()\n");
+                header.append("declare i32 @dup2(i32, i32)\n");
+                header.append("declare i32 @execvp(i8*, i8**)\n");
+                header.append("declare void @_exit(i32)\n");
+                header.append("declare i32 @kill(i32, i32)\n");
+                header.append("declare i32 @waitpid(i32, i32*, i32)\n");
+                header.append("declare i32 @close(i32)\n");
+                header.append("declare i32 @gettimeofday(i8*, i8*)\n");
+            }
+            if (!header.toString().contains("declare i64 @read(i32, i8*, i64)")) {
+                header.append("declare i64 @read(i32, i8*, i64)\n");
+            }
+            if (!header.toString().contains("declare i32 @poll(")) {
+                header.append("declare i32 @poll(i8*, i64, i32)\n");
+            }
+        }
+        int id = labelCount++;
+        String lblArgvLoop = "prl.argv.loop." + id, lblArgvBody = "prl.argv.body." + id,
+               lblArgvDone = "prl.argv.done." + id, lblSpawn = "prl.spawn." + id,
+               lblSpawnFail = "prl.spawn.fail." + id, lblReadLoop = "prl.read.loop." + id,
+               lblChunk = "prl.chunk." + id, lblScan = "prl.scan." + id,
+               lblScanAppend = "prl.scan.append." + id, lblScanLine = "prl.scan.line." + id,
+               lblScanNext = "prl.scan.next." + id, lblDone = "prl.done." + id,
+               lblKill = "prl.kill." + id, lblSleep = "prl.sleep." + id,
+               lblRet = "prl.ret." + id;
+        String argc = "%prv.argc." + tmpCount, argv = "%prv.argv." + tmpCount,
+               iAlloca = "%prv.i." + tmpCount, pend = "%prv.pend." + tmpCount,
+               pendLen = "%prv.pendlen." + tmpCount, exited = "%prv.exited." + tmpCount,
+               timedOut = "%prv.timedout." + tmpCount, codeSlot = "%prv.code." + tmpCount,
+               srcPtr = "%prv.src." + tmpCount, rem = "%prv.rem." + tmpCount,
+               tmpBuf = "%prv.tmpbuf." + tmpCount, nrd = "%prv.nrd." + tmpCount,
+               avail = "%prv.avail." + tmpCount, startT = "%prv.start." + tmpCount;
+        tmpCount++;
+        pb.append("define i32 @cang_io_Process.exec(i8* %cmd, %CangFunction %cb, i32 %timeoutMs) {\n");
+        pb.append("entry:\n");
+        pb.append("  ").append(argc).append(" = load i64, i64* %cmd\n");
+        pb.append("  ").append(pend).append(" = alloca i8*\n  store i8* null, i8** ").append(pend).append("\n");
+        pb.append("  ").append(pendLen).append(" = alloca i64\n  store i64 0, i64* ").append(pendLen).append("\n");
+        pb.append("  ").append(exited).append(" = alloca i32\n  store i32 0, i32* ").append(exited).append("\n");
+        pb.append("  ").append(timedOut).append(" = alloca i32\n  store i32 0, i32* ").append(timedOut).append("\n");
+        pb.append("  ").append(codeSlot).append(" = alloca i32\n  store i32 -1, i32* ").append(codeSlot).append("\n");
+        pb.append("  ").append(srcPtr).append(" = alloca i8*\n");
+        pb.append("  ").append(rem).append(" = alloca i64\n");
+        pb.append("  ").append(tmpBuf).append(" = alloca [4096 x i8]\n");
+        pb.append("  ").append(nrd).append(" = alloca i32\n");
+        pb.append("  ").append(avail).append(" = alloca i32\n");
+        pb.append("  ").append(startT).append(" = alloca i64\n  store i64 0, i64* ").append(startT).append("\n");
+        // argv = malloc((argc+1)*8), fill from the length-prefixed Cang array, NULL-terminate
+        String asz = "%prv.asz." + tmpCount++, asz8 = "%prv.asz8." + tmpCount++;
+        pb.append("  ").append(asz).append(" = add i64 ").append(argc).append(", 1\n");
+        pb.append("  ").append(asz8).append(" = mul i64 ").append(asz).append(", 8\n");
+        pb.append("  ").append(argv).append(" = call i8* @").append(allocFn()).append("(i64 ").append(asz8).append(")\n");
+        pb.append("  ").append(iAlloca).append(" = alloca i64\n  store i64 0, i64* ").append(iAlloca).append("\n");
+        pb.append("  br label %").append(lblArgvLoop).append("\n");
+        pb.append(lblArgvLoop).append(":\n");
+        String icur = "%prv.icur." + tmpCount++, icmp = "%prv.icmp." + tmpCount++;
+        pb.append("  ").append(icur).append(" = load i64, i64* ").append(iAlloca).append("\n");
+        pb.append("  ").append(icmp).append(" = icmp slt i64 ").append(icur).append(", ").append(argc).append("\n");
+        pb.append("  br i1 ").append(icmp).append(", label %").append(lblArgvBody).append(", label %").append(lblArgvDone).append("\n");
+        pb.append(lblArgvBody).append(":\n");
+        String cmdAs = "%prv.cmdas." + tmpCount++;
+        pb.append("  ").append(cmdAs).append(" = bitcast i8* %cmd to i8**\n");
+        String cmdS0 = "%prv.cmds0." + tmpCount++;
+        pb.append("  ").append(cmdS0).append(" = getelementptr i8*, i8** ").append(cmdAs).append(", i64 1\n");
+        String slotPtr = "%prv.sp." + tmpCount++;
+        pb.append("  ").append(slotPtr).append(" = getelementptr i8*, i8** ").append(cmdS0).append(", i64 ").append(icur).append("\n");
+        String elem = "%prv.elem." + tmpCount++;
+        pb.append("  ").append(elem).append(" = load i8*, i8** ").append(slotPtr).append("\n");
+        String argvAs = "%prv.argvas." + tmpCount++;
+        pb.append("  ").append(argvAs).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+        String argvSlot = "%prv.as." + tmpCount++;
+        pb.append("  ").append(argvSlot).append(" = getelementptr i8*, i8** ").append(argvAs).append(", i64 ").append(icur).append("\n");
+        pb.append("  store i8* ").append(elem).append(", i8** ").append(argvSlot).append("\n");
+        String iinc = "%prv.iinc." + tmpCount++;
+        pb.append("  ").append(iinc).append(" = add i64 ").append(icur).append(", 1\n");
+        pb.append("  store i64 ").append(iinc).append(", i64* ").append(iAlloca).append("\n");
+        pb.append("  br label %").append(lblArgvLoop).append("\n");
+        pb.append(lblArgvDone).append(":\n");
+        String argvAs2 = "%prv.argvas2." + tmpCount++;
+        pb.append("  ").append(argvAs2).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+        String nullSlot = "%prv.ns." + tmpCount++;
+        pb.append("  ").append(nullSlot).append(" = getelementptr i8*, i8** ").append(argvAs2).append(", i64 ").append(icur).append("\n");
+        pb.append("  store i8* null, i8** ").append(nullSlot).append("\n");
+pb.append("  br label %").append(lblSpawn).append("\n");
+        if (win) {
+            // ---- Windows spawn: PATH-resolve argv[0] (CreateProcess does NOT search PATH),
+            //      quote-join argv into a command line, CreateProcessW with stdout piped. ----
+            pb.append(lblSpawn).append(":\n");
+            String sa = "%prv.sa." + tmpCount++, rd = "%prv.rd." + tmpCount++, wr = "%prv.wr." + tmpCount++;
+            String si = "%prv.si." + tmpCount++, pi = "%prv.pi." + tmpCount++;
+            pb.append("  ").append(sa).append(" = alloca [24 x i8]\n");
+            pb.append("  ").append(rd).append(" = alloca i8*\n");
+            pb.append("  ").append(wr).append(" = alloca i8*\n");
+            pb.append("  ").append(si).append(" = alloca [104 x i8]\n");
+            pb.append("  ").append(pi).append(" = alloca [24 x i8]\n");
+            String a0slot = "%prv.a0s." + tmpCount++;
+            pb.append("  ").append(a0slot).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+            String a0 = "%prv.a0." + tmpCount++;
+            pb.append("  ").append(a0).append(" = load i8*, i8** ").append(a0slot).append("\n");
+            // scan argv[0] for a path separator (/ \ :) — if present, skip PATH search
+            String hasSep = "%prv.hassep." + tmpCount++, sepPtr = "%prv.sepp." + tmpCount++;
+            String lScan = "prl.sep.scan." + id, lSepYes = "prl.sep.yes." + id, lSearch = "prl.search." + id,
+                   lFound = "prl.found." + id, lBuild = "prl.build." + id;
+            pb.append("  ").append(hasSep).append(" = alloca i1\n  store i1 false, i1* ").append(hasSep).append("\n");
+            pb.append("  ").append(sepPtr).append(" = alloca i8*\n  store i8* ").append(a0).append(", i8** ").append(sepPtr).append("\n");
+            pb.append("  br label %").append(lScan).append("\n");
+            pb.append(lScan).append(":\n");
+            String sepCur = "%prv.sepc." + tmpCount++;
+            pb.append("  ").append(sepCur).append(" = load i8*, i8** ").append(sepPtr).append("\n");
+            String sepB = "%prv.sepb." + tmpCount++;
+            pb.append("  ").append(sepB).append(" = load i8, i8* ").append(sepCur).append("\n");
+            String sepEnd = "%prv.sepe." + tmpCount++;
+            pb.append("  ").append(sepEnd).append(" = icmp eq i8 ").append(sepB).append(", 0\n");
+            String lAfterScan = "prl.sep.after." + id;
+            pb.append("  br i1 ").append(sepEnd).append(", label %").append(lAfterScan).append(", label %").append("prl.sep.chk." + id).append("\n");
+            pb.append("prl.sep.chk.").append(id).append(":\n");
+            String c1 = "%prv.c1." + tmpCount++, c2 = "%prv.c2." + tmpCount++, c3 = "%prv.c3." + tmpCount++;
+            pb.append("  ").append(c1).append(" = icmp eq i8 ").append(sepB).append(", 47\n");
+            pb.append("  ").append(c2).append(" = icmp eq i8 ").append(sepB).append(", 92\n");
+            pb.append("  ").append(c3).append(" = icmp eq i8 ").append(sepB).append(", 58\n");
+            String c12 = "%prv.c12." + tmpCount++, c123 = "%prv.c123." + tmpCount++;
+            pb.append("  ").append(c12).append(" = or i1 ").append(c1).append(", ").append(c2).append("\n");
+            pb.append("  ").append(c123).append(" = or i1 ").append(c12).append(", ").append(c3).append("\n");
+            pb.append("  br i1 ").append(c123).append(", label %").append(lSepYes).append(", label %").append("prl.sep.next." + id).append("\n");
+            pb.append("prl.sep.next.").append(id).append(":\n");
+            String sepInc = "%prv.sepi." + tmpCount++;
+            pb.append("  ").append(sepInc).append(" = getelementptr i8, i8* ").append(sepCur).append(", i64 1\n");
+            pb.append("  store i8* ").append(sepInc).append(", i8** ").append(sepPtr).append("\n");
+            pb.append("  br label %").append(lScan).append("\n");
+            pb.append(lSepYes).append(":\n");
+            pb.append("  store i1 true, i1* ").append(hasSep).append("\n");
+            pb.append("  br label %").append(lAfterScan).append("\n");
+            pb.append(lAfterScan).append(":\n");
+            String sepNow = "%prv.sepn." + tmpCount++;
+            pb.append("  ").append(sepNow).append(" = load i1, i1* ").append(hasSep).append("\n");
+            pb.append("  br i1 ").append(sepNow).append(", label %").append(lBuild).append(", label %").append(lSearch).append("\n");
+            // PATH search: widen argv[0], SearchPathW(L".exe"), widen the hit back to UTF-8 -> argv[0]
+            pb.append(lSearch).append(":\n");
+            String w0len = "%prv.w0len." + tmpCount++;
+            pb.append("  ").append(w0len).append(" = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* ").append(a0)
+                 .append(", i32 -1, i16* null, i32 0)\n");
+            String w0bytes = "%prv.w0b." + tmpCount++;
+            pb.append("  ").append(w0bytes).append(" = sext i32 ").append(w0len).append(" to i64\n");
+            String w0sz = "%prv.w0sz." + tmpCount++;
+            pb.append("  ").append(w0sz).append(" = mul i64 ").append(w0bytes).append(", 2\n");
+            String w0 = "%prv.w0." + tmpCount++;
+            pb.append("  ").append(w0).append(" = call i8* @").append(allocFn()).append("(i64 ").append(w0sz).append(")\n");
+            String w0b = "%prv.w0bb." + tmpCount++;
+            pb.append("  ").append(w0b).append(" = bitcast i8* ").append(w0).append(" to i16*\n");
+            pb.append("  %prv.w0c.").append(id).append(" = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* ").append(a0)
+                 .append(", i32 -1, i16* ").append(w0b).append(", i32 ").append(w0len).append(")\n");
+            String sbuf = "%prv.sbuf." + tmpCount++;
+            pb.append("  ").append(sbuf).append(" = call i8* @").append(allocFn()).append("(i64 2048)\n");
+            String sbuf16 = "%prv.sb16." + tmpCount;
+            pb.append("  ").append(sbuf16).append(" = bitcast i8* ").append(sbuf).append(" to i16*\n");
+            tmpCount++;
+            String sr = "%prv.sr." + tmpCount++;
+            pb.append("  ").append(sr).append(" = call i32 @SearchPathW(i16* null, i16* ").append(w0b)
+                 .append(", i16* getelementptr ([5 x i16], [5 x i16]* @.pr.exe, i32 0, i32 0), i32 1024, i16* ")
+                 .append(sbuf16).append(", i16* null)\n");
+            String sok = "%prv.sok." + tmpCount++;
+            pb.append("  ").append(sok).append(" = icmp sgt i32 ").append(sr).append(", 0\n");
+            pb.append("  br i1 ").append(sok).append(", label %").append(lFound).append(", label %").append(lBuild).append("\n");
+            pb.append(lFound).append(":\n");
+            String u8len = "%prv.u8len." + tmpCount++;
+            pb.append("  ").append(u8len).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ").append(sbuf16)
+                 .append(", i32 -1, i8* null, i32 0, i8* null, i8* null)\n");
+            String u8sz = "%prv.u8sz." + tmpCount++;
+            pb.append("  ").append(u8sz).append(" = sext i32 ").append(u8len).append(" to i64\n");
+            String nu8 = "%prv.nu8." + tmpCount++;
+            pb.append("  ").append(nu8).append(" = call i8* @").append(allocFn()).append("(i64 ").append(u8sz).append(")\n");
+            pb.append("  %prv.u8c.").append(id).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ").append(sbuf16)
+                 .append(", i32 -1, i8* ").append(nu8).append(", i32 ").append(u8len).append(", i8* null, i8* null)\n");
+            pb.append("  store i8* ").append(nu8).append(", i8** ").append(a0slot).append("\n");
+            pb.append("  br label %").append(lBuild).append("\n");
+            // ---- quote-join: sum lengths, alloc, then per arg: [" ... "] with embedded " -> \" ----
+            pb.append(lBuild).append(":\n");
+            String sum = "%prv.sum." + tmpCount++, j = "%prv.j." + tmpCount++;
+            String lT1 = "prl.t1." + id, lT1b = "prl.t1b." + id, lT1d = "prl.t1d." + id;
+            pb.append("  ").append(sum).append(" = alloca i64\n  store i64 0, i64* ").append(sum).append("\n");
+            pb.append("  ").append(j).append(" = alloca i64\n  store i64 0, i64* ").append(j).append("\n");
+            pb.append("  br label %").append(lT1).append("\n");
+            pb.append(lT1).append(":\n");
+            String jc = "%prv.jc." + tmpCount++;
+            pb.append("  ").append(jc).append(" = load i64, i64* ").append(j).append("\n");
+            String jcmp = "%prv.jcmp." + tmpCount++;
+            pb.append("  ").append(jcmp).append(" = icmp slt i64 ").append(jc).append(", ").append(argc).append("\n");
+            pb.append("  br i1 ").append(jcmp).append(", label %").append(lT1b).append(", label %").append(lT1d).append("\n");
+            pb.append(lT1b).append(":\n");
+            String cmdAsJ = "%prv.argvasj." + tmpCount++;
+            pb.append("  ").append(cmdAsJ).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+            String jslot = "%prv.js." + tmpCount++;
+            pb.append("  ").append(jslot).append(" = getelementptr i8*, i8** ").append(cmdAsJ).append(", i64 ").append(jc).append("\n");
+            String je = "%prv.je." + tmpCount++;
+            pb.append("  ").append(je).append(" = load i8*, i8** ").append(jslot).append("\n");
+            String jl = "%prv.jl." + tmpCount++;
+            pb.append("  ").append(jl).append(" = call i64 @strlen(i8* ").append(je).append(")\n");
+            String su = "%prv.su." + tmpCount++;
+            pb.append("  ").append(su).append(" = load i64, i64* ").append(sum).append("\n");
+            String sn = "%prv.sn." + tmpCount++;
+            pb.append("  ").append(sn).append(" = add i64 ").append(su).append(", ").append(jl).append("\n");
+            pb.append("  store i64 ").append(sn).append(", i64* ").append(sum).append("\n");
+            String ji = "%prv.ji." + tmpCount++;
+            pb.append("  ").append(ji).append(" = add i64 ").append(jc).append(", 1\n");
+            pb.append("  store i64 ").append(ji).append(", i64* ").append(j).append("\n");
+            pb.append("  br label %").append(lT1).append("\n");
+            pb.append(lT1d).append(":\n");
+            String su2 = "%prv.su2." + tmpCount++;
+            pb.append("  ").append(su2).append(" = load i64, i64* ").append(sum).append("\n");
+            String c3a = "%prv.c3a." + tmpCount++;
+            pb.append("  ").append(c3a).append(" = mul i64 ").append(argc).append(", 3\n");
+            String cap1 = "%prv.cap1." + tmpCount++;
+            pb.append("  ").append(cap1).append(" = mul i64 ").append(su2).append(", 2\n");
+            String cap2 = "%prv.cap2." + tmpCount++;
+            pb.append("  ").append(cap2).append(" = add i64 ").append(cap1).append(", ").append(c3a).append("\n");
+            String cap = "%prv.cap." + tmpCount++;
+            pb.append("  ").append(cap).append(" = add i64 ").append(cap2).append(", 16\n");
+            String cmdUtf8 = "%prv.cmd8." + tmpCount;
+            pb.append("  ").append(cmdUtf8).append(" = call i8* @").append(allocFn()).append("(i64 ").append(cap).append(")\n");
+            tmpCount++;
+            String pos = "%prv.pos." + tmpCount, k = "%prv.k." + tmpCount;
+            pb.append("  ").append(pos).append(" = alloca i8*\n  store i8* ").append(cmdUtf8).append(", i8** ").append(pos).append("\n");
+            pb.append("  ").append(k).append(" = alloca i64\n  store i64 0, i64* ").append(k).append("\n");
+            String lT2 = "prl.t2." + id, lT2arg = "prl.t2arg." + id, lT2in = "prl.t2in." + id,
+                   lT2in2 = "prl.t2in2." + id, lT2inQ = "prl.t2inq." + id, lT2done = "prl.t2done." + id;
+            pb.append("  br label %").append(lT2).append("\n");
+            pb.append(lT2).append(":\n");
+            String kc = "%prv.kc." + tmpCount++;
+            pb.append("  ").append(kc).append(" = load i64, i64* ").append(k).append("\n");
+            String kcmp = "%prv.kcmp." + tmpCount++;
+            pb.append("  ").append(kcmp).append(" = icmp slt i64 ").append(kc).append(", ").append(argc).append("\n");
+            pb.append("  br i1 ").append(kcmp).append(", label %").append(lT2arg).append(", label %").append(lT2done).append("\n");
+            pb.append(lT2arg).append(":\n");
+            String cmdAsK = "%prv.argvask." + tmpCount++;
+            pb.append("  ").append(cmdAsK).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+            String kslot = "%prv.ks." + tmpCount++;
+            pb.append("  ").append(kslot).append(" = getelementptr i8*, i8** ").append(cmdAsK).append(", i64 ").append(kc).append("\n");
+            String ke = "%prv.ke." + tmpCount++;
+            pb.append("  ").append(ke).append(" = load i8*, i8** ").append(kslot).append("\n");
+            String kstr = "%prv.kstr." + tmpCount;
+            pb.append("  ").append(kstr).append(" = alloca i8*\n  store i8* ").append(ke).append(", i8** ").append(kstr).append("\n");
+            String kptr = "%prv.kptr." + tmpCount;
+            pb.append("  ").append(kptr).append(" = alloca i8*\n");
+            String kopen = "%prv.kopen." + tmpCount;
+            pb.append("  ").append(kopen).append(" = load i8*, i8** ").append(pos).append("\n");
+            tmpCount++;
+            String kcmp0 = "%prv.kcmp0." + tmpCount++;
+            pb.append("  ").append(kcmp0).append(" = icmp eq i64 ").append(kc).append(", 0\n");
+            pb.append("  br i1 ").append(kcmp0).append(", label %").append(lT2in).append(", label %").append("prl.t2sp." + id).append("\n");
+            pb.append("prl.t2sp.").append(id).append(":\n");
+            pb.append("  store i8 32, i8* ").append(kopen).append("\n");
+            String kopen2 = "%prv.kopen2." + tmpCount++;
+            pb.append("  ").append(kopen2).append(" = getelementptr i8, i8* ").append(kopen).append(", i64 1\n");
+            pb.append("  store i8* ").append(kopen2).append(", i8** ").append(pos).append("\n");
+            pb.append("  br label %").append(lT2in).append("\n");
+            pb.append(lT2in).append(":\n");
+            String kq = "%prv.kq." + tmpCount++;
+            pb.append("  ").append(kq).append(" = load i8*, i8** ").append(pos).append("\n");
+            pb.append("  store i8 34, i8* ").append(kq).append("\n");  // opening quote
+            String kq2 = "%prv.kq2." + tmpCount++;
+            pb.append("  ").append(kq2).append(" = getelementptr i8, i8* ").append(kq).append(", i64 1\n");
+            pb.append("  store i8* ").append(kq2).append(", i8** ").append(pos).append("\n");
+            pb.append("  store i8* ").append(ke).append(", i8** ").append(kstr).append("\n");
+            pb.append("  store i8* ").append(ke).append(", i8** ").append(kptr).append("\n");
+            pb.append("  br label %").append(lT2in2).append("\n");
+            pb.append(lT2in2).append(":\n");
+            String pc = "%prv.pc." + tmpCount++;
+            pb.append("  ").append(pc).append(" = load i8*, i8** ").append(kptr).append("\n");
+            String pb2 = "%prv.pb." + tmpCount++;
+            pb.append("  ").append(pb2).append(" = load i8, i8* ").append(pc).append("\n");
+            String pend2 = "%prv.pd." + tmpCount++;
+            pb.append("  ").append(pend2).append(" = icmp eq i8 ").append(pb2).append(", 0\n");
+            pb.append("  br i1 ").append(pend2).append(", label %").append("prl.t2close." + id).append(", label %").append(lT2inQ).append("\n");
+            pb.append("prl.t2inq.").append(id).append(":\n");
+            String isQ = "%prv.isq." + tmpCount++;
+            pb.append("  ").append(isQ).append(" = icmp eq i8 ").append(pb2).append(", 34\n");
+            String pst = "%prv.pst." + tmpCount;
+            pb.append("  ").append(pst).append(" = load i8*, i8** ").append(pos).append("\n");
+            tmpCount++;
+            pb.append("  br i1 ").append(isQ).append(", label %").append("prl.t2esc." + id).append(", label %").append("prl.t2copy." + id).append("\n");
+            pb.append("prl.t2esc.").append(id).append(":\n");
+            pb.append("  store i8 92, i8* ").append(pst).append("\n");
+            String pst1 = "%prv.pst1." + tmpCount++;
+            pb.append("  ").append(pst1).append(" = getelementptr i8, i8* ").append(pst).append(", i64 1\n");
+            pb.append("  store i8* ").append(pst1).append(", i8** ").append(pos).append("\n");
+            pb.append("  br label %").append("prl.t2copy." + id).append("\n");
+            pb.append("prl.t2copy.").append(id).append(":\n");
+            String pstC = "%prv.pstc." + tmpCount;
+            pb.append("  ").append(pstC).append(" = load i8*, i8** ").append(pos).append("\n");
+            tmpCount++;
+            pb.append("  store i8 ").append(pb2).append(", i8* ").append(pstC).append("\n");
+            String pst2 = "%prv.pst2." + tmpCount++;
+            pb.append("  ").append(pst2).append(" = getelementptr i8, i8* ").append(pstC).append(", i64 1\n");
+            pb.append("  store i8* ").append(pst2).append(", i8** ").append(pos).append("\n");
+            String pk2 = "%prv.pk2." + tmpCount++;
+            pb.append("  ").append(pk2).append(" = getelementptr i8, i8* ").append(pc).append(", i64 1\n");
+            pb.append("  store i8* ").append(pk2).append(", i8** ").append(kptr).append("\n");
+            pb.append("  br label %").append(lT2in2).append("\n");
+            pb.append("prl.t2close.").append(id).append(":\n");
+            String kcl = "%prv.kcl." + tmpCount++;
+            pb.append("  ").append(kcl).append(" = load i8*, i8** ").append(pos).append("\n");
+            pb.append("  store i8 34, i8* ").append(kcl).append("\n");  // closing quote
+            String kcl2 = "%prv.kcl2." + tmpCount++;
+            pb.append("  ").append(kcl2).append(" = getelementptr i8, i8* ").append(kcl).append(", i64 1\n");
+            pb.append("  store i8* ").append(kcl2).append(", i8** ").append(pos).append("\n");
+            String ki = "%prv.ki." + tmpCount++;
+            pb.append("  ").append(ki).append(" = add i64 ").append(kc).append(", 1\n");
+            pb.append("  store i64 ").append(ki).append(", i64* ").append(k).append("\n");
+            pb.append("  br label %").append(lT2).append("\n");
+            pb.append(lT2done).append(":\n");
+            String pe = "%prv.pe." + tmpCount++;
+            pb.append("  ").append(pe).append(" = load i8*, i8** ").append(pos).append("\n");
+            pb.append("  store i8 0, i8* ").append(pe).append("\n");
+            // widen cmdline -> CreateProcessW(NULL, wcmd, NULL, NULL, inherit, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)
+            String wl = "%prv.wl." + tmpCount++;
+            pb.append("  ").append(wl).append(" = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* ").append(cmdUtf8)
+                 .append(", i32 -1, i16* null, i32 0)\n");
+            String wl64 = "%prv.wl64." + tmpCount++;
+            pb.append("  ").append(wl64).append(" = sext i32 ").append(wl).append(" to i64\n");
+            String wsz = "%prv.wsz." + tmpCount++;
+            pb.append("  ").append(wsz).append(" = mul i64 ").append(wl64).append(", 2\n");
+            String wcmd = "%prv.wcmd." + tmpCount;
+            pb.append("  ").append(wcmd).append(" = call i8* @").append(allocFn()).append("(i64 ").append(wsz).append(")\n");
+            String wcmd16 = "%prv.wcmd16." + tmpCount++;
+            pb.append("  ").append(wcmd16).append(" = bitcast i8* ").append(wcmd).append(" to i16*\n");
+            String wc2 = "%prv.wc2." + tmpCount++;
+            pb.append("  ").append(wc2).append(" = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* ").append(cmdUtf8)
+                 .append(", i32 -1, i16* ").append(wcmd16).append(", i32 ").append(wl).append(")\n");
+            // zero structs; field stores via byte-offset GEP (offsets probe-verified: si=104 pi=24 sa=24)
+            String sa8 = "%prv.sa8." + tmpCount;
+            String si8 = "%prv.si8." + tmpCount;
+            String pi8 = "%prv.pi8." + tmpCount;
+            tmpCount++;
+            pb.append("  ").append(sa8).append(" = bitcast [24 x i8]* ").append(sa).append(" to i8*\n");
+            pb.append("  ").append(si8).append(" = bitcast [104 x i8]* ").append(si).append(" to i8*\n");
+            pb.append("  ").append(pi8).append(" = bitcast [24 x i8]* ").append(pi).append(" to i8*\n");
+            pb.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(sa8).append(", i8 0, i64 24, i1 false)\n");
+            pb.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(si8).append(", i8 0, i64 104, i1 false)\n");
+            pb.append("  call void @llvm.memset.p0i8.p0i8.i64(i8* ").append(pi8).append(", i8 0, i64 24, i1 false)\n");
+            // SA: nLength@0=24, bInheritHandle@16=1
+            String saP0 = "%prv.sap0." + tmpCount++, saI0 = "%prv.sai0." + tmpCount++;
+            pb.append("  ").append(saP0).append(" = getelementptr i8, i8* ").append(sa8).append(", i64 0\n");
+            pb.append("  ").append(saI0).append(" = bitcast i8* ").append(saP0).append(" to i32*\n");
+            pb.append("  store i32 24, i32* ").append(saI0).append("\n");
+            String saP16 = "%prv.sap16." + tmpCount++, saI16 = "%prv.sai16." + tmpCount++;
+            pb.append("  ").append(saP16).append(" = getelementptr i8, i8* ").append(sa8).append(", i64 16\n");
+            pb.append("  ").append(saI16).append(" = bitcast i8* ").append(saP16).append(" to i32*\n");
+            pb.append("  store i32 1, i32* ").append(saI16).append("\n");
+            // SI: cb@0=104, dwFlags@60=STARTF_USESTDHANDLES(256), hStdInput@80, hStdOutput@88, hStdError@96
+            String siP0 = "%prv.sip0." + tmpCount++, siI0 = "%prv.sii0." + tmpCount++;
+            pb.append("  ").append(siP0).append(" = getelementptr i8, i8* ").append(si8).append(", i64 0\n");
+            pb.append("  ").append(siI0).append(" = bitcast i8* ").append(siP0).append(" to i32*\n");
+            pb.append("  store i32 104, i32* ").append(siI0).append("\n");
+            String siP60 = "%prv.sip60." + tmpCount++, siI60 = "%prv.sii60." + tmpCount++;
+            pb.append("  ").append(siP60).append(" = getelementptr i8, i8* ").append(si8).append(", i64 60\n");
+            pb.append("  ").append(siI60).append(" = bitcast i8* ").append(siP60).append(" to i32*\n");
+            pb.append("  store i32 256, i32* ").append(siI60).append("\n");
+            String hIn = "%prv.hin." + tmpCount++, hInP = "%prv.hinp." + tmpCount++, hInPP = "%prv.hinpp." + tmpCount++;
+            pb.append("  ").append(hIn).append(" = call i8* @GetStdHandle(i32 -10)\n");
+            pb.append("  ").append(hInP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 80\n");
+            pb.append("  ").append(hInPP).append(" = bitcast i8* ").append(hInP).append(" to i8**\n");
+            pb.append("  store i8* ").append(hIn).append(", i8** ").append(hInPP).append("\n");
+            String hErr = "%prv.herr." + tmpCount++, hErrP = "%prv.herrp." + tmpCount++, hErrPP = "%prv.herrpp." + tmpCount++;
+            pb.append("  ").append(hErr).append(" = call i8* @GetStdHandle(i32 -12)\n");
+            pb.append("  ").append(hErrP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 96\n");
+            pb.append("  ").append(hErrPP).append(" = bitcast i8* ").append(hErrP).append(" to i8**\n");
+            pb.append("  store i8* ").append(hErr).append(", i8** ").append(hErrPP).append("\n");
+            // CreatePipe(&rd, &wr, &sa, 0)
+            String cpr = "%prv.cpr." + tmpCount++;
+            pb.append("  ").append(cpr).append(" = call i32 @CreatePipe(i8** ").append(rd).append(", i8** ").append(wr)
+                 .append(", i8* ").append(sa8).append(", i32 0)\n");
+            String hOutP = "%prv.houtp." + tmpCount++, hOutPP = "%prv.houtpp." + tmpCount++;
+            pb.append("  ").append(hOutP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 88\n");
+            pb.append("  ").append(hOutPP).append(" = bitcast i8* ").append(hOutP).append(" to i8**\n");
+            String wrV = "%prv.wrv." + tmpCount++;
+            pb.append("  ").append(wrV).append(" = load i8*, i8** ").append(wr).append("\n");
+            pb.append("  store i8* ").append(wrV).append(", i8** ").append(hOutPP).append("\n");
+            String cprOk = "%prv.cprok." + tmpCount++;
+            pb.append("  ").append(cprOk).append(" = icmp eq i32 ").append(cpr).append(", 0\n");
+            pb.append("  br i1 ").append(cprOk).append(", label %prl.pfail." + id + ", label %prl.proc." + id + "\n");
+            pb.append("prl.proc.").append(id).append(":\n");
+            String cpc = "%prv.cpc." + tmpCount++;
+            pb.append("  ").append(cpc).append(" = call i32 @CreateProcessW(i16* null, i16* ").append(wcmd16)
+                 .append(", i8* null, i8* null, i32 1, i32 134217728, i8* null, i16* null, i8* ").append(si8)
+                 .append(", i8* ").append(pi8).append(")\n");
+String cpOk = "%prv.cpok." + tmpCount++;
+            pb.append("  ").append(cpOk).append(" = icmp eq i32 ").append(cpc).append(", 0\n");
+            pb.append("  br i1 ").append(cpOk).append(", label %prl.cf." + id + ", label %prl.cok." + id + "\n");
+            pb.append("prl.cf.").append(id).append(":\n");
+            // CreateProcess failed: close both pipe ends (they exist) then bail with -1
+            String rdV1 = "%prv.rdv1." + tmpCount++;
+            pb.append("  ").append(rdV1).append(" = load i8*, i8** ").append(rd).append("\n");
+            pb.append("  %prv.cc1.").append(id).append(" = call i32 @CloseHandle(i8* ").append(rdV1).append(")\n");
+            String wrV1 = "%prv.wrv1." + tmpCount++;
+            pb.append("  ").append(wrV1).append(" = load i8*, i8** ").append(wr).append("\n");
+            pb.append("  %prv.cc2.").append(id).append(" = call i32 @CloseHandle(i8* ").append(wrV1).append(")\n");
+            pb.append("  br label %").append(lblRet).append("\n");
+            pb.append("prl.pfail.").append(id).append(":\n");
+            pb.append("  br label %").append(lblRet).append("\n");
+            pb.append("prl.cok.").append(id).append(":\n");
+            String wrV2 = "%prv.wrv2." + tmpCount++;
+            pb.append("  ").append(wrV2).append(" = load i8*, i8** ").append(wr).append("\n");
+            pb.append("  %prv.cc3.").append(id).append(" = call i32 @CloseHandle(i8* ").append(wrV2).append(")\n");
+            String now0 = "%prv.now0." + tmpCount++;
+            pb.append("  ").append(now0).append(" = call i64 @GetTickCount64()\n");
+            pb.append("  store i64 ").append(now0).append(", i64* ").append(startT).append("\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+            // ---- read loop (windows): PeekNamedPipe -> ReadFile / exit / timeout ----
+pb.append(lblReadLoop).append(":\n");
+            String rdV = "%prv.rdv." + tmpCount;
+            pb.append("  ").append(rdV).append(" = load i8*, i8** ").append(rd).append("\n");
+            tmpCount++;
+            String pk = "%prv.pk." + tmpCount++;
+pb.append("  store i32 0, i32* ").append(avail).append("\n");
+            pb.append("  ").append(pk).append(" = call i32 @PeekNamedPipe(i8* ").append(rdV)
+                 .append(", i8* null, i32 0, i8* null, i32* ").append(avail).append(", i32* null)\n");
+            String av = "%prv.av." + tmpCount++;
+            pb.append("  ").append(av).append(" = load i32, i32* ").append(avail).append("\n");
+            String avGt = "%prv.avgt." + tmpCount++;
+            pb.append("  ").append(avGt).append(" = icmp sgt i32 ").append(av).append(", 0\n");
+            pb.append("  br i1 ").append(avGt).append(", label %prl.rd." + id + ", label %prl.chk." + id + "\n");
+            pb.append("prl.rd.").append(id).append(":\n");
+            String avMin = "%prv.avmin." + tmpCount++;
+            pb.append("  ").append(avMin).append(" = icmp sgt i32 ").append(av).append(", 4096\n");
+            String rdSz = "%prv.rdsz." + tmpCount++;
+            pb.append("  ").append(rdSz).append(" = select i1 ").append(avMin).append(", i32 4096, i32 ").append(av).append("\n");
+            String tb = "%prv.tb." + tmpCount;
+            pb.append("  ").append(tb).append(" = bitcast [4096 x i8]* ").append(tmpBuf).append(" to i8*\n");
+            tmpCount++;
+            String rf = "%prv.rf." + tmpCount++;
+            pb.append("  ").append(rf).append(" = call i32 @ReadFile(i8* ").append(rdV).append(", i8* ").append(tb)
+                 .append(", i32 ").append(rdSz).append(", i32* ").append(nrd).append(", i8* null)\n");
+        pb.append("  br label %").append(lblChunk).append("\n");
+pb.append("prl.chk.").append(id).append(":\n");
+
+            String exV = "%prv.exv." + tmpCount++;
+            pb.append("  ").append(exV).append(" = load i32, i32* ").append(exited).append("\n");
+            String exNz = "%prv.exnz." + tmpCount++;
+            pb.append("  ").append(exNz).append(" = icmp ne i32 ").append(exV).append(", 0\n");
+            pb.append("  br i1 ").append(exNz).append(", label %prl.finish." + id + ", label %prl.wait." + id + "\n");
+            pb.append("prl.wait.").append(id).append(":\n");
+
+            String piH = "%prv.pih." + tmpCount++;
+            pb.append("  ").append(piH).append(" = bitcast i8* ").append(pi8).append(" to i8**\n");
+            String hProc = "%prv.hproc." + tmpCount;
+            pb.append("  ").append(hProc).append(" = load i8*, i8** ").append(piH).append("\n");
+            tmpCount++;
+            String ws = "%prv.ws." + tmpCount++;
+            pb.append("  ").append(ws).append(" = call i32 @WaitForSingleObject(i8* ").append(hProc).append(", i32 0)\n");
+            String still = "%prv.still." + tmpCount++;
+            pb.append("  ").append(still).append(" = icmp eq i32 ").append(ws).append(", 258\n");
+            pb.append("  br i1 ").append(still).append(", label %prl.tmo." + id + ", label %prl.exitedset." + id + "\n");
+            pb.append("prl.exitedset.").append(id).append(":\n");
+            pb.append("  store i32 1, i32* ").append(exited).append("\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+pb.append("prl.tmo.").append(id).append(":\n");
+            String tNeg = "%prv.tneg." + tmpCount++;
+            pb.append("  ").append(tNeg).append(" = icmp slt i32 %timeoutMs, 0\n");
+            pb.append("  br i1 ").append(tNeg).append(", label %").append(lblSleep).append(", label %prl.tchk." + id + "\n");
+            pb.append("prl.tchk.").append(id).append(":\n");
+            String tDone = "%prv.tdone." + tmpCount;
+            pb.append("  ").append(tDone).append(" = load i32, i32* ").append(timedOut).append("\n");
+            tmpCount++;
+            String tDoneNz = "%prv.tdnz." + tmpCount++;
+            pb.append("  ").append(tDoneNz).append(" = icmp ne i32 ").append(tDone).append(", 0\n");
+            pb.append("  br i1 ").append(tDoneNz).append(", label %").append(lblSleep).append(", label %prl.tnow." + id + "\n");
+            pb.append("prl.tnow.").append(id).append(":\n");
+            String now = "%prv.now." + tmpCount++;
+            pb.append("  ").append(now).append(" = call i64 @GetTickCount64()\n");
+            String st0 = "%prv.st0." + tmpCount;
+            pb.append("  ").append(st0).append(" = load i64, i64* ").append(startT).append("\n");
+            tmpCount++;
+            String elapsed = "%prv.el." + tmpCount++;
+            pb.append("  ").append(elapsed).append(" = sub i64 ").append(now).append(", ").append(st0).append("\n");
+            String tmo64 = "%prv.tmo64." + tmpCount++;
+            pb.append("  ").append(tmo64).append(" = sext i32 %timeoutMs to i64\n");
+            String tHit = "%prv.thit." + tmpCount++;
+            pb.append("  ").append(tHit).append(" = icmp sge i64 ").append(elapsed).append(", ").append(tmo64).append("\n");
+            pb.append("  br i1 ").append(tHit).append(", label %").append(lblKill).append(", label %").append(lblSleep).append("\n");
+            pb.append(lblSleep).append(":\n");
+            pb.append("  call void @Sleep(i32 1)\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+            // kill: TerminateProcess; mark timedOut+exited; loop once more so buffered output still drains
+            pb.append(lblKill).append(":\n");
+            pb.append("  store i32 1, i32* ").append(timedOut).append("\n");
+            String hProc2 = "%prv.hproc2." + tmpCount;
+            pb.append("  ").append(hProc2).append(" = load i8*, i8** ").append(piH).append("\n");
+            tmpCount++;
+            String tp = "%prv.tp." + tmpCount++;
+            pb.append("  ").append(tp).append(" = call i32 @TerminateProcess(i8* ").append(hProc2).append(", i32 1)\n");
+            pb.append("  store i32 1, i32* ").append(exited).append("\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+            // finish: GetExitCodeProcess -> codeSlot (timedOut -> -1)
+pb.append("prl.finish.").append(id).append(":\n");
+
+            String exitc = "%prv.exitc." + tmpCount;
+            pb.append("  ").append(exitc).append(" = alloca i32\n");
+            tmpCount++;
+            String piH3 = "%prv.pih3." + tmpCount++;
+            pb.append("  ").append(piH3).append(" = bitcast i8* ").append(pi8).append(" to i8**\n");
+            String hProc3 = "%prv.hproc3." + tmpCount;
+            pb.append("  ").append(hProc3).append(" = load i8*, i8** ").append(piH3).append("\n");
+            tmpCount++;
+            String gec = "%prv.gec." + tmpCount++;
+            pb.append("  ").append(gec).append(" = call i32 @GetExitCodeProcess(i8* ").append(hProc3).append(", i32* ").append(exitc).append(")\n");
+            String tDone2 = "%prv.td2." + tmpCount;
+            pb.append("  ").append(tDone2).append(" = load i32, i32* ").append(timedOut).append("\n");
+            tmpCount++;
+            String tDone2Nz = "%prv.td2nz." + tmpCount++;
+            pb.append("  ").append(tDone2Nz).append(" = icmp ne i32 ").append(tDone2).append(", 0\n");
+            String ec = "%prv.ec." + tmpCount++;
+            pb.append("  ").append(ec).append(" = load i32, i32* ").append(exitc).append("\n");
+            String fin = "%prv.fin." + tmpCount++;
+            pb.append("  ").append(fin).append(" = select i1 ").append(tDone2Nz).append(", i32 -1, i32 ").append(ec).append("\n");
+            pb.append("  store i32 ").append(fin).append(", i32* ").append(codeSlot).append("\n");
+            pb.append("  br label %").append(lblRet).append("\n");
+        } else {
+            // ---- POSIX spawn: pipe+fork+execvp; read via poll+read; reap via waitpid ----
+            pb.append(lblSpawn).append(":\n");
+            String fds = "%prv.fds." + tmpCount++;
+            pb.append("  ").append(fds).append(" = alloca [2 x i32]\n");
+            String fdsp = "%prv.fdsp." + tmpCount++;
+            pb.append("  ").append(fdsp).append(" = bitcast [2 x i32]* ").append(fds).append(" to i32*\n");
+            String pr = "%prv.pr." + tmpCount++;
+            pb.append("  ").append(pr).append(" = call i32 @pipe(i32* ").append(fdsp).append(")\n");
+            String prOk = "%prv.prok." + tmpCount++;
+            pb.append("  ").append(prOk).append(" = icmp eq i32 ").append(pr).append(", 0\n");
+            pb.append("  br i1 ").append(prOk).append(", label %prl.fork." + id + ", label %").append(lblRet).append("\n");
+            pb.append("prl.fork.").append(id).append(":\n");
+            String pidV = "%prv.pid." + tmpCount++;
+            pb.append("  ").append(pidV).append(" = alloca i32\n");
+            String pfdV = "%prv.pfd." + tmpCount++;
+            pb.append("  ").append(pfdV).append(" = alloca i64\n");
+            String tvV = "%prv.tv." + tmpCount++;
+            pb.append("  ").append(tvV).append(" = alloca [16 x i8]\n");
+            String fv = "%prv.fv." + tmpCount;
+            String fvg = fv + "g";
+            pb.append("  ").append(fvg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 0\n");
+            pb.append("  ").append(fv).append(" = load i32, i32* ").append(fvg).append("\n");
+            tmpCount++;
+            String pid = "%prv.p." + tmpCount++;
+            pb.append("  ").append(pid).append(" = call i32 @fork()\n");
+            String pidNeg = "%prv.pneg." + tmpCount++;
+            pb.append("  ").append(pidNeg).append(" = icmp slt i32 ").append(pid).append(", 0\n");
+            pb.append("  br i1 ").append(pidNeg).append(", label %prl.fkill." + id + ", label %prl.fpid." + id + "\n");
+            pb.append("prl.fpid.").append(id).append(":\n");
+            String pidZero = "%prv.pzero." + tmpCount++;
+            pb.append("  ").append(pidZero).append(" = icmp eq i32 ").append(pid).append(", 0\n");
+            pb.append("  br i1 ").append(pidZero).append(", label %prl.child." + id + ", label %prl.parent." + id + "\n");
+            // child: close read end, dup2 write -> stdout, execvp(argv[0], argv); _exit(127)
+            pb.append("prl.child.").append(id).append(":\n");
+            String f0c = "%prv.f0c." + tmpCount;
+            String f0cg = f0c + "g";
+            pb.append("  ").append(f0cg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 0\n");
+            pb.append("  ").append(f0c).append(" = load i32, i32* ").append(f0cg).append("\n");
+            tmpCount++;
+            String cl0 = "%prv.cl0." + tmpCount++;
+            pb.append("  ").append(cl0).append(" = call i32 @close(i32 ").append(f0c).append(")\n");
+            String f1c = "%prv.f1c." + tmpCount;
+            String f1cg = f1c + "g";
+            pb.append("  ").append(f1cg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 1\n");
+            pb.append("  ").append(f1c).append(" = load i32, i32* ").append(f1cg).append("\n");
+            tmpCount++;
+            String d2 = "%prv.d2." + tmpCount++;
+            pb.append("  ").append(d2).append(" = call i32 @dup2(i32 ").append(f1c).append(", i32 1)\n");
+            String cl1 = "%prv.cl1." + tmpCount++;
+            pb.append("  ").append(cl1).append(" = call i32 @close(i32 ").append(f1c).append(")\n");
+            String a0s2 = "%prv.a0s2." + tmpCount++;
+            pb.append("  ").append(a0s2).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+            String a0c = "%prv.a0c." + tmpCount++;
+            pb.append("  ").append(a0c).append(" = load i8*, i8** ").append(a0s2).append("\n");
+            String ev = "%prv.ev." + tmpCount++;
+            pb.append("  ").append(ev).append(" = call i32 @execvp(i8* ").append(a0c).append(", i8** ").append(argv).append(")\n");
+            pb.append("  call void @_exit(i32 127)\n");
+            pb.append("  unreachable\n");
+            // parent: keep pid, close write end, stamp start time (gettimeofday ms)
+            pb.append("prl.parent.").append(id).append(":\n");
+            pb.append("  store i32 ").append(pid).append(", i32* ").append(pidV).append("\n");
+            String f1p = "%prv.f1p." + tmpCount;
+            String f1pg = f1p + "g";
+            pb.append("  ").append(f1pg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 1\n");
+            pb.append("  ").append(f1p).append(" = load i32, i32* ").append(f1pg).append("\n");
+            tmpCount++;
+            String cl1p = "%prv.cl1p." + tmpCount++;
+            pb.append("  ").append(cl1p).append(" = call i32 @close(i32 ").append(f1p).append(")\n");
+            String tva = "%prv.tva." + tmpCount;
+            pb.append("  ").append(tva).append(" = bitcast [16 x i8]* ").append(tvV).append(" to i8*\n");
+            tmpCount++;
+            String gtv = "%prv.gtv." + tmpCount++;
+            pb.append("  ").append(gtv).append(" = call i32 @gettimeofday(i8* ").append(tva).append(", i8* null)\n");
+            String secP = "%prv.secp." + tmpCount++;
+            pb.append("  ").append(secP).append(" = bitcast [16 x i8]* ").append(tvV).append(" to i64*\n");
+            String secV = "%prv.secv." + tmpCount++;
+            pb.append("  ").append(secV).append(" = load i64, i64* ").append(secP).append("\n");
+            String usecP = "%prv.usecp." + tmpCount++;
+            pb.append("  ").append(usecP).append(" = getelementptr i8, i8* ").append(tva).append(", i64 8\n");
+            String usecI = "%prv.useci." + tmpCount++;
+            pb.append("  ").append(usecI).append(" = bitcast i8* ").append(usecP).append(" to i64*\n");
+            String usecV = "%prv.usecv." + tmpCount++;
+            pb.append("  ").append(usecV).append(" = load i64, i64* ").append(usecI).append("\n");
+            String secMs = "%prv.secms." + tmpCount++;
+            pb.append("  ").append(secMs).append(" = mul i64 ").append(secV).append(", 1000\n");
+            String usecMs = "%prv.usecms." + tmpCount++;
+            pb.append("  ").append(usecMs).append(" = udiv i64 ").append(usecV).append(", 1000\n");
+            String nowMs = "%prv.nowms." + tmpCount++;
+            pb.append("  ").append(nowMs).append(" = add i64 ").append(secMs).append(", ").append(usecMs).append("\n");
+            pb.append("  store i64 ").append(nowMs).append(", i64* ").append(startT).append("\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+            // fork failed: close pipe fds (valid), bail -1
+            pb.append("prl.fkill.").append(id).append(":\n");
+            String f0k = "%prv.f0k." + tmpCount;
+            String f0kg = f0k + "g";
+            pb.append("  ").append(f0kg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 0\n");
+            pb.append("  ").append(f0k).append(" = load i32, i32* ").append(f0kg).append("\n");
+            tmpCount++;
+            String cl0k = "%prv.cl0k." + tmpCount++;
+            pb.append("  ").append(cl0k).append(" = call i32 @close(i32 ").append(f0k).append(")\n");
+            String f1k = "%prv.f1k." + tmpCount;
+            String f1kg = f1k + "g";
+            pb.append("  ").append(f1kg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 1\n");
+            pb.append("  ").append(f1k).append(" = load i32, i32* ").append(f1kg).append("\n");
+            tmpCount++;
+            String cl1k = "%prv.cl1k." + tmpCount++;
+            pb.append("  ").append(cl1k).append(" = call i32 @close(i32 ").append(f1k).append(")\n");
+            pb.append("  br label %").append(lblRet).append("\n");
+            // ---- read loop (posix): pack pollfd {fd, POLLIN} as i64, poll(20ms), read ----
+            pb.append(lblReadLoop).append(":\n");
+            String f0l = "%prv.f0l." + tmpCount;
+            String f0lg = f0l + "g";
+            pb.append("  ").append(f0lg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 0\n");
+            pb.append("  ").append(f0l).append(" = load i32, i32* ").append(f0lg).append("\n");
+            tmpCount++;
+            String f0z = "%prv.f0z." + tmpCount++;
+            pb.append("  ").append(f0z).append(" = zext i32 ").append(f0l).append(" to i64\n");
+            String pack = "%prv.pack." + tmpCount++;
+            pb.append("  ").append(pack).append(" = or i64 ").append(f0z).append(", 4294967296\n");
+            pb.append("  store i64 ").append(pack).append(", i64* ").append(pfdV).append("\n");
+            String pfa = "%prv.pfa." + tmpCount++;
+            pb.append("  ").append(pfa).append(" = bitcast i64* ").append(pfdV).append(" to i8*\n");
+            String ppr = "%prv.ppr." + tmpCount++;
+            pb.append("  ").append(ppr).append(" = call i32 @poll(i8* ").append(pfa).append(", i64 1, i32 20)\n");
+            // timeout check (after the 20ms poll)
+            String tN = "%prv.tn." + tmpCount++;
+            pb.append("  ").append(tN).append(" = icmp slt i32 %timeoutMs, 0\n");
+            pb.append("  br i1 ").append(tN).append(", label %prl.pr." + id + ", label %prl.pt." + id + "\n");
+            pb.append("prl.pt.").append(id).append(":\n");
+            String tD = "%prv.td." + tmpCount;
+            pb.append("  ").append(tD).append(" = load i32, i32* ").append(timedOut).append("\n");
+            tmpCount++;
+            String tDz = "%prv.tdz." + tmpCount++;
+            pb.append("  ").append(tDz).append(" = icmp ne i32 ").append(tD).append(", 0\n");
+            pb.append("  br i1 ").append(tDz).append(", label %prl.pr." + id + ", label %prl.pnow." + id + "\n");
+            pb.append("prl.pnow.").append(id).append(":\n");
+            String tvB = "%prv.tvb." + tmpCount;
+            pb.append("  ").append(tvB).append(" = bitcast [16 x i8]* ").append(tvV).append(" to i8*\n");
+            tmpCount++;
+            String gtv2 = "%prv.gtv2." + tmpCount++;
+            pb.append("  ").append(gtv2).append(" = call i32 @gettimeofday(i8* ").append(tvB).append(", i8* null)\n");
+            String secP2 = "%prv.secp2." + tmpCount;
+            pb.append("  ").append(secP2).append(" = bitcast [16 x i8]* ").append(tvV).append(" to i64*\n");
+            tmpCount++;
+            String secV2 = "%prv.secv2." + tmpCount;
+            pb.append("  ").append(secV2).append(" = load i64, i64* ").append(secP2).append("\n");
+            String usecP2 = "%prv.usecp2." + tmpCount;
+            pb.append("  ").append(usecP2).append(" = getelementptr i8, i8* ").append(tvB).append(", i64 8\n");
+            tmpCount++;
+            String usecI2 = "%prv.useci2." + tmpCount;
+            pb.append("  ").append(usecI2).append(" = bitcast i8* ").append(usecP2).append(" to i64*\n");
+            String usecV2 = "%prv.usecv2." + tmpCount;
+            pb.append("  ").append(usecV2).append(" = load i64, i64* ").append(usecI2).append("\n");
+            String secMs2 = "%prv.secms2." + tmpCount++;
+            pb.append("  ").append(secMs2).append(" = mul i64 ").append(secV2).append(", 1000\n");
+            String usecMs2 = "%prv.usecms2." + tmpCount++;
+            pb.append("  ").append(usecMs2).append(" = udiv i64 ").append(usecV2).append(", 1000\n");
+            String nowMs2 = "%prv.nowms2." + tmpCount++;
+            pb.append("  ").append(nowMs2).append(" = add i64 ").append(secMs2).append(", ").append(usecMs2).append("\n");
+            String st1 = "%prv.st1." + tmpCount;
+            pb.append("  ").append(st1).append(" = load i64, i64* ").append(startT).append("\n");
+            tmpCount++;
+            String el2 = "%prv.el2." + tmpCount++;
+            pb.append("  ").append(el2).append(" = sub i64 ").append(nowMs2).append(", ").append(st1).append("\n");
+            String tmo2 = "%prv.tmo2." + tmpCount++;
+            pb.append("  ").append(tmo2).append(" = sext i32 %timeoutMs to i64\n");
+            String hit2 = "%prv.hit2." + tmpCount++;
+            pb.append("  ").append(hit2).append(" = icmp sge i64 ").append(el2).append(", ").append(tmo2).append("\n");
+            pb.append("  br i1 ").append(hit2).append(", label %").append(lblKill).append(", label %prl.pr." + id + "\n");
+            pb.append("prl.pr.").append(id).append(":\n");
+            String tb2 = "%prv.tb2." + tmpCount;
+            pb.append("  ").append(tb2).append(" = bitcast [4096 x i8]* ").append(tmpBuf).append(" to i8*\n");
+            tmpCount++;
+            String f0r = "%prv.f0r." + tmpCount;
+            String f0rg = f0r + "g";
+            pb.append("  ").append(f0rg).append(" = getelementptr [2 x i32], [2 x i32]* ").append(fds).append(", i32 0, i32 0\n");
+            pb.append("  ").append(f0r).append(" = load i32, i32* ").append(f0rg).append("\n");
+            tmpCount++;
+            String nr = "%prv.nr." + tmpCount++;
+            pb.append("  ").append(nr).append(" = call i64 @read(i32 ").append(f0r).append(", i8* ").append(tb2).append(", i64 4096)\n");
+            String nrPos = "%prv.nrpos." + tmpCount++;
+            pb.append("  ").append(nrPos).append(" = icmp sgt i64 ").append(nr).append(", 0\n");
+            pb.append("  br i1 ").append(nrPos).append(", label %prl.prdata." + id + ", label %").append("prl.finish." + id).append("\n");
+            pb.append("prl.prdata.").append(id).append(":\n");
+            String nrTr = "%prv.nrtr." + tmpCount++;
+            pb.append("  ").append(nrTr).append(" = trunc i64 ").append(nr).append(" to i32\n");
+            pb.append("  store i32 ").append(nrTr).append(", i32* ").append(nrd).append("\n");
+            pb.append("  br label %").append(lblChunk).append("\n");
+            // kill: SIGKILL the child; loop back so the pipe still drains to EOF
+            pb.append(lblKill).append(":\n");
+            pb.append("  store i32 1, i32* ").append(timedOut).append("\n");
+            String pidK = "%prv.pidk." + tmpCount;
+            pb.append("  ").append(pidK).append(" = load i32, i32* ").append(pidV).append("\n");
+            tmpCount++;
+            String kl = "%prv.kl." + tmpCount++;
+            pb.append("  ").append(kl).append(" = call i32 @kill(i32 ").append(pidK).append(", i32 9)\n");
+            pb.append("  br label %").append(lblReadLoop).append("\n");
+            // finish: waitpid + WIFEXITED -> code (non-exited/timeout -> -1; 127 -> -1 not-found map)
+            pb.append("prl.finish.").append(id).append(":\n");
+            String stA = "%prv.sta." + tmpCount;
+            pb.append("  ").append(stA).append(" = alloca i32\n");
+            tmpCount++;
+            String pidR = "%prv.pidr." + tmpCount;
+            pb.append("  ").append(pidR).append(" = load i32, i32* ").append(pidV).append("\n");
+            tmpCount++;
+            String wp = "%prv.wp." + tmpCount++;
+            pb.append("  ").append(wp).append(" = call i32 @waitpid(i32 ").append(pidR).append(", i32* ").append(stA).append(", i32 0)\n");
+            String stV = "%prv.stv." + tmpCount++;
+            pb.append("  ").append(stV).append(" = load i32, i32* ").append(stA).append("\n");
+            String wif = "%prv.wif." + tmpCount++;
+            pb.append("  ").append(wif).append(" = and i32 ").append(stV).append(", 127\n");
+            String wifZ = "%prv.wifz." + tmpCount++;
+            pb.append("  ").append(wifZ).append(" = icmp eq i32 ").append(wif).append(", 0\n");
+            String shr = "%prv.shr." + tmpCount++;
+            pb.append("  ").append(shr).append(" = lshr i32 ").append(stV).append(", 8\n");
+            String xc = "%prv.xc." + tmpCount++;
+            pb.append("  ").append(xc).append(" = and i32 ").append(shr).append(", 255\n");
+            String cOk = "%prv.cok2." + tmpCount++;
+            pb.append("  ").append(cOk).append(" = select i1 ").append(wifZ).append(", i32 ").append(xc).append(", i32 -1\n");
+            String c127 = "%prv.c127." + tmpCount++;
+            pb.append("  ").append(c127).append(" = icmp eq i32 ").append(cOk).append(", 127\n");
+            String cNf = "%prv.cnf." + tmpCount++;
+            pb.append("  ").append(cNf).append(" = select i1 ").append(c127).append(", i32 -1, i32 ").append(cOk).append("\n");
+            String tD2 = "%prv.td2p." + tmpCount;
+            pb.append("  ").append(tD2).append(" = load i32, i32* ").append(timedOut).append("\n");
+            tmpCount++;
+            String tD2z = "%prv.td2zp." + tmpCount++;
+            pb.append("  ").append(tD2z).append(" = icmp eq i32 ").append(tD2).append(", 0\n");
+            String cFin = "%prv.cfin." + tmpCount++;
+            pb.append("  ").append(cFin).append(" = select i1 ").append(tD2z).append(", i32 ").append(cNf).append(", i32 -1\n");
+            pb.append("  store i32 ").append(cFin).append(", i32* ").append(codeSlot).append("\n");
+            pb.append("  br label %").append(lblRet).append("\n");
+        }
+        // ---- shared: chunk -> line scan -> callback -> back to the platform read loop ----
+        pb.append(lblChunk).append(":\n");
+
+        String tb3 = "%prv.tb3." + tmpCount;
+        pb.append("  ").append(tb3).append(" = bitcast [4096 x i8]* ").append(tmpBuf).append(" to i8*\n");
+        tmpCount++;
+        pb.append("  store i8* ").append(tb3).append(", i8** ").append(srcPtr).append("\n");
+        String n32 = "%prv.n32." + tmpCount;
+        pb.append("  ").append(n32).append(" = load i32, i32* ").append(nrd).append("\n");
+        tmpCount++;
+        String n64 = "%prv.n64." + tmpCount++;
+        pb.append("  ").append(n64).append(" = zext i32 ").append(n32).append(" to i64\n");
+        pb.append("  store i64 ").append(n64).append(", i64* ").append(rem).append("\n");
+        pb.append("  br label %").append(lblScan).append("\n");
+        pb.append(lblScan).append(":\n");
+
+        String s0 = "%prv.s0." + tmpCount++;
+        pb.append("  ").append(s0).append(" = load i8*, i8** ").append(srcPtr).append("\n");
+        String r0 = "%prv.r0." + tmpCount++;
+        pb.append("  ").append(r0).append(" = load i64, i64* ").append(rem).append("\n");
+        String rZ = "%prv.rz." + tmpCount++;
+        pb.append("  ").append(rZ).append(" = icmp eq i64 ").append(r0).append(", 0\n");
+        pb.append("  br i1 ").append(rZ).append(", label %").append(lblReadLoop).append(", label %").append(lblScanAppend).append("\n");
+        pb.append(lblScanAppend).append(":\n");
+        String nl = "%prv.nl." + tmpCount++;
+        pb.append("  ").append(nl).append(" = call i8* @memchr(i8* ").append(s0).append(", i32 10, i64 ").append(r0).append(")\n");
+        String nlZ = "%prv.nlz." + tmpCount++;
+        pb.append("  ").append(nlZ).append(" = icmp eq i8* ").append(nl).append(", null\n");
+        pb.append("  br i1 ").append(nlZ).append(", label %prl.accum." + id + ", label %").append(lblScanLine).append("\n");
+        // no newline: append the whole chunk to pending, consume rem, back to the read loop
+        pb.append("prl.accum.").append(id).append(":\n");
+        String pOldL = "%prv.poldl." + tmpCount;
+        pb.append("  ").append(pOldL).append(" = load i64, i64* ").append(pendLen).append("\n");
+        tmpCount++;
+        String nLen = "%prv.nlen." + tmpCount++;
+        pb.append("  ").append(nLen).append(" = add i64 ").append(pOldL).append(", ").append(r0).append("\n");
+        String nSz = "%prv.nsz." + tmpCount++;
+        pb.append("  ").append(nSz).append(" = add i64 ").append(nLen).append(", 1\n");
+        String nB = "%prv.nb." + tmpCount;
+        pb.append("  ").append(nB).append(" = call i8* @").append(allocFn()).append("(i64 ").append(nSz).append(")\n");
+        tmpCount++;
+        String pOld = "%prv.pold." + tmpCount;
+        pb.append("  ").append(pOld).append(" = load i8*, i8** ").append(pend).append("\n");
+        tmpCount++;
+        String pOldZ = "%prv.poldz." + tmpCount++;
+        pb.append("  ").append(pOldZ).append(" = icmp ne i8* ").append(pOld).append(", null\n");
+        String lCpOld = "prl.acc.old." + id, lCpNew = "prl.acc.new." + id;
+        pb.append("  br i1 ").append(pOldZ).append(", label %").append(lCpOld).append(", label %").append(lCpNew).append("\n");
+        pb.append(lCpOld).append(":\n");
+        pb.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(nB).append(", i8* ").append(pOld)
+             .append(", i64 ").append(pOldL).append(", i1 false)\n");
+        pb.append("  br label %").append(lCpNew).append("\n");
+        pb.append(lCpNew).append(":\n");
+        String nDst = "%prv.ndst." + tmpCount++;
+        pb.append("  ").append(nDst).append(" = getelementptr i8, i8* ").append(nB).append(", i64 ").append(pOldL).append("\n");
+        pb.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(nDst).append(", i8* ").append(s0)
+             .append(", i64 ").append(r0).append(", i1 false)\n");
+        String nEnd = "%prv.nend." + tmpCount++;
+        pb.append("  ").append(nEnd).append(" = getelementptr i8, i8* ").append(nB).append(", i64 ").append(nLen).append("\n");
+        pb.append("  store i8 0, i8* ").append(nEnd).append("\n");
+        pb.append("  br i1 ").append(pOldZ).append(", label %prl.acc.free." + id + ", label %prl.acc.store." + id + "\n");
+        pb.append("prl.acc.free.").append(id).append(":\n");
+        pb.append("  call void @").append(freeFn()).append("(i8* ").append(pOld).append(")\n");
+        pb.append("  br label %prl.acc.store.").append(id).append("\n");
+        pb.append("prl.acc.store.").append(id).append(":\n");
+        pb.append("  store i8* ").append(nB).append(", i8** ").append(pend).append("\n");
+        pb.append("  store i64 ").append(nLen).append(", i64* ").append(pendLen).append("\n");
+        pb.append("  store i64 0, i64* ").append(rem).append("\n");
+        pb.append("  br label %").append(lblReadLoop).append("\n");
+        // newline: build line = pending + segment (strip a trailing \r), callback, reset
+        pb.append(lblScanLine).append(":\n");
+        String segLen = "%prv.segl." + tmpCount++;
+        pb.append("  ").append(segLen).append(" = ptrtoint i8* ").append(nl).append(" to i64\n");
+        String srcI = "%prv.srci." + tmpCount++;
+        pb.append("  ").append(srcI).append(" = ptrtoint i8* ").append(s0).append(" to i64\n");
+        String segOnly = "%prv.sego." + tmpCount++;
+        pb.append("  ").append(segOnly).append(" = sub i64 ").append(segLen).append(", ").append(srcI).append("\n");
+        String pL1 = "%prv.pl1." + tmpCount;
+        pb.append("  ").append(pL1).append(" = load i64, i64* ").append(pendLen).append("\n");
+        tmpCount++;
+        String lineLen = "%prv.llen." + tmpCount++;
+        pb.append("  ").append(lineLen).append(" = add i64 ").append(pL1).append(", ").append(segOnly).append("\n");
+        String lineSz = "%prv.lsz." + tmpCount++;
+        pb.append("  ").append(lineSz).append(" = add i64 ").append(lineLen).append(", 1\n");
+        String line = "%prv.line." + tmpCount;
+        pb.append("  ").append(line).append(" = call i8* @").append(allocFn()).append("(i64 ").append(lineSz).append(")\n");
+        tmpCount++;
+        String p1 = "%prv.p1." + tmpCount;
+        pb.append("  ").append(p1).append(" = load i8*, i8** ").append(pend).append("\n");
+        tmpCount++;
+        String p1Z = "%prv.p1z." + tmpCount++;
+        pb.append("  ").append(p1Z).append(" = icmp ne i8* ").append(p1).append(", null\n");
+        pb.append("  br i1 ").append(p1Z).append(", label %prl.li.old." + id + ", label %prl.li.new." + id + "\n");
+        pb.append("prl.li.old.").append(id).append(":\n");
+        pb.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(line).append(", i8* ").append(p1)
+             .append(", i64 ").append(pL1).append(", i1 false)\n");
+        pb.append("  br label %prl.li.new.").append(id).append("\n");
+        pb.append("prl.li.new.").append(id).append(":\n");
+        String lDst = "%prv.ldst." + tmpCount++;
+        pb.append("  ").append(lDst).append(" = getelementptr i8, i8* ").append(line).append(", i64 ").append(pL1).append("\n");
+        pb.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(lDst).append(", i8* ").append(s0)
+             .append(", i64 ").append(segOnly).append(", i1 false)\n");
+        String lEnd = "%prv.lend." + tmpCount++;
+        pb.append("  ").append(lEnd).append(" = getelementptr i8, i8* ").append(line).append(", i64 ").append(lineLen).append("\n");
+        pb.append("  store i8 0, i8* ").append(lEnd).append("\n");
+        // CRLF strip: last byte '\r' -> shorten
+        pb.append("  br i1 ").append(p1Z).append(", label %prl.li.oldfree." + id + ", label %prl.li.cr." + id + "\n");
+        pb.append("prl.li.oldfree.").append(id).append(":\n");
+        pb.append("  call void @").append(freeFn()).append("(i8* ").append(p1).append(")\n");
+        pb.append("  br label %prl.li.cr.").append(id).append("\n");
+        pb.append("prl.li.cr.").append(id).append(":\n");
+        String crZ = "%prv.crz." + tmpCount++;
+        pb.append("  ").append(crZ).append(" = icmp eq i64 ").append(lineLen).append(", 0\n");
+        pb.append("  br i1 ").append(crZ).append(", label %prl.li.cb." + id + ", label %prl.li.crt." + id + "\n");
+        pb.append("prl.li.crt.").append(id).append(":\n");
+        String lastIdx = "%prv.lastidx." + tmpCount++;
+        pb.append("  ").append(lastIdx).append(" = add i64 ").append(lineLen).append(", -1\n");
+        String lastP = "%prv.lastp." + tmpCount++;
+        pb.append("  ").append(lastP).append(" = getelementptr i8, i8* ").append(line).append(", i64 ")
+             .append(lastIdx).append("\n");
+        String lastV = "%prv.lastv." + tmpCount++;
+        pb.append("  ").append(lastV).append(" = load i8, i8* ").append(lastP).append("\n");
+        String isCr = "%prv.iscr." + tmpCount++;
+        pb.append("  ").append(isCr).append(" = icmp eq i8 ").append(lastV).append(", 13\n");
+        pb.append("  br i1 ").append(isCr).append(", label %prl.li.cut." + id + ", label %prl.li.cb." + id + "\n");
+        pb.append("prl.li.cut.").append(id).append(":\n");
+        String cutEnd = "%prv.cutend." + tmpCount++;
+        pb.append("  ").append(cutEnd).append(" = getelementptr i8, i8* ").append(line).append(", i64 ")
+             .append(lastIdx).append("\n");
+        pb.append("  store i8 0, i8* ").append(cutEnd).append("\n");
+        pb.append("  br label %prl.li.cb." + id + "\n");
+        // callback: void %code(i8* receiver, i8* line)
+        pb.append("prl.li.cb.").append(id).append(":\n");
+        pb.append("  %prv.fc.").append(id).append(" = extractvalue %CangFunction %cb, 0\n");
+        pb.append("  %prv.fr.").append(id).append(" = extractvalue %CangFunction %cb, 1\n");
+        pb.append("  %prv.fp.").append(id).append(" = bitcast i8* %prv.fc.").append(id).append(" to void (i8*, i8*)*\n");
+        pb.append("  call void %prv.fp.").append(id).append("(i8* %prv.fr.").append(id).append(", i8* ").append(line).append(")\n");
+
+        // reset pending, advance src past the newline
+        pb.append("  store i8* null, i8** ").append(pend).append("\n");
+        pb.append("  store i64 0, i64* ").append(pendLen).append("\n");
+        String sN = "%prv.sn2." + tmpCount++;
+        pb.append("  ").append(sN).append(" = getelementptr i8, i8* ").append(nl).append(", i64 1\n");
+        pb.append("  store i8* ").append(sN).append(", i8** ").append(srcPtr).append("\n");
+        String segI64 = "%prv.segi." + tmpCount;
+        pb.append("  ").append(segI64).append(" = sext i32 1 to i64\n");
+        tmpCount++;
+        String adv = "%prv.adv." + tmpCount++;
+        pb.append("  ").append(adv).append(" = add i64 ").append(segOnly).append(", 1\n");
+        String rN = "%prv.rn." + tmpCount++;
+        pb.append("  ").append(rN).append(" = sub i64 ").append(r0).append(", ").append(adv).append("\n");
+        pb.append("  store i64 ").append(rN).append(", i64* ").append(rem).append("\n");
+        pb.append("  br label %").append(lblScan).append("\n");
+        // ---- shared return: flush a trailing partial line, free argv, return the code ----
+        pb.append(lblRet).append(":\n");
+        String fL = "%prv.fl." + tmpCount;
+        pb.append("  ").append(fL).append(" = load i64, i64* ").append(pendLen).append("\n");
+        tmpCount++;
+        String fZ = "%prv.fz." + tmpCount++;
+        pb.append("  ").append(fZ).append(" = icmp eq i64 ").append(fL).append(", 0\n");
+        pb.append("  br i1 ").append(fZ).append(", label %prl.freearg." + id + ", label %prl.tail." + id + "\n");
+        pb.append("prl.tail.").append(id).append(":\n");
+        String tP = "%prv.tp2." + tmpCount;
+        pb.append("  ").append(tP).append(" = load i8*, i8** ").append(pend).append("\n");
+        tmpCount++;
+        // strip a trailing \r in place (pend is NUL-terminated)
+        String tLastIdx = "%prv.tlastidx." + tmpCount++;
+        pb.append("  ").append(tLastIdx).append(" = add i64 ").append(fL).append(", -1\n");
+        String tLastP = "%prv.tlastp." + tmpCount++;
+        pb.append("  ").append(tLastP).append(" = getelementptr i8, i8* ").append(tP).append(", i64 ").append(tLastIdx).append("\n");
+        String tLast = "%prv.tlast." + tmpCount++;
+        pb.append("  ").append(tLast).append(" = load i8, i8* ").append(tLastP).append("\n");
+        String tIsCr = "%prv.tiscr." + tmpCount++;
+        pb.append("  ").append(tIsCr).append(" = icmp eq i8 ").append(tLast).append(", 13\n");
+        pb.append("  br i1 ").append(tIsCr).append(", label %prl.tail.cr." + id + ", label %prl.tail.cb." + id + "\n");
+        pb.append("prl.tail.cr.").append(id).append(":\n");
+        pb.append("  store i8 0, i8* ").append(tLastP).append("\n");
+        pb.append("  br label %prl.tail.cb.").append(id).append("\n");
+        pb.append("prl.tail.cb.").append(id).append(":\n");
+        pb.append("  %prv.tc.").append(id).append(" = extractvalue %CangFunction %cb, 0\n");
+        pb.append("  %prv.tr.").append(id).append(" = extractvalue %CangFunction %cb, 1\n");
+        pb.append("  %prv.tp3.").append(id).append(" = bitcast i8* %prv.tc.").append(id).append(" to void (i8*, i8*)*\n");
+        pb.append("  call void %prv.tp3.").append(id).append("(i8* %prv.tr.").append(id).append(", i8* ").append(tP).append(")\n");
+        pb.append("  store i8* null, i8** ").append(pend).append("\n");
+        pb.append("  store i64 0, i64* ").append(pendLen).append("\n");
+        pb.append("  br label %prl.freearg.").append(id).append("\n");
+        pb.append("prl.freearg.").append(id).append(":\n");
+        pb.append("  call void @").append(freeFn()).append("(i8* ").append(argv).append(")\n");
+        String retC = "%prv.retc." + tmpCount++;
+        pb.append("  ").append(retC).append(" = load i32, i32* ").append(codeSlot).append("\n");
+        pb.append("  ret i32 ").append(retC).append("\n");
+        pb.append("}\n\n");
+        header.append(pb);
     }
 
     private void emitFileRuntime() {

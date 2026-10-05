@@ -1,0 +1,10 @@
+namespace cang/io
+
+# Process - 执行本地命令（编译器内建，需 import cang/io/Process）
+class Process
+
+# 执行命令：cmd[0] 为可执行文件、其余为参数（无 shell，注入安全）。
+# call 是输出回调：stdout 每读到一行调用一次 call(line)。
+# timeout 毫秒，-1 = 永久等待；超时杀进程返回 -1；无法启动返回 -1。
+# 返回子进程退出码；stderr 继承当前终端（不进回调）。
+static native func int exec(String[] cmd, Function<Void, String> call, int timeout)
