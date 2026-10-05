@@ -521,15 +521,14 @@ public class Cang {
     }
 
     /**
-     * Find the stdlib directory by searching up from working directory.
-     * Falls back to the stdlib bundled inside the packaged jar.
+     * Find the stdlib directory: working directory first, then the packaged-jar
+     * fallback (bundled resources extracted to <code dir>/../stdlib). No hardcoded paths.
      */
     private static String findStdlibDir() {
         String cwd = System.getProperty("user.dir");
         String[] candidates = {
             cwd + File.separator + "stdlib",
-            cwd + File.separator + ".." + File.separator + "stdlib",
-            "D:\\IDEA\\toy\\Cang\\stdlib"
+            cwd + File.separator + ".." + File.separator + "stdlib"
         };
         for (String dir : candidates) {
             if (new File(dir).isDirectory()) {
@@ -540,8 +539,18 @@ public class Cang {
                 }
             }
         }
-        // Packaged jar: extract bundled stdlib resources to a temp directory once.
-        return extractBundledStdlib();
+        // Packaged jar: extract bundled stdlib resources to <code dir>/../stdlib.
+        try {
+            java.net.URI uri = Cang.class.getProtectionDomain().getCodeSource().getLocation().toURI();
+            Path loc = Path.of(uri).toAbsolutePath();
+            // jar file -> its containing folder; running from classes -> the classes folder's parent
+            Path jarDir = loc.getParent();
+            if (jarDir != null) {
+                return extractBundledStdlib(jarDir.resolve("..").resolve("stdlib").normalize());
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     /** Standard library files shipped as classpath resources inside the packaged jar (paths relative to stdlib/). */
@@ -557,26 +566,27 @@ public class Cang {
     };
 
     /**
-     * Extract the stdlib bundled in the jar to a temp directory so imports can be read as files.
-     * Returns null when no bundled stdlib is present (e.g. running from target/classes).
+     * Extract the stdlib bundled in the jar to targetDir so imports can be read as files.
+     * Returns null when no bundled stdlib is present (e.g. running from target/classes
+     * without the resources on the classpath).
      */
-    private static String extractBundledStdlib() {
+    private static String extractBundledStdlib(Path targetDir) {
         if (bundledStdlibDir != null) return bundledStdlibDir;
         try {
-            File root = new File(System.getProperty("java.io.tmpdir"), "cang-stdlib");
-            if (!root.isDirectory() && !root.mkdirs()) return null;
+            Path root = targetDir;
+            if (!Files.isDirectory(root)) Files.createDirectories(root);
             boolean found = false;
             for (String rel : BUNDLED_STDLIB_FILES) {
                 try (java.io.InputStream in = Cang.class.getResourceAsStream("/stdlib/" + rel)) {
                     if (in == null) continue;
                     found = true;
-                    File out = new File(root, rel);
+                    File out = root.resolve(rel).toFile();
                     if (out.getParentFile() != null) out.getParentFile().mkdirs();
                     Files.copy(in, out.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                 }
             }
             if (!found) return null;
-            bundledStdlibDir = root.getCanonicalPath();
+            bundledStdlibDir = root.toFile().getCanonicalPath();
             return bundledStdlibDir;
         } catch (IOException e) {
             return null;
