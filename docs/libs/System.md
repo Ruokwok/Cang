@@ -47,7 +47,15 @@ String path = System.getenv("PATH")
 
 找不到环境变量时返回 `null`。
 
-### 16.5 当前时间
+
+### 16.5 当前工作目录
+
+```cang
+String dir = System.getCwd()
+```
+
+进程启动时的工作目录（Windows 下为 `C:\...` 形式）；获取失败返回 `null`。
+### 16.6 当前时间
 
 ```cang
 long now = System.currentTimeMillis()

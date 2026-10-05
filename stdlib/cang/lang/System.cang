@@ -20,5 +20,8 @@ static native func String getenv(String name)
 # 获取 Unix epoch 毫秒时间戳
 static native func long currentTimeMillis()
 
+# 获取当前工作目录（进程的 cwd；失败返回 null）
+static native func String getCwd()
+
 # 手动触发一次垃圾回收（需要 --gc 编译；--no-gc 模式下为空操作）
 static native func void gc()

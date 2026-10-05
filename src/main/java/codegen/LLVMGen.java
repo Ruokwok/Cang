@@ -6184,6 +6184,82 @@ public class LLVMGen {
             body.append("  ").append(millis).append(" = mul i64 ").append(seconds).append(", 1000\n");
             return new LLVMValue(millis, "i64");
         }
+        if (method.equals("getCwd") && nodes.isEmpty()) {
+            // Inlined into the caller: never `ret` here — one result slot, branches join at `done`.
+            int cid = labelCount++;
+            String slot = "%system.cwd.slot." + tmpCount;
+            body.append("  ").append(slot).append(" = alloca i8*\n");
+            tmpCount++;
+            if (targetPlatform.equals("windows")) {
+                if (!header.toString().contains("declare i32 @GetCurrentDirectoryW(")) {
+                    header.append("declare i32 @GetCurrentDirectoryW(i32, i16*)\n");
+                }
+                if (!header.toString().contains("declare i32 @WideCharToMultiByte(")) {
+                    header.append("declare i32 @WideCharToMultiByte(i32, i32, i16*, i32, i8*, i32, i8*, i8*)\n");
+                }
+                String need = "%system.cwd.need." + tmpCount++;
+                body.append("  ").append(need).append(" = call i32 @GetCurrentDirectoryW(i32 0, i16* null)\n");
+                String needZ = "%system.cwd.needz." + tmpCount++;
+                body.append("  ").append(needZ).append(" = icmp eq i32 ").append(need).append(", 0\n");
+                body.append("  br i1 ").append(needZ).append(", label %system.cwd.fail." + cid
+                    + ", label %system.cwd.ok." + cid + "\n");
+                body.append("system.cwd.ok.").append(cid).append(":\n");
+                String need64 = "%system.cwd.need64." + tmpCount++;
+                body.append("  ").append(need64).append(" = zext i32 ").append(need).append(" to i64\n");
+                String wbytes = "%system.cwd.wbytes." + tmpCount++;
+                body.append("  ").append(wbytes).append(" = mul i64 ").append(need64).append(", 2\n");
+                String wbuf = "%system.cwd.wbuf." + tmpCount;
+                body.append("  ").append(wbuf).append(" = call i8* @").append(allocFn())
+                     .append("(i64 ").append(wbytes).append(")\n");
+                tmpCount++;
+                String w16 = "%system.cwd.w16." + tmpCount++;
+                body.append("  ").append(w16).append(" = bitcast i8* ").append(wbuf).append(" to i16*\n");
+                String got = "%system.cwd.got." + tmpCount++;
+                body.append("  ").append(got).append(" = call i32 @GetCurrentDirectoryW(i32 ").append(need)
+                     .append(", i16* ").append(w16).append(")\n");
+                String u8len = "%system.cwd.u8len." + tmpCount++;
+                body.append("  ").append(u8len).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ")
+                     .append(w16).append(", i32 -1, i8* null, i32 0, i8* null, i8* null)\n");
+                String u8sz = "%system.cwd.u8sz." + tmpCount++;
+                body.append("  ").append(u8sz).append(" = sext i32 ").append(u8len).append(" to i64\n");
+                String out = "%system.cwd.out." + tmpCount;
+                body.append("  ").append(out).append(" = call i8* @").append(allocFn())
+                     .append("(i64 ").append(u8sz).append(")\n");
+                tmpCount++;
+                String cvt = "%system.cwd.cvt." + tmpCount++;
+                body.append("  ").append(cvt).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ")
+                     .append(w16).append(", i32 -1, i8* ").append(out).append(", i32 ").append(u8len)
+                     .append(", i8* null, i8* null)\n");
+                body.append("  store i8* ").append(out).append(", i8** ").append(slot).append("\n");
+                body.append("  br label %system.cwd.done." + cid + "\n");
+                body.append("system.cwd.fail.").append(cid).append(":\n");
+                body.append("  store i8* null, i8** ").append(slot).append("\n");
+                body.append("  br label %system.cwd.done." + cid + "\n");
+            } else {
+                if (!header.toString().contains("declare i8* @getcwd(")) {
+                    header.append("declare i8* @getcwd(i8*, i64)\n");
+                }
+                String buf = "%system.cwd.buf." + tmpCount;
+                body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 4096)\n");
+                tmpCount++;
+                String r = "%system.cwd.r." + tmpCount++;
+                body.append("  ").append(r).append(" = call i8* @getcwd(i8* ").append(buf).append(", i64 4096)\n");
+                String rZ = "%system.cwd.rz." + tmpCount++;
+                body.append("  ").append(rZ).append(" = icmp eq i8* ").append(r).append(", null\n");
+                body.append("  br i1 ").append(rZ).append(", label %system.cwd.fail." + cid
+                    + ", label %system.cwd.ok2." + cid + "\n");
+                body.append("system.cwd.ok2.").append(cid).append(":\n");
+                body.append("  store i8* ").append(buf).append(", i8** ").append(slot).append("\n");
+                body.append("  br label %system.cwd.done." + cid + "\n");
+                body.append("system.cwd.fail.").append(cid).append(":\n");
+                body.append("  store i8* null, i8** ").append(slot).append("\n");
+                body.append("  br label %system.cwd.done." + cid + "\n");
+            }
+            body.append("system.cwd.done.").append(cid).append(":\n");
+            String ret = "%system.cwd.ret." + tmpCount++;
+            body.append("  ").append(ret).append(" = load i8*, i8** ").append(slot).append("\n");
+            return new LLVMValue(ret, "i8*", "String");
+        }
         throw new RuntimeException("Unknown System method or argument count: System." + method + " (at line " + line + ")");
     }
 
