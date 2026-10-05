@@ -6242,6 +6242,183 @@ public class LLVMGen {
             body.append("  ").append(ret).append(" = load i8*, i8** ").append(slot).append("\n");
             return new LLVMValue(ret, "i8*", "String");
         }
+        if (method.equals("getExecDir") && nodes.isEmpty()) {
+            // Own executable's directory, independent of cwd. Result-slot + join (inlined, no ret).
+            int eid = labelCount++;
+            String eslot = "%system.exdir.slot." + tmpCount;
+            body.append("  ").append(eslot).append(" = alloca i8*\n");
+            tmpCount++;
+            if (targetPlatform.equals("windows")) {
+                if (!header.toString().contains("declare i32 @GetModuleFileNameW(")) {
+                    header.append("declare i32 @GetModuleFileNameW(i16*, i16*, i32)\n");
+                }
+                if (!header.toString().contains("declare i32 @WideCharToMultiByte(")) {
+                    header.append("declare i32 @WideCharToMultiByte(i32, i32, i16*, i32, i8*, i32, i8*, i8*)\n");
+                }
+                // 1024 WCHAR buffer — covers long paths; 0 = failure, n == cap = truncated.
+                String wbytes = "%system.exdir.wbytes." + tmpCount++;
+                body.append("  ").append(wbytes).append(" = mul i64 1024, 2\n");
+                String wbuf = "%system.exdir.wbuf." + tmpCount;
+                body.append("  ").append(wbuf).append(" = call i8* @").append(allocFn())
+                     .append("(i64 ").append(wbytes).append(")\n");
+                tmpCount++;
+                String w16 = "%system.exdir.w16." + tmpCount++;
+                body.append("  ").append(w16).append(" = bitcast i8* ").append(wbuf).append(" to i16*\n");
+                String n = "%system.exdir.n." + tmpCount++;
+                body.append("  ").append(n).append(" = call i32 @GetModuleFileNameW(i16* null, i16* ")
+                     .append(w16).append(", i32 1024)\n");
+                String nZ = "%system.exdir.nz." + tmpCount++;
+                body.append("  ").append(nZ).append(" = icmp eq i32 ").append(n).append(", 0\n");
+                String nCap = "%system.exdir.ncap." + tmpCount++;
+                body.append("  ").append(nCap).append(" = icmp eq i32 ").append(n).append(", 1024\n");
+                String nBad = "%system.exdir.nbad." + tmpCount++;
+                body.append("  ").append(nBad).append(" = or i1 ").append(nZ).append(", ").append(nCap).append("\n");
+                body.append("  br i1 ").append(nBad).append(", label %system.exdir.fail." + eid
+                    + ", label %system.exdir.scan." + eid + "\n");
+                // scan for the last path separator (0x5C '\' / 0x2F '/')
+                body.append("system.exdir.scan.").append(eid).append(":\n");
+                String last = "%system.exdir.last." + tmpCount;
+                body.append("  ").append(last).append(" = alloca i64\n  store i64 -1, i64* ").append(last).append("\n");
+                tmpCount++;
+                String idx = "%system.exdir.i." + tmpCount;
+                body.append("  ").append(idx).append(" = alloca i64\n  store i64 0, i64* ").append(idx).append("\n");
+                tmpCount++;
+                String n64 = "%system.exdir.n64." + tmpCount++;
+                body.append("  ").append(n64).append(" = zext i32 ").append(n).append(" to i64\n");
+                body.append("  br label %system.exdir.loop." + eid + "\n");
+                body.append("system.exdir.loop.").append(eid).append(":\n");
+                String iv = "%system.exdir.iv." + tmpCount++;
+                body.append("  ").append(iv).append(" = load i64, i64* ").append(idx).append("\n");
+                String ilt = "%system.exdir.ilt." + tmpCount++;
+                body.append("  ").append(ilt).append(" = icmp slt i64 ").append(iv).append(", ").append(n64).append("\n");
+                body.append("  br i1 ").append(ilt).append(", label %system.exdir.ch." + eid
+                    + ", label %system.exdir.scandone." + eid + "\n");
+                body.append("system.exdir.ch.").append(eid).append(":\n");
+                String cp = "%system.exdir.cp." + tmpCount++;
+                body.append("  ").append(cp).append(" = getelementptr i16, i16* ").append(w16).append(", i64 ").append(iv).append("\n");
+                String cv = "%system.exdir.cv." + tmpCount++;
+                body.append("  ").append(cv).append(" = load i16, i16* ").append(cp).append("\n");
+                String cBS = "%system.exdir.cbs." + tmpCount++;
+                body.append("  ").append(cBS).append(" = icmp eq i16 ").append(cv).append(", 92\n");
+                String cFS = "%system.exdir.cfs." + tmpCount++;
+                body.append("  ").append(cFS).append(" = icmp eq i16 ").append(cv).append(", 47\n");
+                String cSep = "%system.exdir.csep." + tmpCount++;
+                body.append("  ").append(cSep).append(" = or i1 ").append(cBS).append(", ").append(cFS).append("\n");
+                body.append("  br i1 ").append(cSep).append(", label %system.exdir.setsep." + eid
+                    + ", label %system.exdir.next." + eid + "\n");
+                body.append("system.exdir.setsep.").append(eid).append(":\n");
+                body.append("  store i64 ").append(iv).append(", i64* ").append(last).append("\n");
+                body.append("  br label %system.exdir.next.").append(eid).append("\n");
+                body.append("system.exdir.next.").append(eid).append(":\n");
+                String iinc = "%system.exdir.iinc." + tmpCount++;
+                body.append("  ").append(iinc).append(" = add i64 ").append(iv).append(", 1\n");
+                body.append("  store i64 ").append(iinc).append(", i64* ").append(idx).append("\n");
+                body.append("  br label %system.exdir.loop.").append(eid).append("\n");
+                body.append("system.exdir.scandone.").append(eid).append(":\n");
+                String lv = "%system.exdir.lv." + tmpCount++;
+                body.append("  ").append(lv).append(" = load i64, i64* ").append(last).append("\n");
+                String lBad = "%system.exdir.lbad." + tmpCount++;
+                body.append("  ").append(lBad).append(" = icmp sle i64 ").append(lv).append(", 0\n");
+                body.append("  br i1 ").append(lBad).append(", label %system.exdir.fail." + eid
+                    + ", label %system.exdir.cut." + eid + "\n");
+                // overwrite the separator with NUL so the wide string ends at the directory
+                body.append("system.exdir.cut.").append(eid).append(":\n");
+                String zp = "%system.exdir.zp." + tmpCount++;
+                body.append("  ").append(zp).append(" = getelementptr i16, i16* ").append(w16).append(", i64 ").append(lv).append("\n");
+                body.append("  store i16 0, i16* ").append(zp).append("\n");
+                String u8len = "%system.exdir.u8len." + tmpCount++;
+                body.append("  ").append(u8len).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ")
+                     .append(w16).append(", i32 -1, i8* null, i32 0, i8* null, i8* null)\n");
+                String u8sz = "%system.exdir.u8sz." + tmpCount++;
+                body.append("  ").append(u8sz).append(" = sext i32 ").append(u8len).append(" to i64\n");
+                String out = "%system.exdir.out." + tmpCount;
+                body.append("  ").append(out).append(" = call i8* @").append(allocFn())
+                     .append("(i64 ").append(u8sz).append(")\n");
+                tmpCount++;
+                String cvt = "%system.exdir.cvt." + tmpCount++;
+                body.append("  ").append(cvt).append(" = call i32 @WideCharToMultiByte(i32 65001, i32 0, i16* ")
+                     .append(w16).append(", i32 -1, i8* ").append(out).append(", i32 ").append(u8len)
+                     .append(", i8* null, i8* null)\n");
+                body.append("  store i8* ").append(out).append(", i8** ").append(eslot).append("\n");
+                body.append("  br label %system.exdir.done.").append(eid).append("\n");
+                body.append("system.exdir.fail.").append(eid).append(":\n");
+                body.append("  store i8* null, i8** ").append(eslot).append("\n");
+                body.append("  br label %system.exdir.done.").append(eid).append("\n");
+            } else {
+                if (!header.toString().contains("declare i64 @readlink(")) {
+                    header.append("declare i64 @readlink(i8*, i8*, i64)\n");
+                }
+                // "/proc/self/exe" constant via the shared string pool
+                LLVMValue selfPath = makeStringConstant("/proc/self/exe");
+                String buf = "%system.exdir.buf." + tmpCount;
+                body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 1024)\n");
+                tmpCount++;
+                String n = "%system.exdir.n." + tmpCount++;
+                body.append("  ").append(n).append(" = call i64 @readlink(i8* ").append(selfPath.value)
+                     .append(", i8* ").append(buf).append(", i64 1023)\n");
+                String nNeg = "%system.exdir.nneg." + tmpCount++;
+                body.append("  ").append(nNeg).append(" = icmp slt i64 ").append(n).append(", 0\n");
+                body.append("  br i1 ").append(nNeg).append(", label %system.exdir.fail." + eid
+                    + ", label %system.exdir.term." + eid + "\n");
+                body.append("system.exdir.term.").append(eid).append(":\n");
+                // readlink does not NUL-terminate
+                String tzp = "%system.exdir.tzp." + tmpCount++;
+                body.append("  ").append(tzp).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(n).append("\n");
+                body.append("  store i8 0, i8* ").append(tzp).append("\n");
+                // walk for the last '/'
+                String last = "%system.exdir.last." + tmpCount;
+                body.append("  ").append(last).append(" = alloca i64\n  store i64 -1, i64* ").append(last).append("\n");
+                tmpCount++;
+                String idx = "%system.exdir.i." + tmpCount;
+                body.append("  ").append(idx).append(" = alloca i64\n  store i64 0, i64* ").append(idx).append("\n");
+                tmpCount++;
+                body.append("  br label %system.exdir.loop." + eid + "\n");
+                body.append("system.exdir.loop.").append(eid).append(":\n");
+                String iv = "%system.exdir.iv." + tmpCount++;
+                body.append("  ").append(iv).append(" = load i64, i64* ").append(idx).append("\n");
+                String ilt = "%system.exdir.ilt." + tmpCount++;
+                body.append("  ").append(ilt).append(" = icmp slt i64 ").append(iv).append(", ").append(n).append("\n");
+                body.append("  br i1 ").append(ilt).append(", label %system.exdir.ch." + eid
+                    + ", label %system.exdir.scandone." + eid + "\n");
+                body.append("system.exdir.ch.").append(eid).append(":\n");
+                String cp = "%system.exdir.cp." + tmpCount++;
+                body.append("  ").append(cp).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(iv).append("\n");
+                String cv = "%system.exdir.cv." + tmpCount++;
+                body.append("  ").append(cv).append(" = load i8, i8* ").append(cp).append("\n");
+                String cFS = "%system.exdir.cfs." + tmpCount++;
+                body.append("  ").append(cFS).append(" = icmp eq i8 ").append(cv).append(", 47\n");
+                body.append("  br i1 ").append(cFS).append(", label %system.exdir.setsep." + eid
+                    + ", label %system.exdir.next." + eid + "\n");
+                body.append("system.exdir.setsep.").append(eid).append(":\n");
+                body.append("  store i64 ").append(iv).append(", i64* ").append(last).append("\n");
+                body.append("  br label %system.exdir.next.").append(eid).append("\n");
+                body.append("system.exdir.next.").append(eid).append(":\n");
+                String iinc = "%system.exdir.iinc." + tmpCount++;
+                body.append("  ").append(iinc).append(" = add i64 ").append(iv).append(", 1\n");
+                body.append("  store i64 ").append(iinc).append(", i64* ").append(idx).append("\n");
+                body.append("  br label %system.exdir.loop.").append(eid).append("\n");
+                body.append("system.exdir.scandone.").append(eid).append(":\n");
+                String lv = "%system.exdir.lv." + tmpCount++;
+                body.append("  ").append(lv).append(" = load i64, i64* ").append(last).append("\n");
+                String lBad = "%system.exdir.lbad." + tmpCount++;
+                body.append("  ").append(lBad).append(" = icmp sle i64 ").append(lv).append(", 0\n");
+                body.append("  br i1 ").append(lBad).append(", label %system.exdir.fail." + eid
+                    + ", label %system.exdir.cut." + eid + "\n");
+                body.append("system.exdir.cut.").append(eid).append(":\n");
+                String zp = "%system.exdir.zp." + tmpCount++;
+                body.append("  ").append(zp).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(lv).append("\n");
+                body.append("  store i8 0, i8* ").append(zp).append("\n");
+                body.append("  store i8* ").append(buf).append(", i8** ").append(eslot).append("\n");
+                body.append("  br label %system.exdir.done.").append(eid).append("\n");
+                body.append("system.exdir.fail.").append(eid).append(":\n");
+                body.append("  store i8* null, i8** ").append(eslot).append("\n");
+                body.append("  br label %system.exdir.done.").append(eid).append("\n");
+            }
+            body.append("system.exdir.done.").append(eid).append(":\n");
+            String eret = "%system.exdir.ret." + tmpCount++;
+            body.append("  ").append(eret).append(" = load i8*, i8** ").append(eslot).append("\n");
+            return new LLVMValue(eret, "i8*", "String");
+        }
         throw new RuntimeException("Unknown System method or argument count: System." + method + " (at line " + line + ")");
     }
 

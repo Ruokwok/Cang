@@ -48,13 +48,16 @@ String path = System.getenv("PATH")
 找不到环境变量时返回 `null`。
 
 
-### 16.5 当前工作目录
+### 16.5 目录
 
 ```cang
-String dir = System.getCwd()
+String dir = System.getCwd()          // 当前工作目录
+String exe = System.getExecDir()      // 本可执行文件所在目录
 ```
 
 进程启动时的工作目录（Windows 下为 `C:\...` 形式）；获取失败返回 `null`。
+
+`getExecDir()` 返回**本 exe 自身**所在的目录，与从哪个目录启动无关——定位旁边的资源文件用它更可靠。
 ### 16.6 当前时间
 
 ```cang
