@@ -3,9 +3,11 @@ import cang/io/File
 import cang/lang/System
 
 # cangc — Cang 编译器启动器
-# 布局约定（相对当前工作目录）：
-#   <cwd>/jar/cang.jar          编译器 jar
-#   <cwd>/openjdk/bin/java.exe  JVM（非 Windows 为 bin/java）
+# 布局约定（相对 cangc.exe 所在目录，与启动时的工作目录无关）：
+#   jar/cang.jar           编译器 jar
+#   openjdk/bin/java.exe   JVM（非 Windows 为 bin/java）
+#   llvm/bin/clang.exe     存在时自动 --clang 传给编译器，否则由 jar 自动选择
+#   mingw64/bin/gcc.exe    存在时自动 --gcc 传给编译器，否则由 jar 自动选择
 # 用法与 java -jar cang.jar 完全一致，退出码透传；
 # -v 归一为 --version 后转发（打印编译器版本）；
 # -h/--help 或无参数启动时打印本帮助（无参 exit 1，显式 help exit 0）。
@@ -49,18 +51,23 @@ Compiler options (forwarded to the compiler):
     System.exit(1)
 }
 
-String cwd = System.getCwd()
-if (cwd == null) {
-    Stderr.println("cangc: cannot resolve working directory")
+# ---- 目录全部相对 cangc.exe 所在目录（与从哪里启动无关） ----
+String base = System.getExecDir()
+if (base == null) {
+    Stderr.println("cangc: cannot resolve executable directory")
     System.exit(2)
 }
 
 String jre = "openjdk/bin/java.exe"
+String clangRel = "llvm/bin/clang.exe"
+String gccRel = "mingw64/bin/gcc.exe"
 if (System.OS_TYPE != "windows") {
     jre = "openjdk/bin/java"
+    clangRel = "llvm/bin/clang"
+    gccRel = "mingw64/bin/gcc"
 }
-String javaExe = cwd + "/" + jre
-String jarPath = cwd + "/jar/cang.jar"
+String javaExe = base + "/" + jre
+String jarPath = base + "/jar/cang.jar"
 
 File javaFile = new File(javaExe)
 if (!javaFile.exists()) {
@@ -73,12 +80,47 @@ if (!jarFile.exists()) {
     System.exit(4)
 }
 
-# cmd = [javaExe, "-jar", jarPath, <用户参数...>]
+# ---- exe 同级工具链：存在且用户未指定时追加 --clang/--gcc；不存在则由 jar 自动选择 ----
+bool userClang = false
+bool userGcc = false
+for (var a : System.ARGS) {
+    if (a == "--clang") {
+        userClang = true
+    }
+    if (a == "--gcc") {
+        userGcc = true
+    }
+}
+bool addClang = false
+bool addGcc = false
+File clangFile = null
+File gccFile = null
+if (!userClang) {
+    clangFile = new File(base + "/" + clangRel)
+    if (clangFile.exists()) {
+        addClang = true
+    }
+}
+if (!userGcc) {
+    gccFile = new File(base + "/" + gccRel)
+    if (gccFile.exists()) {
+        addGcc = true
+    }
+}
+
+# ---- cmd = [javaExe, "-jar", jarPath, <用户参数...>, (--clang X)?, (--gcc Y)?] ----
 int n = 0
 for (var a : System.ARGS) {
     n = n + 1
 }
-String[] cmd = new String[n + 2]
+int extra = 0
+if (addClang) {
+    extra = extra + 2
+}
+if (addGcc) {
+    extra = extra + 2
+}
+String[] cmd = new String[n + 2 + extra]
 cmd[0] = javaExe
 cmd[1] = "-jar"
 cmd[2] = jarPath
@@ -94,6 +136,18 @@ for (var a : System.ARGS) {
             cmd[i] = "--version"
         }
     }
+}
+if (addClang) {
+    i = i + 1
+    cmd[i] = "--clang"
+    i = i + 1
+    cmd[i] = base + "/" + clangRel
+}
+if (addGcc) {
+    i = i + 1
+    cmd[i] = "--gcc"
+    i = i + 1
+    cmd[i] = base + "/" + gccRel
 }
 
 # 子进程 stdout 逐行转发；stderr 直接继承终端
