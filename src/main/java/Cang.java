@@ -800,15 +800,14 @@ public class Cang {
         linkArgs.add("-o");
         linkArgs.add(exeFile);
         if (gc) {
-            String dir = findGcLibDir("windows", gcLibDir);
-            if (dir == null) {
-                System.err.println("error: --gc requires Boehm GC static library libgc.a");
-                System.err.println("       provide it at runtime/boehm/windows-amd64/lib/libgc.a or pass --gc-lib <dir>");
+            String gcLib = findGcLib("windows", gcLibDir);
+            if (gcLib == null) {
+                System.err.println("error: --gc requires the Boehm GC static library");
+                System.err.println("       place it at lib/window_amd64_libgc.a or pass --gc-lib <file-or-dir>");
                 System.exit(1);
             }
-            linkArgs.add("-L" + dir);
-            linkArgs.add("-lgc");
-            System.out.println("      gc:     " + dir);
+            linkArgs.add(gcLib);
+            System.out.println("      gc:     " + gcLib);
         }
 
         long t1 = System.currentTimeMillis();
@@ -846,24 +845,54 @@ public class Cang {
         }
     }
 
-    /** Locate a Boehm GC static library directory for --gc linking. */
-    private static String findGcLibDir(String target, String override) {
-        List<String> candidates = new ArrayList<>();
-        if (override != null) candidates.add(override);
-        String cwd = System.getProperty("user.dir");
-        candidates.add(cwd + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib");
-        candidates.add(cwd + File.separator + ".." + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib");
-        if (target.equals("windows")) {
-            // Development build fallback produced from the bundled bdwgc sources.
-            candidates.add(cwd + File.separator + "target" + File.separator + "boehm-build" + File.separator + "bdwgc");
+    /**
+     * Locate the Boehm GC static library FILE for --gc linking.
+     * override accepts a file path or a directory containing libgc.a.
+     * Search order: lib/{os}_amd64_libgc.a (cwd, then parent), then the
+     * legacy runtime/boehm/<os>-amd64/lib/libgc.a layout.
+     */
+    private static String findGcLib(String target, String override) {
+        // 1) explicit --gc-lib: a file as-is, or a directory holding libgc.a
+        if (override != null) {
+            File f = new File(override);
+            if (f.isFile()) return f.getAbsolutePath();
+            File inDir = new File(f, "libgc.a");
+            if (inDir.isFile()) return inDir.getAbsolutePath();
         }
-        for (String dir : candidates) {
+        String cwd = System.getProperty("user.dir");
+        // 2) lib/ layout: window_/linux_/mac_ + amd64 (also accept the 'windows' spelling)
+        String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
+        String altKey = target.equals("windows") ? "windows" : osKey;
+        String[] libNames = { osKey + "_amd64_libgc.a", altKey + "_amd64_libgc.a" };
+        String[] bases = { cwd, cwd + File.separator + ".." };
+        for (String base : bases) {
+            for (String name : libNames) {
+                File f = new File(base, "lib" + File.separator + name);
+                if (f.isFile()) {
+                    try {
+                        return f.getCanonicalPath();
+                    } catch (IOException e) {
+                        return f.getAbsolutePath();
+                    }
+                }
+            }
+        }
+        // 3) legacy layout fallback
+        String[] legacyDirs = {
+            cwd + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib",
+            cwd + File.separator + ".." + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib",
+            target.equals("windows")
+                ? cwd + File.separator + "target" + File.separator + "boehm-build" + File.separator + "bdwgc"
+                : null
+        };
+        for (String dir : legacyDirs) {
             if (dir == null) continue;
-            if (new File(dir, "libgc.a").isFile()) {
+            File f = new File(dir, "libgc.a");
+            if (f.isFile()) {
                 try {
-                    return new File(dir).getCanonicalPath();
+                    return f.getCanonicalPath();
                 } catch (IOException e) {
-                    return dir;
+                    return f.getAbsolutePath();
                 }
             }
         }
@@ -892,14 +921,14 @@ public class Cang {
 
         String gcArgs = "";
         if (gc) {
-            String dir = findGcLibDir("linux", gcLibDir);
-            if (dir == null) {
-                System.err.println("error: --gc for Linux requires Boehm GC static library libgc.a");
-                System.err.println("       provide it at runtime/boehm/linux-amd64/lib/libgc.a or pass --gc-lib <dir>");
+            String gcLib = findGcLib("linux", gcLibDir);
+            if (gcLib == null) {
+                System.err.println("error: --gc for Linux requires the Boehm GC static library");
+                System.err.println("       place it at lib/linux_amd64_libgc.a or pass --gc-lib <file-or-dir>");
                 System.err.println("       (the library must be built for the Linux target, not Windows)");
                 System.exit(1);
             }
-            gcArgs = " -L\"" + toWslPath(dir) + "\" -lgc";
+            gcArgs = " \"" + toWslPath(gcLib) + "\"";
         }
 
         System.out.println("Compiling for Linux via WSL...");
@@ -916,9 +945,9 @@ public class Cang {
     }
 
     private static void compileMacOS(String llFile, String baseName, boolean gc, String gcLibDir) throws IOException, InterruptedException {
-        if (gc && findGcLibDir("macos", gcLibDir) == null) {
-            System.err.println("error: --gc for macOS requires Boehm GC static library libgc.a");
-            System.err.println("       provide it at runtime/boehm/macos-amd64/lib/libgc.a or pass --gc-lib <dir>");
+        if (gc && findGcLib("macos", gcLibDir) == null) {
+            System.err.println("error: --gc for macOS requires the Boehm GC static library");
+            System.err.println("       place it at lib/mac_amd64_libgc.a or pass --gc-lib <file-or-dir>");
         }
         System.exit(1);
     }
