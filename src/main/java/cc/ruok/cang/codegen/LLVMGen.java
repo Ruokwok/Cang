@@ -1,10 +1,11 @@
-package codegen;
+package cc.ruok.cang.codegen;
 
-import parser.AST.*;
-import parser.AST;
-import lexer.Lexer;
-import lexer.Token;
-import parser.Parser;
+import cc.ruok.cang.parser.AST.*;
+import cc.ruok.cang.parser.AST;
+import cc.ruok.cang.lexer.Lexer;
+import cc.ruok.cang.lexer.Token;
+import cc.ruok.cang.parser.Parser;
+import cc.ruok.cang.util.CompileError;
 
 import java.util.*;
 
@@ -263,7 +264,7 @@ public class LLVMGen {
     public String generate(Program program) {
         try {
             return generateInternal(program);
-        } catch (util.CompileError e) {
+        } catch (CompileError e) {
             throw e; // already carries precise file/line/column
         } catch (RuntimeException e) {
             // debug.md #27: codegen exceptions without "(at line N)" were rendered at 1:1.
@@ -790,7 +791,7 @@ public class LLVMGen {
             String file = !decl.sourceFile.isEmpty() ? decl.sourceFile : sourceFile;
             String srcLine = readSourceLine(file, decl.line);
             int col = srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1;
-            throw new util.CompileError("Duplicate class: '" + fullName + "'",
+            throw new cc.ruok.cang.util.CompileError("Duplicate class: '" + fullName + "'",
                 file, decl.line, col, srcLine, decl.name.length());
         }
         info.llvmName = "%" + fullName;
@@ -1159,7 +1160,7 @@ public class LLVMGen {
             String srcLine = readSourceLine(file, decl.line);
             // Mixed native/non-native overloads can never link (native has no body).
             if (existing.isNative != decl.isNative) {
-                throw new util.CompileError(
+                throw new cc.ruok.cang.util.CompileError(
                     "Method '" + decl.name + "' mixes native and non-native declarations; overloads must be uniform",
                     file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
                     srcLine, decl.name.length());
@@ -1171,19 +1172,19 @@ public class LLVMGen {
             // User rule: a method with default parameter values may not be overloaded
             // (this also removes every defaults/overload resolution ambiguity).
             if (existingDefaults || newDefaults) {
-                throw new util.CompileError(
+                throw new cc.ruok.cang.util.CompileError(
                     "Method '" + decl.name + "' has default parameter values and cannot be overloaded",
                     file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
                     srcLine, decl.name.length());
             }
             if (existing.isStatic != decl.isStatic) {
-                throw new util.CompileError(
+                throw new cc.ruok.cang.util.CompileError(
                     "Method '" + decl.name + "' mixes static and instance declarations; overloads must be uniform",
                     file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
                     srcLine, decl.name.length());
             }
             if (existing.paramTypes.equals(newTypes)) {
-                throw new util.CompileError(
+                throw new cc.ruok.cang.util.CompileError(
                     "Duplicate function: '" + decl.name + "' is already defined with the same signature",
                     file, decl.line, srcLine.indexOf(decl.name) >= 0 ? srcLine.indexOf(decl.name) + 1 : 1,
                     srcLine, decl.name.length());
@@ -1836,7 +1837,7 @@ public class LLVMGen {
                         }
                     }
                 } catch (Exception ignored) {}
-                throw new util.CompileError(
+                throw new cc.ruok.cang.util.CompileError(
                     "Function '" + decl.name + "' must return a value of type '" + decl.returnType + "'",
                     srcFile, decl.line, 1, srcLine, decl.name.length());
             }
@@ -2844,7 +2845,7 @@ public class LLVMGen {
             String lit = literalCaseKey(sc.value);
             if (lit != null && !seenCases.add(lit)) {
                 String shown = lit.length() > 2 ? lit.substring(2) : lit; // strip "i:" etc. prefix
-                throw new util.CompileError("Duplicate case value '" + shown + "'",
+                throw new cc.ruok.cang.util.CompileError("Duplicate case value '" + shown + "'",
                     sourceFile, sc.line, 1, readSourceLine(sourceFile, sc.line), 4);
             }
         }

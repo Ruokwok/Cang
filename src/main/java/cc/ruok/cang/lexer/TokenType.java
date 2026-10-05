@@ -1,4 +1,4 @@
-package lexer;
+package cc.ruok.cang.lexer;
 
 import java.util.Map;
 import java.util.HashMap;

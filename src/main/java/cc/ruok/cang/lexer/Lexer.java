@@ -1,4 +1,4 @@
-package lexer;
+package cc.ruok.cang.lexer;
 
 import java.util.ArrayList;
 import java.util.List;

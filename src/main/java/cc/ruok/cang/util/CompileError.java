@@ -1,4 +1,4 @@
-package util;
+package cc.ruok.cang.util;
 
 /**
  * Browser/JS-style compile error with source location.

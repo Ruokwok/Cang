@@ -1,8 +1,8 @@
-package parser;
+package cc.ruok.cang.parser;
 
-import lexer.Token;
-import lexer.TokenType;
-import parser.AST.*;
+import cc.ruok.cang.lexer.Token;
+import cc.ruok.cang.lexer.TokenType;
+import cc.ruok.cang.parser.AST.*;
 
 import java.util.ArrayList;
 import java.util.List;

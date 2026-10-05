@@ -1,9 +1,11 @@
-import codegen.LLVMGen;
-import lexer.Lexer;
-import lexer.Token;
-import parser.AST;
-import parser.Parser;
-import util.CompileError;
+package cc.ruok.cang;
+
+import cc.ruok.cang.codegen.LLVMGen;
+import cc.ruok.cang.lexer.Lexer;
+import cc.ruok.cang.lexer.Token;
+import cc.ruok.cang.parser.AST;
+import cc.ruok.cang.parser.Parser;
+import cc.ruok.cang.util.CompileError;
 
 import java.io.File;
 import java.io.IOException;

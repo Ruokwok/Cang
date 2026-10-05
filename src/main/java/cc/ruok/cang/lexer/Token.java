@@ -1,4 +1,4 @@
-package lexer;
+package cc.ruok.cang.lexer;
 
 public class Token {
 
