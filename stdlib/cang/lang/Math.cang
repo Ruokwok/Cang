@@ -53,7 +53,17 @@ static native func double atan2(double y, double x)
 # 对数与指数
 static native func double log(double x)
 static native func double log10(double x)
+static native func double log2(double x)
 static native func double exp(double x)
+
+# 直角三角形斜边 sqrt(a*a + b*b)
+static native func double hypot(double a, double b)
+
+# 浮点取余（C 语义，向零截断）
+static native func double fmod(double a, double b)
+
+# 符号：正 1.0 / 负 -1.0 / 零 0.0（NaN 归 0.0，v1 边界）
+static native func double signum(double x)
 
 # 跨平台自包含伪随机数，固定种子，返回 [0, 1)
 static native func double random()

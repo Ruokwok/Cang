@@ -6061,6 +6061,39 @@ public class LLVMGen {
             return new LLVMValue(r, type);
         }
 
+        if (method.equals("hypot") && args.size() == 2) {
+            String a = castValue(args.get(0), "double"), b = castValue(args.get(1), "double");
+            String sa = "%math.ha." + tmpCount++;
+            String sb = "%math.hb." + tmpCount++;
+            String s = "%math.hs." + tmpCount++;
+            body.append("  ").append(sa).append(" = fmul double ").append(a).append(", ").append(a).append("\n");
+            body.append("  ").append(sb).append(" = fmul double ").append(b).append(", ").append(b).append("\n");
+            body.append("  ").append(s).append(" = fadd double ").append(sa).append(", ").append(sb).append("\n");
+            String r = "%math.hypot." + tmpCount++;
+            body.append("  ").append(r).append(" = call double @llvm.sqrt.f64(double ").append(s).append(")\n");
+            return new LLVMValue(r, "double");
+        }
+        if (method.equals("fmod") && args.size() == 2) {
+            String r = "%math.fmod." + tmpCount++;
+            body.append("  ").append(r).append(" = frem double ")
+                 .append(castValue(args.get(0), "double")).append(", ")
+                 .append(castValue(args.get(1), "double")).append("\n");
+            return new LLVMValue(r, "double");
+        }
+        if (method.equals("signum") && args.size() == 1) {
+            // NaN falls into the 0.0 arm (v1 boundary, documented)
+            String v = castValue(args.get(0), "double");
+            String gt = "%math.sg.gt." + tmpCount++;
+            String lt = "%math.sg.lt." + tmpCount++;
+            String pos = "%math.sg.pos." + tmpCount++;
+            String r = "%math.signum." + tmpCount++;
+            body.append("  ").append(gt).append(" = fcmp ogt double ").append(v).append(", 0.0\n");
+            body.append("  ").append(lt).append(" = fcmp olt double ").append(v).append(", 0.0\n");
+            body.append("  ").append(pos).append(" = select i1 ").append(gt).append(", double 1.0, double 0.0\n");
+            body.append("  ").append(r).append(" = select i1 ").append(lt).append(", double -1.0, double ").append(pos).append("\n");
+            return new LLVMValue(r, "double");
+        }
+
         String intrinsic = null;
         if (method.equals("sqrt")) intrinsic = "sqrt";
         else if (method.equals("pow")) intrinsic = "pow";
@@ -6076,6 +6109,7 @@ public class LLVMGen {
         else if (method.equals("atan2")) intrinsic = "atan2";
         else if (method.equals("log")) intrinsic = "log";
         else if (method.equals("log10")) intrinsic = "log10";
+        else if (method.equals("log2")) intrinsic = "log2";
         else if (method.equals("exp")) intrinsic = "exp";
         if (intrinsic != null && (args.size() == 1 || (intrinsic.equals("pow") || intrinsic.equals("atan2")) && args.size() == 2)) {
             String r = "%math." + intrinsic + "." + tmpCount++;

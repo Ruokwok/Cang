@@ -4,7 +4,8 @@
 
 ## 要点
 - abs/max/min、pow/sqrt、floor/ceil/round
-- sin/cos/tan/asin/acos/atan、log/exp/log10
+- sin/cos/tan/asin/acos/atan、log/exp/log10/log2
+- hypot/fmod/signum（斜边、浮点取余、符号；signum 的 NaN 归 0.0，v1 边界）
 - random() 伪随机（LCG，跨平台可复现序列）
 
 
@@ -65,10 +66,19 @@ Math.atan2(y, x)
 ```cang
 Math.log(x)
 Math.log10(x)
+Math.log2(x)
 Math.exp(x)
 ```
 
-### 15.7 随机数
+### 15.7 斜边、取余与符号
+
+```cang
+Math.hypot(3.0, 4.0)   # 5.0，sqrt(a*a + b*b)
+Math.fmod(7.5, 2.0)    # 1.5，C 语义向零截断
+Math.signum(-0.5)      # -1.0（零 -> 0.0，NaN -> 0.0）
+```
+
+### 15.8 随机数
 
 ```cang
 double value = Math.random()
