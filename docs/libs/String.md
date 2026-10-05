@@ -3,9 +3,10 @@
 > 返回 [文档索引](../README.md)
 
 ## 要点
-- length / substring / indexOf / lastIndexOf / indexOfIgnoreCase / startsWith / endsWith
+- length / substring / indexOf / indexOfIgnoreCase / startsWith / endsWith
 - toUpper / toLower / trim（均已在编译器内建实现，无需 import）
-- split 等拆分 API 暂未提供（v1 边界）
+- parseInt / parseLong / parseDouble：完整数字校验，非法输入或超范围是运行时错误（首尾空白按 Java 惯例忽略）
+- split / lastIndexOf 暂未提供（v1 边界）
 - 方法链式调用与 str 的显式转换
 
 
@@ -26,6 +27,9 @@ s.toUpper()
 s.toLower()
 s.trim()
 s.indexOfIgnoreCase("cang")
+"42".parseInt()       # 42
+"3.25".parseDouble()  # 3.25
+"1234567890123".parseLong()
 ```
 
 字符串对象是不可变的，方法不会修改原字符串，而是返回新值或新字符串。

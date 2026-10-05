@@ -30,3 +30,12 @@ native func String trim()
 
 # 查找第一次出现的位置（忽略大小写）
 native func int indexOfIgnoreCase(String substring)
+
+# 转为整数，必须是完整合法数字（失败运行时错误；超出 int 范围也报错）
+native func int parseInt()
+
+# 转为 64 位整数（失败运行时错误）
+native func long parseLong()
+
+# 转为浮点数（支持 1.5 / 1e3 / .5 形式，失败运行时错误）
+native func double parseDouble()

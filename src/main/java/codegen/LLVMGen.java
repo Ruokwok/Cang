@@ -1414,6 +1414,11 @@ public class LLVMGen {
             header.append("declare i8* @strstr(i8*, i8*)\n");
             header.append("declare i32 @memcmp(i8*, i8*, i64)\n");
         }
+        // String.parse* (strtoll = 64-bit long on BOTH ABIs, unlike strtol: Win long=32)
+        if (!header.toString().contains("declare i64 @strtoll(")) {
+            header.append("declare i64 @strtoll(i8*, i8**, i32)\n");
+            header.append("declare double @strtod(i8*, i8**)\n");
+        }
 
         // Static fields as global variables
         for (Map.Entry<String, FieldDecl> entry : staticFields.entrySet()) {
@@ -5451,6 +5456,10 @@ public class LLVMGen {
         if (objCache == null) objCache = generateExpr(node.object);
         LLVMValue objVal = objCache;
         if ("str".equals(objVal.semanticType)) {
+            // str shares the intrinsic String surface (they are both i8* at runtime).
+            if (STRING_METHODS.contains(node.method)) {
+                return generateStringMethod(objVal, node);
+            }
             throw new RuntimeException("str is a primitive type and has no methods (at line " + node.line + ")");
         }
         // String methods (length/substring/...) — compiler intrinsics like Stdout dispatch.
@@ -6183,7 +6192,8 @@ public class LLVMGen {
     /** The native String surface (stdlib/cang/lang/String.cang) — dispatched intrinsically. */
     private static final java.util.Set<String> STRING_METHODS = java.util.Set.of(
         "length", "startsWith", "endsWith", "indexOf", "indexOfIgnoreCase",
-        "substring", "toUpper", "toLower", "trim");
+        "substring", "toUpper", "toLower", "trim",
+        "parseInt", "parseLong", "parseDouble");
 
     /** String intrinsics: receiver is the i8* string itself (no struct header). */
     private LLVMValue generateStringMethod(LLVMValue recv, MethodCallExpr node) {
@@ -6192,7 +6202,7 @@ public class LLVMGen {
         // Null receiver -> catchable error (same pattern as object field access).
         int id = labelCount++;
         String nn = "str.nn." + id;
-        String isNull = "%str.null." + tmpCount++;
+        String isNull = "%str.isnull." + tmpCount++;
         body.append("  ").append(isNull).append(" = icmp eq i8* ").append(recv.value).append(", null\n");
         body.append("  br i1 ").append(isNull).append(", label %str.null.").append(id)
              .append(", label %").append(nn).append("\n\n");
@@ -6326,6 +6336,33 @@ public class LLVMGen {
                 return new LLVMValue(emitCaseConv(recv.value, false, line), "i8*", "String");
             case "trim":
                 return new LLVMValue(emitTrim(recv.value), "i8*", "String");
+            case "parseInt": {
+                requireArgs(node, 0, m);
+                LLVMValue raw = emitParseNum(recv, false, line);
+                // i32 range guard (strtoll happily parses beyond int)
+                int rid = labelCount++;
+                String rbad = "str.pi.bad." + rid, rok = "str.pi.ok." + rid;
+                String hi = "%p.hi." + tmpCount++;
+                body.append("  ").append(hi).append(" = icmp sgt i64 ").append(raw.value).append(", 2147483647\n");
+                String lo = "%p.lo." + tmpCount++;
+                body.append("  ").append(lo).append(" = icmp slt i64 ").append(raw.value).append(", -2147483648\n");
+                String oob = "%p.oob." + tmpCount++;
+                body.append("  ").append(oob).append(" = or i1 ").append(hi).append(", ").append(lo).append("\n");
+                body.append("  br i1 ").append(oob).append(", label %").append(rbad)
+                     .append(", label %").append(rok).append("\n");
+                body.append(rbad).append(":\n");
+                emitRuntimeError("Number out of range for 'int'", line, rok);
+                body.append(rok).append(":\n");
+                String r32 = "%p.i32." + tmpCount++;
+                body.append("  ").append(r32).append(" = trunc i64 ").append(raw.value).append(" to i32\n");
+                return new LLVMValue(r32, "i32", "int");
+            }
+            case "parseLong":
+                requireArgs(node, 0, m);
+                return emitParseNum(recv, false, line);
+            case "parseDouble":
+                requireArgs(node, 0, m);
+                return emitParseNum(recv, true, line);
             default:
                 throw new RuntimeException("Unknown String method: " + m + " (at line " + line + ")");
         }
@@ -6335,6 +6372,41 @@ public class LLVMGen {
         if (node.args.size() != n) {
             throw new RuntimeException("String." + m + " expects " + n + " argument(s) (at line " + node.line + ")");
         }
+    }
+
+    /** strtoll/strtod with an end-pointer full-consume guard: input that is not a
+     *  complete number (or is empty) is a runtime error. Returns i64 (ints) or double. */
+    private LLVMValue emitParseNum(LLVMValue recv, boolean dbl, int line) {
+        int id = labelCount++;
+        String okL = "str.parse.ok." + id, failL = "str.parse.fail." + id;
+        // Java-style: surrounding whitespace is ignored (trim first; strtoll/strtod skip leading too)
+        String trimmed = emitTrim(recv.value);
+        String slot = "%ep.slot." + tmpCount++;
+        body.append("  ").append(slot).append(" = alloca i8*\n");
+        String v = "%pv." + tmpCount++;
+        if (dbl) {
+            body.append("  ").append(v).append(" = call double @strtod(i8* ").append(trimmed)
+                 .append(", i8** ").append(slot).append(")\n");
+        } else {
+            body.append("  ").append(v).append(" = call i64 @strtoll(i8* ").append(trimmed)
+                 .append(", i8** ").append(slot).append(", i32 10)\n");
+        }
+        String ep = "%ep." + tmpCount++;
+        body.append("  ").append(ep).append(" = load i8*, i8** ").append(slot).append("\n");
+        String c = "%epc." + tmpCount++;
+        body.append("  ").append(c).append(" = load i8, i8* ").append(ep).append("\n");
+        String consumed = "%pcons." + tmpCount++;
+        body.append("  ").append(consumed).append(" = icmp ne i8* ").append(ep).append(", ").append(trimmed).append("\n");
+        String term = "%pterm." + tmpCount++;
+        body.append("  ").append(term).append(" = icmp eq i8 ").append(c).append(", 0\n");
+        String ok = "%pok." + tmpCount++;
+        body.append("  ").append(ok).append(" = and i1 ").append(consumed).append(", ").append(term).append("\n");
+        body.append("  br i1 ").append(ok).append(", label %").append(okL)
+             .append(", label %").append(failL).append("\n");
+        body.append(failL).append(":\n");
+        emitRuntimeError("Invalid number", line, okL);
+        body.append(okL).append(":\n");
+        return new LLVMValue(v, dbl ? "double" : "i64", dbl ? "double" : "long");
     }
 
     /** strstr + pointer delta -> index or -1 (inlined: stores the result, never `ret`s). */
