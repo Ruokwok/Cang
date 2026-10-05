@@ -29,16 +29,12 @@ if (argCount <= 1) {
     }
 }
 if (showHelp) {
-    Stdout.println(`cangc — Cang compiler launcher
+    Stdout.println(`Cang compiler
 
 Usage:
   cangc <source.cang> [options]    compile a Cang program
   cangc -v | --version             print compiler version
   cangc -h | --help                show this help
-
-Layout (relative to the current working directory):
-  jar/cang.jar             compiler
-  openjdk/bin/java(.exe)   JVM
 
 Compiler options (forwarded to the compiler):
   --no-link            compile to .ll only (skip clang/gcc)
@@ -46,9 +42,7 @@ Compiler options (forwarded to the compiler):
   --clang <path>       clang executable
   --gcc <path>         gcc executable
   --gc / --no-gc       Boehm GC on (default) / manual free
-  --gc-lib <dir>       override libgc lookup directory
-
-The exit code is passed through from the compiler.`)
+  --gc-lib <dir>       override libgc lookup directory`)
     if (helpExplicit) {
         System.exit(0)
     }
