@@ -23,6 +23,12 @@ public class Cang {
             printUsage();
             System.exit(1);
         }
+        for (String a : args) {
+            if (a.equals("--version")) {
+                System.out.println("Cang " + readProjectVersion());
+                System.exit(0);
+            }
+        }
         if (args[0].startsWith("-")) {
             System.err.println("error: missing source file (first argument must be a .cang file)");
             printUsage();
@@ -99,8 +105,40 @@ public class Cang {
         return args[idx];
     }
 
+    /**
+     * Project version from pom.xml: cwd first, then walking up from the
+     * code source (covers running from target/classes or from a jar).
+     * The first &lt;version&gt; outside any &lt;parent&gt; block wins; "unknown" if unreadable.
+     */
+    private static String readProjectVersion() {
+        List<Path> candidates = new ArrayList<>();
+        candidates.add(Path.of("pom.xml"));
+        try {
+            Path cs = Path.of(Cang.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path dir = Files.isDirectory(cs) ? cs : cs.getParent();
+            for (int i = 0; i < 3 && dir != null; i++) {
+                candidates.add(dir.resolve("pom.xml"));
+                dir = dir.getParent();
+            }
+        } catch (Exception ignored) {
+        }
+        for (Path p : candidates) {
+            try {
+                if (!Files.exists(p)) continue;
+                String xml = Files.readString(p);
+                xml = xml.replaceAll("(?s)<parent>.*?</parent>", "");
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("<version>\\s*(.*?)\\s*</version>").matcher(xml);
+                if (m.find()) return m.group(1);
+            } catch (Exception ignored) {
+            }
+        }
+        return "unknown";
+    }
+
     private static void printUsage() {
         System.err.println("Usage: Cang <source.cang> [options]");
+        System.err.println("  --version          print compiler version and exit");
         System.err.println("  --no-link          compile to .ll only (skip clang/gcc)");
         System.err.println("  --target <t>       windows | linux | macos   (default: windows)");
         System.err.println("  --arch <a>         target architecture         (default: amd64)");

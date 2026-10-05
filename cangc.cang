@@ -6,7 +6,8 @@ import cang/lang/System
 # 布局约定（相对当前工作目录）：
 #   <cwd>/jar/cang.jar          编译器 jar
 #   <cwd>/openjdk/bin/java.exe  JVM（非 Windows 为 bin/java）
-# 用法与 java -jar cang.jar 完全一致，退出码透传。
+# 用法与 java -jar cang.jar 完全一致，退出码透传；
+# -v 归一为 --version 后转发（打印编译器版本）。
 class Main()
 
 String cwd = System.getCwd()
@@ -50,6 +51,9 @@ for (var a : System.ARGS) {
     } else {
         i = i + 1
         cmd[i] = a
+        if (a == "-v") {
+            cmd[i] = "--version"
+        }
     }
 }
 
