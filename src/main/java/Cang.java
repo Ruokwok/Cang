@@ -924,27 +924,24 @@ public class Cang {
 
     /**
      * Resolve a Cang source argument:
-     *   cc/ruok/Main        -> src/cc/ruok/Main.cang (preferred, namespace under src/)
-     *   cc/ruok/Main.cang   -> src/cc/ruok/Main.cang (preferred)
-     *   test/foo.cang       -> test/foo.cang (direct path fallback, keeps old workflows)
+     *   cc/ruok/Demo.cang   -> ./cc/ruok/Demo.cang (direct, relative to the working directory)
+     *   cc/ruok/Demo        -> src/cc/ruok/Demo.cang (no extension = namespace under src/)
+     *   D:/x/Demo           -> absolute, no src/ prefix; .cang appended in place
      */
     private static String resolveSourcePath(String arg) {
-        String withExt = arg.endsWith(".cang") ? arg : arg + ".cang";
-        String normalized = withExt.replace('\\', '/');
-        String flat = normalized.replace('/', File.separatorChar);
-        String direct = arg.replace('\\', '/').replace('/', File.separatorChar);
-        String[] candidates = {
-            "src" + File.separator + flat,
-            flat,
-            direct
-        };
-        java.util.List<String> searched = new java.util.ArrayList<>();
-        for (String c : candidates) {
-            if (new File(c).isFile()) return c;
-            if (!searched.contains(c)) searched.add(c);
+        String normalized = arg.replace('\\', '/');
+        boolean hasExt = normalized.endsWith(".cang");
+        String withExt = hasExt ? normalized : normalized + ".cang";
+        String flat = withExt.replace('/', File.separatorChar);
+        String candidate;
+        if (hasExt || new File(arg).isAbsolute()) {
+            candidate = flat;
+        } else {
+            candidate = "src" + File.separator + flat;
         }
+        if (new File(candidate).isFile()) return candidate;
         System.err.println("error: cannot find source: " + arg);
-        for (String c : searched) System.err.println("  searched: " + c);
+        System.err.println("  searched: " + candidate);
         System.exit(1);
         return null;
     }
