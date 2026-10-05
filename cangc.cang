@@ -1,0 +1,61 @@
+import cang/io/Process
+import cang/io/File
+import cang/lang/System
+
+# cangc — Cang 编译器启动器
+# 布局约定（相对当前工作目录）：
+#   <cwd>/jar/cang.jar          编译器 jar
+#   <cwd>/openjdk/bin/java.exe  JVM（非 Windows 为 bin/java）
+# 用法与 java -jar cang.jar 完全一致，退出码透传。
+class Main()
+
+String cwd = System.getCwd()
+if (cwd == null) {
+    Stderr.println("cangc: cannot resolve working directory")
+    System.exit(2)
+}
+
+String jre = "openjdk/bin/java.exe"
+if (System.OS_TYPE != "windows") {
+    jre = "openjdk/bin/java"
+}
+String javaExe = cwd + "/" + jre
+String jarPath = cwd + "/jar/cang.jar"
+
+File javaFile = new File(javaExe)
+if (!javaFile.exists()) {
+    Stderr.println("cangc: JVM not found: " + javaExe)
+    System.exit(3)
+}
+File jarFile = new File(jarPath)
+if (!jarFile.exists()) {
+    Stderr.println("cangc: compiler jar not found: " + jarPath)
+    System.exit(4)
+}
+
+# cmd = [javaExe, "-jar", jarPath, <用户参数...>]
+int n = 0
+for (var a : System.ARGS) {
+    n = n + 1
+}
+String[] cmd = new String[n + 2]
+cmd[0] = javaExe
+cmd[1] = "-jar"
+cmd[2] = jarPath
+bool first = true
+int i = 2
+for (var a : System.ARGS) {
+    if (first) {
+        first = false
+    } else {
+        i = i + 1
+        cmd[i] = a
+    }
+}
+
+# 子进程 stdout 逐行转发；stderr 直接继承终端
+Function<Void, String> cb = (line) -> {
+    Stdout.println(line)
+}
+int code = Process.exec(cmd, cb, -1)
+System.exit(code)
