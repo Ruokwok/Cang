@@ -1473,6 +1473,7 @@ public class LLVMGen {
         emitFileRuntime();
         emitScannerRuntime();
         emitProcessRuntime();
+        emitStringBuilderWrappers();
     }
 
     private final Map<String, String> fmtConstants = new LinkedHashMap<>();
@@ -10081,6 +10082,157 @@ pb.append("prl.finish.").append(id).append(":\n");
               .append(pathIdx).append("\n");
         header.append("  ").append(path).append(" = load i8*, i8** ").append(pp).append("\n");
         return path;
+    }
+
+    /**
+     * Wrapper defines for cang/lang/StringBuilder (Design B, same shape as File).
+     * append grows a private byte buffer (double on demand); toString snapshot-copies.
+     */
+    private void emitStringBuilderWrappers() {
+        ClassInfo sbCi = classes.get("cang_lang_StringBuilder");
+        if (sbCi == null) return;
+        Integer capI = sbCi.fieldIndices.get("cap");
+        Integer dataI = sbCi.fieldIndices.get("data");
+        Integer sizeI = sbCi.fieldIndices.get("size");
+        if (capI == null || dataI == null || sizeI == null) return;
+        int capIdx = capI, dataIdx = dataI, sizeIdx = sizeI;
+        String t = "%cang_lang_StringBuilder";
+
+        // ---------- append(String s) ----------
+        int id = labelCount++;
+        header.append("define void @cang_lang_StringBuilder.append(").append(t).append("* %this, i8* %s) {\n");
+        header.append("entry:\n");
+        String dP = "%sb.d." + tmpCount++, sP = "%sb.s." + tmpCount++, cP = "%sb.c." + tmpCount++;
+        header.append("  ").append(dP).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(dataIdx).append("\n");
+        header.append("  ").append(sP).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(sizeIdx).append("\n");
+        header.append("  ").append(cP).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(capIdx).append("\n");
+        String size = "%sb.sz." + tmpCount++, cap = "%sb.cp." + tmpCount++, data = "%sb.dv." + tmpCount++;
+        header.append("  ").append(size).append(" = load i64, i64* ").append(sP).append("\n");
+        header.append("  ").append(cap).append(" = load i64, i64* ").append(cP).append("\n");
+        header.append("  ").append(data).append(" = load i8*, i8** ").append(dP).append("\n");
+        String sNull = "%sb.sn." + tmpCount++;
+        header.append("  ").append(sNull).append(" = icmp eq i8* %s, null\n");
+        header.append("  br i1 ").append(sNull).append(", label %sb.app.done.").append(id)
+              .append(", label %sb.app.nn.").append(id).append("\n");
+        header.append("sb.app.nn.").append(id).append(":\n");
+        String sl = "%sb.sl." + tmpCount++;
+        header.append("  ").append(sl).append(" = call i64 @strlen(i8* %s)\n");
+        String need = "%sb.need." + tmpCount++;
+        header.append("  ").append(need).append(" = add i64 ").append(size).append(", ").append(sl).append("\n");
+        String need1 = "%sb.need1." + tmpCount++;
+        header.append("  ").append(need1).append(" = add i64 ").append(need).append(", 1\n");
+        // grow when the buffer has no data yet (fresh/custom cap) or the request no longer fits
+        String oob = "%sb.oob." + tmpCount++;
+        header.append("  ").append(oob).append(" = icmp ugt i64 ").append(need1).append(", ").append(cap).append("\n");
+        String dNull = "%sb.dn." + tmpCount++;
+        header.append("  ").append(dNull).append(" = icmp eq i8* ").append(data).append(", null\n");
+        String grow = "%sb.gw." + tmpCount++;
+        header.append("  ").append(grow).append(" = or i1 ").append(oob).append(", ").append(dNull).append("\n");
+        header.append("  br i1 ").append(grow).append(", label %sb.app.grow.").append(id)
+              .append(", label %sb.app.ready.").append(id).append("\n");
+        // ---- grow: ncap = max(need1, cap*2, 16); fresh buffer, copy old, free old ----
+        header.append("sb.app.grow.").append(id).append(":\n");
+        String cap2 = "%sb.cap2." + tmpCount++;
+        header.append("  ").append(cap2).append(" = mul i64 ").append(cap).append(", 2\n");
+        String t1 = "%sb.t1." + tmpCount++;
+        header.append("  ").append(t1).append(" = icmp ugt i64 ").append(need1).append(", ").append(cap2).append("\n");
+        String n1 = "%sb.n1." + tmpCount++;
+        header.append("  ").append(n1).append(" = select i1 ").append(t1).append(", i64 ").append(need1)
+              .append(", i64 ").append(cap2).append("\n");
+        String t2 = "%sb.t2." + tmpCount++;
+        header.append("  ").append(t2).append(" = icmp ult i64 ").append(n1).append(", 16\n");
+        String ncap = "%sb.ncap." + tmpCount++;
+        header.append("  ").append(ncap).append(" = select i1 ").append(t2).append(", i64 16, i64 ").append(n1).append("\n");
+        String ndata = "%sb.nd." + tmpCount;
+        header.append("  ").append(ndata).append(" = call i8* @").append(allocFn())
+              .append("(i64 ").append(ncap).append(")\n");
+        tmpCount++;
+        header.append("  br i1 ").append(dNull).append(", label %sb.app.store.").append(id)
+              .append(", label %sb.app.copy.").append(id).append("\n");
+        header.append("sb.app.copy.").append(id).append(":\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(ndata).append(", i8* ")
+              .append(data).append(", i64 ").append(size).append(", i1 false)\n");
+        header.append("  call void @").append(freeFn()).append("(i8* ").append(data).append(")\n");
+        header.append("  br label %sb.app.store.").append(id).append("\n");
+        header.append("sb.app.store.").append(id).append(":\n");
+        header.append("  store i8* ").append(ndata).append(", i8** ").append(dP).append("\n");
+        header.append("  store i64 ").append(ncap).append(", i64* ").append(cP).append("\n");
+        header.append("  br label %sb.app.ready.").append(id).append("\n");
+        // ---- ready: write the segment at [size), NUL-terminate, publish size ----
+        header.append("sb.app.ready.").append(id).append(":\n");
+        String data2 = "%sb.d2." + tmpCount++;
+        header.append("  ").append(data2).append(" = load i8*, i8** ").append(dP).append("\n");
+        String dst = "%sb.dst." + tmpCount++;
+        header.append("  ").append(dst).append(" = getelementptr i8, i8* ").append(data2).append(", i64 ").append(size).append("\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(dst).append(", i8* %s, i64 ")
+              .append(sl).append(", i1 false)\n");
+        String endp = "%sb.end." + tmpCount++;
+        header.append("  ").append(endp).append(" = getelementptr i8, i8* ").append(data2).append(", i64 ")
+              .append(need).append("\n");
+        header.append("  store i8 0, i8* ").append(endp).append("\n");
+        header.append("  store i64 ").append(need).append(", i64* ").append(sP).append("\n");
+        header.append("  br label %sb.app.done.").append(id).append("\n");
+        header.append("sb.app.done.").append(id).append(":\n");
+        header.append("  ret void\n}\n\n");
+
+        // ---------- length() ----------
+        header.append("define i32 @cang_lang_StringBuilder.length(").append(t).append("* %this) {\n");
+        header.append("entry:\n");
+        String lP = "%sb.ls." + tmpCount++;
+        header.append("  ").append(lP).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(sizeIdx).append("\n");
+        String lv = "%sb.lv." + tmpCount++;
+        header.append("  ").append(lv).append(" = load i64, i64* ").append(lP).append("\n");
+        String li = "%sb.li." + tmpCount++;
+        header.append("  ").append(li).append(" = trunc i64 ").append(lv).append(" to i32\n");
+        header.append("  ret i32 ").append(li).append("\n}\n\n");
+
+        // ---------- toString() : snapshot copy ----------
+        int tid = labelCount++;
+        header.append("define i8* @cang_lang_StringBuilder.toString(").append(t).append("* %this) {\n");
+        header.append("entry:\n");
+        String dP2 = "%sb.d." + tmpCount++, sP2 = "%sb.s." + tmpCount++;
+        header.append("  ").append(dP2).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(dataIdx).append("\n");
+        header.append("  ").append(sP2).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(sizeIdx).append("\n");
+        String sz = "%sb.tz." + tmpCount++, dsrc = "%sb.td." + tmpCount++;
+        header.append("  ").append(sz).append(" = load i64, i64* ").append(sP2).append("\n");
+        header.append("  ").append(dsrc).append(" = load i8*, i8** ").append(dP2).append("\n");
+        String sz1 = "%sb.tz1." + tmpCount++;
+        header.append("  ").append(sz1).append(" = add i64 ").append(sz).append(", 1\n");
+        String out = "%sb.out." + tmpCount;
+        header.append("  ").append(out).append(" = call i8* @").append(allocFn())
+              .append("(i64 ").append(sz1).append(")\n");
+        tmpCount++;
+        String szZ = "%sb.tzz." + tmpCount++;
+        header.append("  ").append(szZ).append(" = icmp eq i64 ").append(sz).append(", 0\n");
+        header.append("  br i1 ").append(szZ).append(", label %sb.ts.zero.").append(tid)
+              .append(", label %sb.ts.copy.").append(tid).append("\n");
+        header.append("sb.ts.zero.").append(tid).append(":\n");
+        header.append("  store i8 0, i8* ").append(out).append("\n");
+        header.append("  br label %sb.ts.fin.").append(tid).append("\n");
+        header.append("sb.ts.copy.").append(tid).append(":\n");
+        header.append("  call void @llvm.memcpy.p0i8.p0i8.i64(i8* ").append(out).append(", i8* ")
+              .append(dsrc).append(", i64 ").append(sz).append(", i1 false)\n");
+        String oend = "%sb.toe." + tmpCount++;
+        header.append("  ").append(oend).append(" = getelementptr i8, i8* ").append(out).append(", i64 ").append(sz).append("\n");
+        header.append("  store i8 0, i8* ").append(oend).append("\n");
+        header.append("  br label %sb.ts.fin.").append(tid).append("\n");
+        header.append("sb.ts.fin.").append(tid).append(":\n");
+        header.append("  ret i8* ").append(out).append("\n}\n\n");
+
+        // ---------- clear() : size=0, keep the buffer ----------
+        header.append("define void @cang_lang_StringBuilder.clear(").append(t).append("* %this) {\n");
+        header.append("entry:\n");
+        String cP2 = "%sb.cs." + tmpCount++;
+        header.append("  ").append(cP2).append(" = getelementptr ").append(t).append(", ").append(t)
+              .append("* %this, i32 0, i32 ").append(sizeIdx).append("\n");
+        header.append("  store i64 0, i64* ").append(cP2).append("\n");
+        header.append("  ret void\n}\n\n");
     }
 
     /** Wrapper defines for all 20 native File methods — these satisfy the generic call sites. */

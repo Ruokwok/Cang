@@ -1,0 +1,18 @@
+namespace cang/lang
+
+# StringBuilder - 高效字符串构建器（编译器内建，需 import cang/lang/StringBuilder）
+# append 摊还 O(len(s))、容量不足翻倍；最终 toString 拷贝出不可变快照。
+# cap 为预留字节容量；data/size 是内部状态，请勿直接修改。
+class StringBuilder(long cap = 0, string data = null, long size = 0)
+
+# 追加一个字符串（null 视为空操作）
+native func void append(String s)
+
+# 当前字节数（超出 int 范围会截断）
+native func int length()
+
+# 拷贝出不可变 String 快照（之后继续 append 不影响已有快照）
+native func String toString()
+
+# 清空内容（保留已分配容量以便复用）
+native func void clear()

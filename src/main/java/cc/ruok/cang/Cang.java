@@ -564,7 +564,8 @@ public class Cang {
         "cang/lang/Dict.cang",
         "cang/io/File.cang",
         "cang/io/Scanner.cang",
-        "cang/io/Process.cang"
+        "cang/io/Process.cang",
+        "cang/lang/StringBuilder.cang"
     };
 
     /**
