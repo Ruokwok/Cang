@@ -86,6 +86,11 @@ public enum TokenType {
         return KEYWORDS.get(text);
     }
 
+    /** 关键字拼写集合（只读），供 IDE 补全使用。 */
+    public static java.util.Set<String> keywords() {
+        return java.util.Collections.unmodifiableSet(KEYWORDS.keySet());
+    }
+
     public static boolean isTypeKeyword(TokenType type) {
         return type == T_BYTE || type == T_INT || type == T_LONG ||
                type == T_FLOAT || type == T_DOUBLE || type == T_BOOL ||
