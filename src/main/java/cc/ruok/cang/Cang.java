@@ -841,18 +841,31 @@ public class Cang {
      * legacy runtime/boehm/<os>-amd64/lib/libgc.a layout.
      */
     private static String findGcLib(String target, String override) {
-        // 1) explicit --gc-lib: a file as-is, or a directory holding libgc.a
+        String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
+        String altKey = target.equals("windows") ? "windows" : osKey;
+        String[] libNames = { osKey + "_amd64_libgc.a", altKey + "_amd64_libgc.a" };
+        // 1) explicit --gc-lib / CompileOptions.gcLibDir: a file as-is, or a directory:
+        //    <dir>/libgc.a, <dir>/lib/libgc.a, or <dir>/lib/<os>_amd64_libgc.a (project layout)
         if (override != null) {
             File f = new File(override);
             if (f.isFile()) return f.getAbsolutePath();
             File inDir = new File(f, "libgc.a");
             if (inDir.isFile()) return inDir.getAbsolutePath();
+            File inLibGeneric = new File(f, "lib" + File.separator + "libgc.a");
+            if (inLibGeneric.isFile()) return inLibGeneric.getAbsolutePath();
+            for (String name : libNames) {
+                File inLibDir = new File(f, "lib" + File.separator + name);
+                if (inLibDir.isFile()) {
+                    try {
+                        return inLibDir.getCanonicalPath();
+                    } catch (IOException e) {
+                        return inLibDir.getAbsolutePath();
+                    }
+                }
+            }
         }
         String cwd = System.getProperty("user.dir");
-        // 2) lib/ layout: window_/linux_/mac_ + amd64 (also accept the 'windows' spelling)
-        String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
-        String altKey = target.equals("windows") ? "windows" : osKey;
-        String[] libNames = { osKey + "_amd64_libgc.a", altKey + "_amd64_libgc.a" };
+        // 2) cwd lib/ layout: window_/linux_/mac_ + amd64 (also accept the 'windows' spelling)
         String[] bases = { cwd, cwd + File.separator + ".." };
         for (String base : bases) {
             for (String name : libNames) {
