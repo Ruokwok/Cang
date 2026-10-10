@@ -319,9 +319,11 @@ public class LLVMGen {
             if (m instanceof ClassDecl && ((ClassDecl) m).isEntryPoint) { hasEntryClass = true; break; }
         }
 
+        String firstClassName = null;
         for (AST member : program.members) {
             if (member instanceof ClassDecl) {
                 ClassDecl cd = (ClassDecl) member;
+                if (firstClassName == null) firstClassName = cd.name;
                 if (!cd.genericParams.isEmpty()) {
                     genericTemplates.put(cd.name, cd);
                     // Un-specialized template: never collected nor generated — its method bodies
@@ -417,6 +419,11 @@ public class LLVMGen {
         } else if (!mainStatements.isEmpty()) {
             topLevelStmts.addAll(mainStatements);
             generateAutoMain();
+        } else if (firstClassName != null) {
+            // A class-bearing main file without a usable entry main errors here — covers
+            // classes skipped as generic templates (entryClass stays null) that would
+            // otherwise emit a main-less module and only fail at the linker.
+            throw new RuntimeException("no entry point: class '" + firstClassName + "'");
         }
 
         return header.toString() + "\n" + body.toString() + extraDefs.toString();
