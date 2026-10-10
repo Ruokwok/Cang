@@ -429,9 +429,8 @@ public class Cang {
             // Move topLevelBody members to class members (for imported files)
             if (classDecl != null && !classDecl.topLevelBody.isEmpty()) {
                 for (AST stmt : classDecl.topLevelBody) {
-                    if (stmt instanceof AST.FuncDecl) {
-                        classDecl.members.add(stmt);
-                    } else if (stmt instanceof AST.FieldDecl) {
+                    if (stmt instanceof AST.FuncDecl || stmt instanceof AST.FieldDecl
+                            || stmt instanceof AST.ConstructorDecl) {
                         classDecl.members.add(stmt);
                     }
                 }

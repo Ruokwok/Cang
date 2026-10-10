@@ -36,9 +36,9 @@ public class Parser {
         ClassDecl currentClass = null;
         while (!check(TokenType.EOF)) {
             if (check(TokenType.CLASS) || (check(TokenType.ABSTRACT) && peek(1).type == TokenType.CLASS)) {
-                // Save previous class if exists
+                // One class per file (class-model reform): a second class is an error.
                 if (currentClass != null) {
-                    members.add(currentClass);
+                    error("Only one class per file is allowed; the class body extends from the class declaration to the end of the file");
                 }
                 // New class (possibly 'abstract class') - not entry point initially
                 AST parsed = parseTopLevel();
@@ -50,14 +50,14 @@ public class Parser {
             } else if (currentClass != null && (check(TokenType.FUNC)
                     || (check(TokenType.ABSTRACT) && peek(1).type == TokenType.FUNC))) {
                 // Function (or abstract func) after class → attach as method
-                currentClass.topLevelBody.add(parseTopLevel());
+                currentClass.topLevelBody.add(parseTopLevel(true));
             } else if (currentClass != null && check(TokenType.STATIC)) {
                 // static function after class → attach as method
-                currentClass.topLevelBody.add(parseTopLevel());
+                currentClass.topLevelBody.add(parseTopLevel(true));
             } else {
                 // Top-level statement (if, var, expression, etc.)
                 if (currentClass != null) {
-                    currentClass.topLevelBody.add(parseTopLevel());
+                    currentClass.topLevelBody.add(parseTopLevel(true));
                 } else {
                     members.add(parseTopLevel());
                 }
@@ -272,6 +272,11 @@ public class Parser {
         // In a class body a non-method type start is a FIELD, not a statement
         if (inClass && isTypeStart()) {
             return parseClassMember();
+        }
+        // Class body holds only fields and methods; statements live inside a method or
+        // static void main(String[] args) (class-model reform).
+        if (inClass) {
+            error("statements are not allowed in the class body; move them into a method or static void main(String[] args) (at line " + current().line + ")");
         }
         // Top-level statement (var decl, expression, if, while, etc.)
         return parseStatement();

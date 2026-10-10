@@ -4323,6 +4323,17 @@ public class LLVMGen {
                     return new LLVMValue(loaded, llvmType);
                 }
             }
+            // Java-style bare field access inside instance methods / init / main
+            LLVMValue faddr = instanceFieldAddr(node.name);
+            if (faddr != null) {
+                ClassInfo fci = classes.get(currentClassName);
+                String cangT = fci.fieldTypes.get(fci.fieldIndices.get(node.name) - 1);
+                String ldy = "%fldld." + tmpCount++;
+                String base = faddr.type.substring(0, faddr.type.length() - 1);
+                body.append("  ").append(ldy).append(" = load ").append(base)
+                     .append(", ").append(faddr.type).append(" ").append(faddr.value).append("\n");
+                return new LLVMValue(ldy, base, semanticKindOf(cangT));
+            }
             throw new RuntimeException("Undefined variable: " + node.name + " at line " + node.line);
         }
         // Load the value
@@ -4332,6 +4343,22 @@ public class LLVMGen {
         return new LLVMValue(loaded, val.type, val.semanticType);
     }
 
+    /** Address of an instance field of the class being compiled (Java-style bare field access),
+     *  or null when there is no `this` in scope / the field does not exist. */
+    private LLVMValue instanceFieldAddr(String name) {
+        if (currentClassName == null) return null;
+        ClassInfo ci = classes.get(currentClassName);
+        if (ci == null) return null;
+        Integer idx = ci.fieldIndices.get(name);
+        if (idx == null) return null;
+        LLVMValue thiz = scope.lookup("this");
+        if (thiz == null) return null;
+        String ptr = "%fld." + tmpCount++;
+        body.append("  ").append(ptr).append(" = getelementptr ").append(ci.llvmName)
+             .append(", ").append(ci.llvmName).append("* ").append(thiz.value)
+             .append(", i32 0, i32 ").append(idx).append("\n");
+        return new LLVMValue(ptr, toLLVMType(ci.fieldTypes.get(idx - 1)) + "*");
+    }
     private LLVMValue generateBinary(BinaryExpr node) {
         LLVMValue left = generateExpr(node.left);
 
@@ -4803,6 +4830,7 @@ public class LLVMGen {
         }
         Identifier id = (Identifier) target;
         LLVMValue ptr = scope.lookup(id.name);
+        if (ptr == null) ptr = instanceFieldAddr(id.name);
         if (ptr == null) throw new RuntimeException("Undefined variable: " + id.name + " (at line " + target.line + ")");
 
         String loaded = "%inc.old." + tmpCount++;
@@ -4871,6 +4899,20 @@ public class LLVMGen {
                     body.append("  store ").append(llvmT).append(" ").append(casted)
                          .append(", ").append(llvmT).append("* ").append(gname).append("\n");
                     return new LLVMValue(casted, llvmT);
+                }
+                // Java-style bare field assignment (e.g. inside init)
+                LLVMValue faddrA = instanceFieldAddr(id.name);
+                if (faddrA != null) {
+                    ClassInfo fciA = classes.get(currentClassName);
+                    String llvmTA = toLLVMType(fciA.fieldTypes.get(fciA.fieldIndices.get(id.name) - 1));
+                    if (!assignableTo(llvmTA, val)) {
+                        throw new RuntimeException("Cannot assign " + cangTypeFromLLVMFull(val.type)
+                            + " to " + cangTypeFromLLVMFull(llvmTA) + " (at line " + node.line + ")");
+                    }
+                    String castedF = castValue(val, llvmTA);
+                    body.append("  store ").append(llvmTA).append(" ").append(castedF)
+                         .append(", ").append(llvmTA).append("* ").append(faddrA.value).append("\n");
+                    return new LLVMValue(castedF, llvmTA);
                 }
                 throw new RuntimeException("Undefined variable: " + id.name + " (at line " + node.line + ")");
             }
