@@ -319,11 +319,18 @@ public class LLVMGen {
             if (m instanceof ClassDecl && ((ClassDecl) m).isEntryPoint) { hasEntryClass = true; break; }
         }
 
-        String firstClassName = null;
+        // Main file's own classes only (isEntryPoint): imported classes come first in the
+        // merged list and must never be blamed for a missing entry.
+        String mainClassName = null;
+        int mainClassLine = 1;
+        int firstTopFuncLine = 0;
         for (AST member : program.members) {
             if (member instanceof ClassDecl) {
                 ClassDecl cd = (ClassDecl) member;
-                if (firstClassName == null) firstClassName = cd.name;
+                if (cd.isEntryPoint && mainClassName == null) {
+                    mainClassName = cd.name;
+                    mainClassLine = cd.line;
+                }
                 if (!cd.genericParams.isEmpty()) {
                     genericTemplates.put(cd.name, cd);
                     // Un-specialized template: never collected nor generated — its method bodies
@@ -350,6 +357,7 @@ public class LLVMGen {
                 classDecls.add(cd);
                 collectClass(cd);
             } else if (member instanceof FuncDecl) {
+                if (firstTopFuncLine == 0) firstTopFuncLine = member.line;
                 collectFunction((FuncDecl) member, null);
                 topLevelFuncs.add(member);
             } else if (member instanceof NamespaceDecl || member instanceof ImportDecl) {
@@ -412,18 +420,24 @@ public class LLVMGen {
         if (entryClass != null) {
             FuncInfo mainFi = findStaticMain(entryClass);
             if (mainFi == null) {
-                throw new RuntimeException("no entry point: class '"
-                    + entryClass.name + "'");
+                // Pin to the class declaration line (the generate() wrapper only fills in
+                // lastStmtLine when no at-line is present).
+                throw new RuntimeException("class '" + entryClass.name
+                    + "' has no main method (at line " + entryClass.line + ")");
             }
             generateMainEntry(mainFi);
         } else if (!mainStatements.isEmpty()) {
             topLevelStmts.addAll(mainStatements);
             generateAutoMain();
-        } else if (firstClassName != null) {
-            // A class-bearing main file without a usable entry main errors here — covers
-            // classes skipped as generic templates (entryClass stays null) that would
-            // otherwise emit a main-less module and only fail at the linker.
-            throw new RuntimeException("no entry point: class '" + firstClassName + "'");
+        } else if (mainClassName != null) {
+            // Class-bearing main file whose class never became the entry class (generic
+            // template) — error here instead of emitting a main-less module.
+            throw new RuntimeException("class '" + mainClassName
+                + "' has no main method (at line " + mainClassLine + ")");
+        } else if (!topLevelFuncs.isEmpty()) {
+            // Class-less file with only function definitions: nothing to run.
+            throw new RuntimeException("no main method (at line "
+                + (firstTopFuncLine > 0 ? firstTopFuncLine : 1) + ")");
         }
 
         return header.toString() + "\n" + body.toString() + extraDefs.toString();
