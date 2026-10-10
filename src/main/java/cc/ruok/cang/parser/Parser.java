@@ -291,12 +291,12 @@ public class Parser {
         boolean isPrivate = false;
         String name;
         if (check(TokenType.IDENT) && current().value.equals("_")) {
+            error("the class-name '_' modifier was removed; use a private constructor _init() instead");
             advance();
-            isPrivate = true;
             name = expect(TokenType.IDENT).value;
         } else if (check(TokenType.IDENT) && current().value.length() > 1
                 && current().value.startsWith("_")) {
-            isPrivate = true;
+            error("the class-name '_' modifier was removed; use a private constructor _init() instead");
             name = advance().value.substring(1);
         } else if (check(TokenType.IDENT)) {
             name = advance().value;
@@ -324,27 +324,20 @@ public class Parser {
         String superClass = null;
         List<AST> superArgs = new ArrayList<>();
 
-        // Constructor params: class Name(params)
+        // Constructor params removed with the class-line form: fields + init(...) live
+        // in the class body now (class-model reform, batch 4).
         List<Parameter> ctorParams = new ArrayList<>();
         if (check(TokenType.LPAREN)) {
-            ctorParams = parseParams();
+            error("class '" + name + "' cannot declare constructor parameters; declare fields in the class body and write init(...) instead");
         }
 
         // Inheritance: : Parent(args)
         if (check(TokenType.COLON)) {
             advance();
             superClass = expect(TokenType.IDENT).value;
-            // Parent constructor args: Parent(args)
+            // Parent constructor args moved to super() inside init(...) (batch 4).
             if (check(TokenType.LPAREN)) {
-                advance();
-                if (!check(TokenType.RPAREN)) {
-                    superArgs.add(parseExpression());
-                    while (check(TokenType.COMMA)) {
-                        advance();
-                        superArgs.add(parseExpression());
-                    }
-                }
-                expect(TokenType.RPAREN);
+                error("parent constructor arguments belong in super() inside init(...); ': " + superClass + "(...)' was removed");
             }
         }
 
@@ -406,9 +399,13 @@ public class Parser {
             error("abstract is only valid on 'func' declarations");
         }
 
-        // constructor: ClassName(params) { body }
+        // constructor: init(params) { body } / _init(params) { body } (batch 4:
+        // the ClassName(params) and class-line forms were removed)
         if (!isStatic && check(TokenType.IDENT) && peek(1).type == TokenType.LPAREN) {
             String ctorName = advance().value;
+            if (!ctorName.equals("init") && !ctorName.equals("_init")) {
+                error("constructors must be named init(...) or _init(...); '" + ctorName + "(...)' was removed");
+            }
             List<Parameter> params = parseParams();
             AST body = parseBlock();
             return new ConstructorDecl(ctorName, params, body, line);

@@ -4,8 +4,11 @@ namespace cang/io
 # 用法：Scanner.get() 取单例 → readLine() 整行读 / readKey() 单键读（返回键码）
 # 键码与 KEY_* 常量比较：enter/esc/tab/方向键等（Windows 走 _getch 全功能；
 # POSIX v1 走 getchar 行缓冲降级——特殊键需终端 raw 模式，见文档）。
-# 外部不可 new（类名 _ 修饰符 = 私有构造）。
-class _ Scanner()
+# 外部不可 new（_init = 私有构造）。
+class Scanner
+
+    _init() {
+    }
 
 # 单例：静态字段 + 静态工厂
 static Scanner instance = null

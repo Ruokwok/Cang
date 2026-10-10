@@ -38,6 +38,7 @@ public class LLVMGen {
         Map<String, Integer> fieldIndices = new LinkedHashMap<>();
         List<Parameter> ctorParams = new ArrayList<>();
         List<FieldDecl> staticFields = new ArrayList<>(); // static fields (global)
+        Map<String, FieldDecl> fieldDecls = new LinkedHashMap<>(); // own instance fields by name (declared initializers)
         List<AST> superArgs = new ArrayList<>(); // parent constructor args
         boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
         boolean isPrivateCtor; // '_' modifier on the class name: new only inside the class itself
@@ -334,20 +335,13 @@ public class LLVMGen {
                 if (isEntry) {
                     entryClass = cd;
                 }
-                // Move FuncDecl/FieldDecl/ConstructorDecl to members; keep statements in topLevelBody for entry
+                // Move declarations to members. The parser rejects statements in the class
+                // body (batch 4), so topLevelBody holds declarations only.
                 for (AST stmt : new ArrayList<>(cd.topLevelBody)) {
                     if (stmt instanceof FuncDecl || stmt instanceof FieldDecl || stmt instanceof ConstructorDecl) {
                         cd.members.add(stmt);
                         cd.topLevelBody.remove(stmt);
-                    } else if (!isEntry) {
-                        // debug.md #36: only the entry class's statements run (they become the
-                        // main body); statements hanging on any later class would land in
-                        // mainStatements, which is never generated once an entry exists —
-                        // silently dropped. Fail loudly instead.
-                        throw new RuntimeException("statements must appear right after the entry class (first class in file); class '"
-                            + cd.name + "' is not the entry class (at line " + stmt.line + ")");
                     }
-                    // Entry class: statements stay in topLevelBody
                 }
                 classDecls.add(cd);
                 collectClass(cd);
@@ -361,8 +355,7 @@ public class LLVMGen {
                 // Top-level statement outside class — legal only in a class-less program;
                 // with a class present it would be silently dropped (debug.md #36 pair).
                 if (hasClassDecl) {
-                    throw new RuntimeException("statements must appear after the first class (or in a class-less program); move this statement below the entry class (at line "
-                        + member.line + ")");
+                    throw new RuntimeException("statements before the class are only allowed in a class-less program; move this statement into static void main(String[] args) (at line " + member.line + ")");
                 }
                 mainStatements.add(member);
             }
@@ -409,15 +402,16 @@ public class LLVMGen {
             generateFunction((FuncDecl) func, null);
         }
 
-        // Generate main: static void main(String[] args) when present, else the legacy
-        // entry-class body / auto-wrapped top-level statements (dual track until batch 4).
+        // Generate main: static void main(String[] args). A class-bearing program without
+        // one is an error (batch 4); class-less programs keep the auto-wrapped top-level
+        // statements as their main body.
         if (entryClass != null) {
             FuncInfo mainFi = findStaticMain(entryClass);
-            if (mainFi != null) {
-                generateMainEntry(mainFi);
-            } else {
-                generateEntryPointMain(entryClass);
+            if (mainFi == null) {
+                throw new RuntimeException("no entry point: declare 'static void main(String[] args)' in class '"
+                    + entryClass.name + "'");
             }
+            generateMainEntry(mainFi);
         } else if (!mainStatements.isEmpty()) {
             topLevelStmts.addAll(mainStatements);
             generateAutoMain();
@@ -670,6 +664,19 @@ public class LLVMGen {
                 // Reference concretes (String / classes / arrays / Function) keep null.
             }
         }
+        // Same guard for body field initializers: `T v = null` in a class field (batch-4
+        // field model) specialized to a value type must store a zero, not i32 null.
+        if (node instanceof FieldDecl) {
+            FieldDecl fd = (FieldDecl) node;
+            if (fd.init instanceof NullLit && parameter.equals(fd.type)) {
+                if (concrete.equals("bool")) {
+                    fd.init = new BoolLit(false, fd.line);
+                } else if (concrete.equals("int") || concrete.equals("byte") || concrete.equals("long")
+                        || concrete.equals("float") || concrete.equals("double")) {
+                    fd.init = new IntLit("0", fd.line);
+                }
+            }
+        }
         for (java.lang.reflect.Field f : node.getClass().getFields()) {
             try {
                 Object v = f.get(node);
@@ -888,6 +895,7 @@ public class LLVMGen {
                     info.fieldNames.add(f.name);
                     info.fieldTypes.add(f.type);
                     info.fieldIndices.put(f.name, idx++);
+                    info.fieldDecls.put(f.name, f);
                 }
             }
         }
@@ -1607,6 +1615,37 @@ public class LLVMGen {
     }
 
     /**
+     * Store each OWN field's declared initializer (or the type default when the field
+     * declares none). Parent fields are initialized by the parent constructor. Runs after
+     * super() and the type id, before the constructor body - Java initialization order.
+     */
+    private void emitOwnFieldInitializers(ClassInfo ci) {
+        if (ci == null) return;
+        int parentFieldCount = 0;
+        if (ci.parentName != null) {
+            ClassInfo parentInfo = classes.get(ci.parentName);
+            if (parentInfo != null) parentFieldCount = parentInfo.fieldNames.size();
+        }
+        for (int i = parentFieldCount; i < ci.fieldNames.size(); i++) {
+            String fieldName = ci.fieldNames.get(i);
+            String fieldType = ci.fieldTypes.get(i);
+            String llvmType = toLLVMType(fieldType);
+            String ptr = "%f.init." + fieldName + "." + tmpCount++;
+            body.append("  ").append(ptr).append(" = getelementptr ").append(ci.llvmName)
+                 .append(", ").append(ci.llvmName).append("* %this, i32 0, i32 ").append(1 + i).append("\n");
+            FieldDecl fd = ci.fieldDecls.get(fieldName);
+            String stored;
+            if (fd != null && fd.init != null) {
+                stored = castValue(generateExpr(fd.init), llvmType);
+            } else {
+                stored = defaultValueForType(fieldType);
+            }
+            body.append("  store ").append(llvmType).append(" ").append(stored)
+                 .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
+        }
+    }
+
+    /**
      * Generate implicit constructor: assigns params to fields
      */
     private void generateImplicitCtor(ClassDecl decl, ClassInfo ci, String fullName) {
@@ -1690,6 +1729,9 @@ public class LLVMGen {
             body.append("  store ").append(pType).append(" ").append(loaded)
                 .append(", ").append(pType).append("* %f").append(p.name).append("\n");
         }
+
+        // Own fields: declared initializers or type defaults (parent set its own in super()).
+        emitOwnFieldInitializers(ci);
 
         endRegionCleanup();
         emitGcFramePop();
@@ -1794,26 +1836,9 @@ public class LLVMGen {
              .append(fullName).append(", %").append(fullName).append("* %this, i32 0, i32 0\n");
         body.append("  store i32 ").append(ci != null ? ci.typeId : 0).append(", i32* ").append(typePtr).append("\n");
 
-        // Initialize fields to their declared defaults (index starts at 1: slot 0 is the type id)
-        if (ci != null) {
-            int parentFieldCount = 0;
-            if (ci.parentName != null) {
-                ClassInfo parentInfo = classes.get(ci.parentName);
-                if (parentInfo != null) parentFieldCount = parentInfo.fieldNames.size();
-            }
-            // fieldNames = parent fields first, then own: struct index is 1 + position.
-            // Own fields only — parent defaults belong to the parent constructor.
-            for (int i = parentFieldCount; i < ci.fieldNames.size(); i++) {
-                String fieldType = ci.fieldTypes.get(i);
-                String defaultVal = defaultValueForType(fieldType);
-                String ptr = "%f." + ci.fieldNames.get(i);
-                body.append("  ").append(ptr).append(" = getelementptr ").append(ci.llvmName)
-                     .append(", ").append(ci.llvmName).append("* %this, i32 0, i32 ")
-                     .append(1 + i).append("\n");
-                body.append("  store ").append(toLLVMType(fieldType)).append(" ").append(defaultVal)
-                     .append(", ").append(toLLVMType(fieldType)).append("* ").append(ptr).append("\n");
-            }
-        }
+        // Own fields: declared initializers (or type defaults). Parent fields belong to
+        // the parent constructor - Java initialization order: super() -> fields -> body.
+        emitOwnFieldInitializers(ci);
 
         // Generate body (a leading SuperCall statement is a no-op — it was emitted above)
         generateBlockBody((Block) decl.body);
@@ -8047,85 +8072,6 @@ public class LLVMGen {
         scope = null;
     }
 
-    /**
-     * Generate main for entry-point class (class with no braces).
-     * Params become local variables initialized with defaults.
-     * Rest of file is the body.
-     */
-    private void generateEntryPointMain(ClassDecl entryClass) {
-        body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
-        body.append("entry:\n");
-        emitStackBaseSet(body, "main");
-        if (gcEnabled) body.append("  call void @GC_init()\n");
-
-        scope = new Scope(null);
-        tmpCount = 0;
-        currentFuncReturnType = "int";
-        emitGcFrameSetup();
-
-        // Entry-class instance for top-level `this`: the rest of the file is the entry
-        // instance's body, so this:: method references (e.g. task(this::run)) work at top level.
-        ClassInfo entryCi = classes.get(entryClass.name);
-        if (entryCi != null) {
-            String eSizeGep = "%entry.obj.size." + tmpCount++;
-            body.append("  ").append(eSizeGep).append(" = getelementptr ").append(entryCi.llvmName)
-                 .append(", ").append(entryCi.llvmName).append("* null, i32 1\n");
-            String eSize = "%entry.obj.sizeof." + tmpCount++;
-            body.append("  ").append(eSize).append(" = ptrtoint ").append(entryCi.llvmName)
-                 .append("* ").append(eSizeGep).append(" to i64\n");
-            String eRaw = "%entry.obj.raw." + tmpCount++;
-            body.append("  ").append(eRaw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(eSize).append(")\n");
-            String eObj = "%entry.obj." + tmpCount++;
-            body.append("  ").append(eObj).append(" = bitcast i8* ").append(eRaw).append(" to ").append(entryCi.llvmName).append("*\n");
-            String eTid = "%entry.obj.tid." + tmpCount++;
-            body.append("  ").append(eTid).append(" = getelementptr ").append(entryCi.llvmName)
-                 .append(", ").append(entryCi.llvmName).append("* ").append(eObj).append(", i32 0, i32 0\n");
-            body.append("  store i32 ").append(entryCi.typeId).append(", i32* ").append(eTid).append("\n");
-            scope.define("this", new LLVMValue(eObj, entryCi.llvmName + "*"));
-            // Top-level code is the entry instance's body: allow this:: references.
-            currentClassName = entryCi.fullName;
-        }
-
-        // Allocate and initialize parameters with default values
-        for (Parameter p : entryClass.ctorParams) {
-            String llvmType = toLLVMType(p.type);
-            String ptr = "%v." + p.name;
-            body.append("  ").append(ptr).append(" = alloca ").append(llvmType).append("\n");
-            scope.define(p.name, new LLVMValue(ptr, llvmType,
-                semanticKindOf(p.type)));
-            registerGcRoot(ptr, llvmType);
-            if (p.type.startsWith("Array<") && p.type.endsWith(">")) {
-                trackArrayVar(p.name, p.type.substring(6, p.type.length() - 1));
-            }
-
-            if (p.defaultValue != null) {
-                LLVMValue defVal = generateExpr(p.defaultValue);
-                String castedDefault = castValue(defVal, llvmType);
-                body.append("  store ").append(llvmType).append(" ")
-                     .append(castedDefault)
-                     .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
-            } else {
-                body.append("  store ").append(llvmType).append(" ")
-                     .append(defaultValueForType(p.type))
-                     .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
-            }
-        }
-
-        // Build System.ARGS before user code runs
-        emitArgsArrayInit();
-
-        // Generate body (rest of file)
-        for (AST stmt : entryClass.topLevelBody) {
-            generateStmt(stmt);
-        }
-
-        emitGcFramePop();
-        emitThreadBlockJoins();
-        emitRegisteredThreadJoins();
-        body.append("  ret i32 0\n");
-        body.append("}\n\n");
-        scope = null;
-    }
 
     // ==================== Type utilities ====================
 

@@ -10,7 +10,9 @@ namespace cang/lang
 
 import cang/lang/Error
 
-class List<T>(T[] data = new T[10], int size = 0)
+class List<T>
+    T[] data = new T[10];
+    int size = 0;
 
 # 元素个数
 func int size() {

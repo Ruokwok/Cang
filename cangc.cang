@@ -11,7 +11,8 @@ import cang/lang/System
 # 用法与 java -jar cang.jar 完全一致，退出码透传；
 # -v 归一为 --version 后转发（打印编译器版本）；
 # -h/--help 或无参数启动时打印本帮助（无参 exit 1，显式 help exit 0）。
-class Main()
+class Main
+static func void main(String[] args) {
 
 # ---- help / version 拦截（不需要 jar/JVM，最先处理） ----
 bool showHelp = false
@@ -156,3 +157,4 @@ Function<Void, String> cb = (line) -> {
 }
 int code = Process.exec(cmd, cb, -1)
 System.exit(code)
+}

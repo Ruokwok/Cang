@@ -2,7 +2,15 @@ namespace cang/lang
 
 # String - 字符串类
 # 编译器内置，无需 import
-class String(str s = '')
+class String
+    str s = '';
+
+    init() {
+    }
+
+    init(str s) {
+        this.s = s;
+    }
 
 # 字符串长度
 native func int length()

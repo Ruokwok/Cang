@@ -2,7 +2,15 @@ namespace cang/io
 
 # File - 文件对象，获取方式参考 Java：new File("src/abc.txt")
 # 相对路径的根目录为程序运行目录（进程当前工作目录）。
-class File(String path = "")
+class File
+    String path = "";
+
+    init() {
+    }
+
+    init(String path) {
+        this.path = path;
+    }
 
 # 系统路径分隔符：windows 为 \ ，linux/macos 为 /
 static final native String separator

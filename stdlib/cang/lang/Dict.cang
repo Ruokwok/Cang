@@ -11,7 +11,10 @@ namespace cang/lang
 
 import cang/lang/Error
 
-class Dict<K, V>(K[] keys = new K[8], V[] vals = new V[8], int count = 0)
+class Dict<K, V>
+    K[] keys = new K[8];
+    V[] vals = new V[8];
+    int count = 0;
 
 # 键值个数
 func int size() {
