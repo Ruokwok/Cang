@@ -45,6 +45,7 @@ public class Cang {
         String gccPath = "gcc";
         boolean gc = true;          // Boehm GC is on by default
         String gcLibDir = null;
+        String outputName = null;   // -o / --output: executable name (.exe optional)
 
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
@@ -56,11 +57,26 @@ public class Cang {
                 case "--gc": gc = true; break;
                 case "--no-gc": gc = false; break;
                 case "--gc-lib": gcLibDir = requireValue(args, ++i, "--gc-lib", "<dir>"); break;
+                case "-o":
+                case "--output": outputName = requireValue(args, ++i, "-o", "<name>"); break;
                 default:
                     System.err.println("error: unknown option '" + args[i] + "'");
                     printUsage();
                     System.exit(1);
             }
+        }
+
+        if (outputName != null) {
+            if (outputName.toLowerCase().endsWith(".exe")) {
+                outputName = outputName.substring(0, outputName.length() - ".exe".length());
+            }
+            if (outputName.isEmpty()) {
+                System.err.println("error: -o requires a non-empty name");
+                System.exit(1);
+            }
+            outputBaseOverride = outputName.contains("/") || outputName.contains("\\")
+                    ? outputName
+                    : "target" + File.separator + outputName;
         }
 
         sourceFile = filename;
@@ -148,6 +164,7 @@ public class Cang {
         System.err.println("  --gcc <path>       gcc executable");
         System.err.println("  --gc / --no-gc     Boehm GC on (default) / manual malloc-free");
         System.err.println("  --gc-lib <dir>     override libgc lookup directory");
+        System.err.println("  -o, --output <name>  output executable name (default: source name; .exe optional)");
     }
 
     private static String compile(String filename, String code, boolean noLink, String target, String architecture, boolean gc) throws IOException {
@@ -929,8 +946,19 @@ public class Cang {
         return null;
     }
 
-    /** Build artifacts always go to target/<source name> (e.g. target/Main.exe). */
+    /** -o / --output override: when set, every artifact (.ll/.o/exe) uses this base. */
+    private static String outputBaseOverride = null;
+
+    /** Build artifacts go to target/<source name> (e.g. target/Main.exe),
+     *  or to the -o/--output base when given. */
     private static String outputFileBase(String sourceFile) {
+        if (outputBaseOverride != null) {
+            try {
+                String parent = new File(outputBaseOverride).getParent();
+                if (parent != null && !parent.isEmpty()) Files.createDirectories(Path.of(parent));
+            } catch (IOException ignored) {}
+            return outputBaseOverride;
+        }
         String simple = new File(sourceFile).getName();
         if (simple.endsWith(".cang")) simple = simple.substring(0, simple.length() - ".cang".length());
         try {

@@ -167,6 +167,8 @@ cang test/example.cang --target windows --arch amd64
 cang test/example.cang --target linux --arch amd64
 cang test/example.cang --target linux --arch aarch64
 cang test/example.cang --target macos --arch amd64
+cang test/example.cang -o myapp            # 指定可执行文件名（默认与源文件同名；.exe 可省略）
+cang test/example.cang --output out\demo   # 带路径的输出名（目录自动创建）
 ```
 
 `cang` 是仓库根目录的启动脚本（`cang.cmd` / `cang`）；没有该命令时等价于：

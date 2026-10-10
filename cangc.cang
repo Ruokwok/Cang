@@ -45,7 +45,8 @@ Compiler options (forwarded to the compiler):
   --clang <path>       clang executable
   --gcc <path>         gcc executable
   --gc / --no-gc       Boehm GC on (default) / manual free
-  --gc-lib <dir>       override libgc lookup directory`)
+  --gc-lib <dir>       override libgc lookup directory
+  -o, --output <name>  output executable name (default: source name)`)
     if (helpExplicit) {
         System.exit(0)
     }
