@@ -97,7 +97,7 @@ public final class CangApi {
             Cang.setLogStream(opt.isQuiet() ? null : System.out);
             try {
                 String code = java.nio.file.Files.readString(java.nio.file.Path.of(sourceFile));
-                String base = Cang.outputBase(sourceFile, opt.getOutputName());
+                String base = Cang.outputBase(sourceFile, opt.getOutputName(), opt.getTargetRoot());
                 String ll = Cang.compile(sourceFile, code, opt.isNoLink(), opt.getTarget(),
                         opt.getArch(), opt.isGc(), base);
                 r.llFile = base + ".ll";

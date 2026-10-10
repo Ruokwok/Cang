@@ -125,24 +125,44 @@ public class Cang {
     }
 
     /**
-     * Output base for all artifacts (.ll/.o/exe): target/&lt;source name&gt; by default;
+     * Output base for all artifacts (.ll/.o/exe): &lt;targetRoot&gt;/target/&lt;source name&gt;
      * with an output name, ".exe" is optional and a name containing a path separator
      * is used as-is (parent directories created).
      */
     public static String outputBase(String sourceFile, String outputName) {
-        if (outputName == null || outputName.isEmpty()) return outputFileBase(sourceFile);
-        String n = outputName;
-        if (n.toLowerCase().endsWith(".exe")) n = n.substring(0, n.length() - ".exe".length());
-        if (n.isEmpty()) throw new IllegalArgumentException("output name is empty");
-        if (n.contains("/") || n.contains("\\")) {
+        return outputBase(sourceFile, outputName, null);
+    }
+
+    /**
+     * Like {@link #outputBase(String, String)} but with an artifact root: plain names
+     * land in {@code <targetRoot>/target/} (created on demand). A name containing a
+     * path separator is an explicit path and is honored as-is, ignoring targetRoot.
+     */
+    public static String outputBase(String sourceFile, String outputName, String targetRoot) {
+        if (outputName != null && (outputName.contains("/") || outputName.contains("\\"))) {
+            String n = outputName.toLowerCase().endsWith(".exe")
+                    ? outputName.substring(0, outputName.length() - ".exe".length())
+                    : outputName;
+            if (n.isEmpty()) throw new IllegalArgumentException("output name is empty");
             try {
                 String parent = new File(n).getParent();
                 if (parent != null && !parent.isEmpty()) Files.createDirectories(Path.of(parent));
             } catch (IOException ignored) {}
             return n;
         }
-        try { Files.createDirectories(Path.of("target")); } catch (IOException ignored) {}
-        return "target" + File.separator + n;
+        String dir = (targetRoot == null || targetRoot.isBlank())
+                ? "target"
+                : Path.of(targetRoot, "target").toString();
+        try { Files.createDirectories(Path.of(dir)); } catch (IOException ignored) {}
+        String n = outputName;
+        if (n == null || n.isEmpty()) {
+            n = new File(sourceFile).getName();
+            if (n.endsWith(".cang")) n = n.substring(0, n.length() - ".cang".length());
+        } else if (n.toLowerCase().endsWith(".exe")) {
+            n = n.substring(0, n.length() - ".exe".length());
+            if (n.isEmpty()) throw new IllegalArgumentException("output name is empty");
+        }
+        return dir + File.separator + n;
     }
 
     /** Option value accessor: missing value is a usage error, not an ArrayIndexOutOfBounds. */

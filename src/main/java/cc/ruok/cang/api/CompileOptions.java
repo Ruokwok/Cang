@@ -15,6 +15,8 @@ public class CompileOptions {
     private String outputName = null;
     private String clangPath = "clang";
     private String gccPath = "gcc";
+    /** 产物根目录：产物输出到 <targetRoot>/target/ 下；null = 进程 cwd 的 target/。 */
+    private String targetRoot = null;
     /** 库根目录：在其 lib/ 下查找所需 .a（GC 及将来的其它库）。 */
     private String libRoot = null;
     /** true（默认）= 编译过程不向 stdout 打印；false = 与 CLI 相同的进度输出。 */
@@ -25,6 +27,7 @@ public class CompileOptions {
     public CompileOptions gc(boolean on) { this.gc = on; return this; }
     public CompileOptions noLink(boolean on) { this.noLink = on; return this; }
     public CompileOptions outputName(String name) { this.outputName = name; return this; }
+    public CompileOptions targetRoot(String dir) { this.targetRoot = (dir == null || dir.isBlank()) ? null : dir; return this; }
     public CompileOptions clang(String path) { this.clangPath = path; return this; }
     public CompileOptions gcc(String path) { this.gccPath = path; return this; }
     public CompileOptions libRoot(String dir) { this.libRoot = dir; return this; }
@@ -35,6 +38,7 @@ public class CompileOptions {
     public boolean isGc() { return gc; }
     public boolean isNoLink() { return noLink; }
     public String getOutputName() { return outputName; }
+    public String getTargetRoot() { return targetRoot; }
     public String getClangPath() { return clangPath; }
     public String getGccPath() { return gccPath; }
     public String getLibRoot() { return libRoot; }

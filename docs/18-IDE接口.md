@@ -95,9 +95,11 @@ IDE 内直接调用编译器——**不 spawn 子进程、不 System.exit**，�
 CompileResult r = CangApi.compile("src/Main.cang",
         new CompileOptions()
             .outputName("myapp")     // 可执行文件名（.exe 可省）；null = 与源文件同名
+            .targetRoot("D:/proj")   // 产物目录根：输出到 D:/proj/target/xxx.exe
             .noLink(false)           // true = 只生成 .ll
             .target("windows")       // windows | linux | macos
             .gc(true)                // Boehm GC（默认开）
+            .libRoot("D:/toolchain") // 库根：其 lib/ 下查 .a
             .quiet(true));           // 默认静默：过程输出不进 stdout
 
 if (r.isSuccess()) {
@@ -114,7 +116,10 @@ if (r.isSuccess()) {
 ```
 
 - **单实例串行**：编译器内部是进程级状态，调用在内部锁上排队（不要指望并行两路编译提速）；
-- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
+- **产物目录**：`.targetRoot(目录)` → 产物一律在 `<目录>/target/` 下
+  （`xxx.exe` / `.ll` / `.o` 同基名；不传 = 进程 cwd 的 `target/`，与 CLI 一致）。
+  与 `outputName` 组合即 `<targetRoot>/target/<name>.exe`；`outputName` 自带路径分隔符时
+  视为显式路径、忽略 targetRoot。- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
   （如 `window_amd64_libgc.a`，另认 `<目录>/lib/libgc.a`、`<目录>/libgc.a` 与文件直传）——
   IDE 进程的 cwd 不是编译器安装目录时**必须传**，否则报
   `Boehm GC static library not found for windows target`；CLI 的 `--gc-lib <目录>` 同语义；
