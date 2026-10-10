@@ -41,6 +41,9 @@ public class LLVMGen {
         List<AST> superArgs = new ArrayList<>(); // parent constructor args
         boolean isAbstract; // abstract class: not instantiable, may declare abstract methods
         boolean isPrivateCtor; // '_' modifier on the class name: new only inside the class itself
+        // Signatures (","-joined param types) of _init overloads: new matching them is rejected
+        // outside the class. Empty set = every constructor is public.
+        java.util.Set<String> privateInitSigs = new java.util.LinkedHashSet<>();
     }
 
     static class FuncInfo {
@@ -331,9 +334,9 @@ public class LLVMGen {
                 if (isEntry) {
                     entryClass = cd;
                 }
-                // Move FuncDecl/FieldDecl to members; keep statements in topLevelBody for entry
+                // Move FuncDecl/FieldDecl/ConstructorDecl to members; keep statements in topLevelBody for entry
                 for (AST stmt : new ArrayList<>(cd.topLevelBody)) {
-                    if (stmt instanceof FuncDecl || stmt instanceof FieldDecl) {
+                    if (stmt instanceof FuncDecl || stmt instanceof FieldDecl || stmt instanceof ConstructorDecl) {
                         cd.members.add(stmt);
                         cd.topLevelBody.remove(stmt);
                     } else if (!isEntry) {
@@ -406,15 +409,66 @@ public class LLVMGen {
             generateFunction((FuncDecl) func, null);
         }
 
-        // Generate main: entry class body or auto-wrapped statements
+        // Generate main: static void main(String[] args) when present, else the legacy
+        // entry-class body / auto-wrapped top-level statements (dual track until batch 4).
         if (entryClass != null) {
-            generateEntryPointMain(entryClass);
+            FuncInfo mainFi = findStaticMain(entryClass);
+            if (mainFi != null) {
+                generateMainEntry(mainFi);
+            } else {
+                generateEntryPointMain(entryClass);
+            }
         } else if (!mainStatements.isEmpty()) {
             topLevelStmts.addAll(mainStatements);
             generateAutoMain();
         }
 
         return header.toString() + "\n" + body.toString() + extraDefs.toString();
+    }
+
+    /** The class's `static void main(String[] args)` — the new-style entry point. */
+    private FuncInfo findStaticMain(ClassDecl cd) {
+        String fullName = declFullNames.get(cd);
+        if (fullName == null) return null;
+        List<FuncInfo> grp = overloadGroups.get(fullName + ".main");
+        if (grp == null) return null;
+        for (FuncInfo fi : grp) {
+            if ("void".equals(fi.returnType) && fi.isStatic
+                    && fi.paramTypes.size() == 1
+                    && ("String[]".equals(fi.paramTypes.get(0)) || "Array<String>".equals(fi.paramTypes.get(0)))) {
+                return fi;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Entry wrapper for the new model: build System.ARGS, then call
+     * static void main(String[] args); thread joins and GC frame mirror generateAutoMain.
+     */
+    private void generateMainEntry(FuncInfo mainFi) {
+        body.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+        body.append("entry:\n");
+        emitStackBaseSet(body, "main");
+        if (gcEnabled) body.append("  call void @GC_init()\n");
+
+        scope = new Scope(null);
+        tmpCount = 0;
+        currentFuncReturnType = "int";
+        emitGcFrameSetup();
+
+        emitArgsArrayInit();
+
+        String argsV = "%main.args." + tmpCount++;
+        body.append("  ").append(argsV).append(" = load i8*, i8** @system.args\n");
+        body.append("  call void @").append(mainFi.llvmName).append("(i8* ").append(argsV).append(")\n");
+
+        emitGcFramePop();
+        emitThreadBlockJoins();
+        emitRegisteredThreadJoins();
+        body.append("  ret i32 0\n");
+        body.append("}\n\n");
+        scope = null;
     }
 
     // Function objects: { code, receiver } pairs; thunks/lambdas/globals go here after main body.
@@ -1230,17 +1284,44 @@ public class LLVMGen {
     }
 
     private void collectConstructor(ConstructorDecl decl, String fullName) {
+        String funcName = fullName + ".constructor";
         FuncInfo info = new FuncInfo();
-        info.name = fullName + ".constructor";
+        info.name = funcName;
         info.returnType = "void";
         info.className = fullName;
         info.isConstructor = true;
+        boolean hasDefault = false;
         for (Parameter p : decl.params) {
             info.paramTypes.add(p.type);
             info.paramNames.add(p.name);
             info.paramDefaults.add(p.defaultValue);
+            if (p.defaultValue != null) hasDefault = true;
         }
-        functions.put(info.name, info);
+        // Overloads share the group (mirrors collectFunction); defaults and overloads
+        // are mutually exclusive (user rule, same message as methods).
+        List<FuncInfo> grp = overloadGroups.get(funcName);
+        if (grp == null) {
+            info.llvmName = funcName;
+            overloadGroups.put(funcName, new ArrayList<>());
+            overloadGroups.get(funcName).add(info);
+            functions.put(funcName, info);
+        } else {
+            for (FuncInfo other : grp) {
+                boolean otherDefault = false;
+                for (AST d : other.paramDefaults) if (d != null) { otherDefault = true; break; }
+                if (hasDefault || otherDefault) {
+                    throw new RuntimeException("Constructor '" + decl.className
+                        + "' has default parameter values and cannot be overloaded (at line " + decl.line + ")");
+                }
+            }
+            info.llvmName = funcName + "." + grp.size();
+            grp.add(info);
+        }
+        // _init marks this signature private (new forbidden outside the class)
+        if (decl.className.startsWith("_")) {
+            ClassInfo ci = classes.get(fullName);
+            if (ci != null) ci.privateInitSigs.add(String.join(",", info.paramTypes));
+        }
     }
 
     // ==================== Header ====================
@@ -1504,9 +1585,13 @@ public class LLVMGen {
         if (ci == null) ci = classes.get(decl.name);
         if (ci == null) return;
         currentClassName = fullName;
-
-        // Generate implicit constructor if has params OR has parent (to call parent ctor)
-        if (!decl.ctorParams.isEmpty() || ci.parentName != null) {
+        // Generate implicit constructor if has params OR has parent — unless an explicit
+        // init(...) exists (the new ctor model owns the super chain then).
+        boolean hasExplicitInit = false;
+        for (AST member : decl.members) {
+            if (member instanceof ConstructorDecl) { hasExplicitInit = true; break; }
+        }
+        if ((!decl.ctorParams.isEmpty() || ci.parentName != null) && !hasExplicitInit) {
             generateImplicitCtor(decl, ci, fullName);
         }
 
@@ -1614,10 +1699,26 @@ public class LLVMGen {
     }
 
     private void generateConstructor(ConstructorDecl decl, String fullName) {
+        // Overload-aware symbol: match this decl's param types inside the group.
         String funcName = fullName + ".constructor";
-        ClassInfo ci = classes.get(decl.className);
+        String llvmSym = funcName;
+        List<FuncInfo> grp = overloadGroups.get(funcName);
+        if (grp != null) {
+            StringBuilder sig = new StringBuilder();
+            for (int i = 0; i < decl.params.size(); i++) {
+                if (i > 0) sig.append(",");
+                sig.append(decl.params.get(i).type);
+            }
+            for (FuncInfo f : grp) {
+                if (String.join(",", f.paramTypes).equals(sig.toString())) {
+                    llvmSym = f.llvmName;
+                    break;
+                }
+            }
+        }
+        ClassInfo ci = classes.get(fullName);
 
-        body.append("define void @").append(funcName).append("(");
+        body.append("define void @").append(llvmSym).append("(");
         body.append("%").append(fullName).append("* %this");
         for (int i = 0; i < decl.params.size(); i++) {
             Parameter p = decl.params.get(i);
@@ -1648,20 +1749,73 @@ public class LLVMGen {
             }
         }
 
-        // Initialize fields to default values
+        // super chain (Java-style): an explicit super(args) as the FIRST statement supplies
+        // the parent arguments; otherwise call the parent's no-arg constructor implicitly.
+        SuperCall sc = null;
+        if (decl.body instanceof Block) {
+            List<AST> stmts = ((Block) decl.body).statements;
+            if (!stmts.isEmpty() && stmts.get(0) instanceof SuperCall) {
+                sc = (SuperCall) stmts.get(0);
+            }
+        }
+        if (ci != null && ci.parentName != null) {
+            ClassInfo parentInfo = classes.get(ci.parentName);
+            if (parentInfo != null) {
+                List<AST> scArgs = sc != null ? sc.args : new ArrayList<>();
+                String parentCtor = parentInfo.fullName + ".constructor";
+                FuncInfo pfi = null;
+                List<FuncInfo> pgrp = overloadGroups.get(parentCtor);
+                if (pgrp != null && !pgrp.isEmpty()) {
+                    pfi = resolveOverload(pgrp, scArgs, decl.line);
+                } else if (functions.containsKey(parentCtor)) {
+                    pfi = functions.get(parentCtor);
+                }
+                if (pfi != null) {
+                    // Bitcast this to parent type
+                    String parentThis = "%parent.this." + tmpCount++;
+                    body.append("  ").append(parentThis).append(" = bitcast %")
+                         .append(fullName).append("* %this to %")
+                         .append(parentInfo.fullName).append("*\n");
+                    StringBuilder pargs = new StringBuilder();
+                    pargs.append("%").append(parentInfo.fullName).append("* ").append(parentThis);
+                    for (int i = 0; i < scArgs.size(); i++) {
+                        LLVMValue argVal = generateExpr(scArgs.get(i));
+                        pargs.append(", ").append(argVal.type).append(" ").append(argVal.value);
+                    }
+                    String pSym = pfi.llvmName != null ? pfi.llvmName : pfi.name;
+                    body.append("  call void @").append(pSym).append("(").append(pargs).append(")\n");
+                }
+            }
+        }
+
+        // Set type ID AFTER the parent constructor (so the child's ID overwrites the parent's)
+        String typePtr = "%typeid." + fullName;
+        body.append("  ").append(typePtr).append(" = getelementptr %")
+             .append(fullName).append(", %").append(fullName).append("* %this, i32 0, i32 0\n");
+        body.append("  store i32 ").append(ci != null ? ci.typeId : 0).append(", i32* ").append(typePtr).append("\n");
+
+        // Initialize fields to their declared defaults (index starts at 1: slot 0 is the type id)
         if (ci != null) {
-            for (int i = 0; i < ci.fieldNames.size(); i++) {
+            int parentFieldCount = 0;
+            if (ci.parentName != null) {
+                ClassInfo parentInfo = classes.get(ci.parentName);
+                if (parentInfo != null) parentFieldCount = parentInfo.fieldNames.size();
+            }
+            // fieldNames = parent fields first, then own: struct index is 1 + position.
+            // Own fields only — parent defaults belong to the parent constructor.
+            for (int i = parentFieldCount; i < ci.fieldNames.size(); i++) {
                 String fieldType = ci.fieldTypes.get(i);
                 String defaultVal = defaultValueForType(fieldType);
                 String ptr = "%f." + ci.fieldNames.get(i);
                 body.append("  ").append(ptr).append(" = getelementptr ").append(ci.llvmName)
-                     .append(", ").append(ci.llvmName).append("* %this, i32 0, i32 ").append(i).append("\n");
+                     .append(", ").append(ci.llvmName).append("* %this, i32 0, i32 ")
+                     .append(1 + i).append("\n");
                 body.append("  store ").append(toLLVMType(fieldType)).append(" ").append(defaultVal)
                      .append(", ").append(toLLVMType(fieldType)).append("* ").append(ptr).append("\n");
             }
         }
 
-        // Generate body
+        // Generate body (a leading SuperCall statement is a no-op — it was emitted above)
         generateBlockBody((Block) decl.body);
 
         endRegionCleanup();
@@ -1873,6 +2027,9 @@ public class LLVMGen {
             scope = new Scope(prev);
             generateBlockBody((Block) node);
             scope = prev;
+        } else if (node instanceof SuperCall) {
+            // super(args) inside an init was already emitted by generateConstructor
+            // (resolved against the parent overload group before the body runs).
         } else if (node instanceof VarDecl) {
             generateVarDecl((VarDecl) node);
         } else if (node instanceof IfStmt) {
@@ -5425,7 +5582,8 @@ public class LLVMGen {
             }
 
             if (fi.returnType.equals("void")) {
-                body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
+                String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
+            body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
                 return new LLVMValue("void", "void");
             } else {
                 String result = "%call." + tmpCount++;
@@ -5526,7 +5684,8 @@ public class LLVMGen {
         }
 
         if (fi.returnType.equals("void")) {
-            body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
+            String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
+            body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
@@ -6449,7 +6608,8 @@ public class LLVMGen {
         }
 
         if (fi.returnType.equals("void")) {
-            body.append("  call void @").append(fi.llvmName).append("(").append(args).append(")\n");
+            String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
+            body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
@@ -7324,10 +7484,25 @@ public class LLVMGen {
         body.append("  ").append(obj).append(" = bitcast i8* ").append(raw)
              .append(" to ").append(ci.llvmName).append("*\n");
 
-        // Call constructor if exists
+        // Constructor: resolve via the overload group when init() overloads exist
+        // (legacy single '.constructor' entry still works when no group was registered).
         String ctorName = ci.fullName + ".constructor";
-        if (functions.containsKey(ctorName)) {
-            FuncInfo fi = functions.get(ctorName);
+        FuncInfo fi = null;
+        List<FuncInfo> ctorGrp = overloadGroups.get(ctorName);
+        if (ctorGrp != null && !ctorGrp.isEmpty()) {
+            fi = resolveOverload(ctorGrp, node.args, node.line);
+        } else if (functions.containsKey(ctorName)) {
+            fi = functions.get(ctorName);
+        }
+        if (fi != null) {
+            // _init signature: new is only allowed inside this class
+            if (ci.privateInitSigs.contains(String.join(",", fi.paramTypes))) {
+                if (currentClassName == null || !currentClassName.equals(ci.fullName)) {
+                    throw new RuntimeException("Class '" + node.className
+                        + "' has a private constructor (_init); new is only allowed inside the class itself (at line "
+                        + node.line + ")");
+                }
+            }
             StringBuilder args = new StringBuilder();
             args.append(ci.llvmName).append("* ").append(obj);
             int argCount = node.args.size();
@@ -7352,7 +7527,8 @@ public class LLVMGen {
                     }
                 }
             }
-            body.append("  call void @").append(ctorName).append("(").append(args).append(")\n");
+            String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
+            body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
         }
 
         return new LLVMValue(obj, ci.llvmName + "*",
