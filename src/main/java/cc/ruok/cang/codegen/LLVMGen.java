@@ -411,7 +411,7 @@ public class LLVMGen {
             FuncInfo mainFi = findStaticMain(entryClass);
             if (mainFi == null) {
                 throw new RuntimeException("no entry point: class '"
-                    + entryClass.name + "' has no static void main");
+                    + entryClass.name + "'");
             }
             generateMainEntry(mainFi);
         } else if (!mainStatements.isEmpty()) {
@@ -422,20 +422,24 @@ public class LLVMGen {
         return header.toString() + "\n" + body.toString() + extraDefs.toString();
     }
 
-    /** The class's `static void main(String[] args)` — the new-style entry point. */
+    /** The entry point is exactly `static void main(String[] args)` or `static void main()`;
+     *  any other `main(...)` signature is an ordinary static method. When both valid forms
+     *  exist, the String[] form wins (launcher convention). */
     private FuncInfo findStaticMain(ClassDecl cd) {
         String fullName = declFullNames.get(cd);
         if (fullName == null) return null;
         List<FuncInfo> grp = overloadGroups.get(fullName + ".main");
         if (grp == null) return null;
+        FuncInfo zeroArg = null;
         for (FuncInfo fi : grp) {
-            if ("void".equals(fi.returnType) && fi.isStatic
-                    && fi.paramTypes.size() == 1
+            if (!"void".equals(fi.returnType) || !fi.isStatic) continue;
+            if (fi.paramTypes.size() == 1
                     && ("String[]".equals(fi.paramTypes.get(0)) || "Array<String>".equals(fi.paramTypes.get(0)))) {
                 return fi;
             }
+            if (fi.paramTypes.isEmpty()) zeroArg = fi;
         }
-        return null;
+        return zeroArg;
     }
 
     /**
@@ -455,9 +459,14 @@ public class LLVMGen {
 
         emitArgsArrayInit();
 
-        String argsV = "%main.args." + tmpCount++;
-        body.append("  ").append(argsV).append(" = load i8*, i8** @system.args\n");
-        body.append("  call void @").append(mainFi.llvmName).append("(i8* ").append(argsV).append(")\n");
+        if (mainFi.paramTypes.isEmpty()) {
+            // static void main() — the args array is still initialized so System.ARGS works.
+            body.append("  call void @").append(mainFi.llvmName).append("()\n");
+        } else {
+            String argsV = "%main.args." + tmpCount++;
+            body.append("  ").append(argsV).append(" = load i8*, i8** @system.args\n");
+            body.append("  call void @").append(mainFi.llvmName).append("(i8* ").append(argsV).append(")\n");
+        }
 
         emitGcFramePop();
         emitThreadBlockJoins();
