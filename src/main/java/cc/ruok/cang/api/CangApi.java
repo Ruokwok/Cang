@@ -105,15 +105,15 @@ public final class CangApi {
                     switch (opt.getTarget()) {
                         case "windows":
                             Cang.compileWindows(ll, base, opt.getClangPath(), opt.getGccPath(),
-                                    opt.isGc(), opt.getGcLibDir());
+                                    opt.isGc(), opt.getLibRoot());
                             r.exeFile = base + ".exe";
                             break;
                         case "linux":
-                            Cang.compileLinux(ll, base, opt.isGc(), opt.getGcLibDir());
+                            Cang.compileLinux(ll, base, opt.isGc(), opt.getLibRoot());
                             r.exeFile = base;
                             break;
                         case "macos":
-                            Cang.compileMacOS(ll, base, opt.isGc(), opt.getGcLibDir());
+                            Cang.compileMacOS(ll, base, opt.isGc(), opt.getLibRoot());
                             r.exeFile = base;
                             break;
                         default:

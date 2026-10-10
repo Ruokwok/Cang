@@ -15,7 +15,8 @@ public class CompileOptions {
     private String outputName = null;
     private String clangPath = "clang";
     private String gccPath = "gcc";
-    private String gcLibDir = null;
+    /** 库根目录：在其 lib/ 下查找所需 .a（GC 及将来的其它库）。 */
+    private String libRoot = null;
     /** true（默认）= 编译过程不向 stdout 打印；false = 与 CLI 相同的进度输出。 */
     private boolean quiet = true;
 
@@ -26,7 +27,7 @@ public class CompileOptions {
     public CompileOptions outputName(String name) { this.outputName = name; return this; }
     public CompileOptions clang(String path) { this.clangPath = path; return this; }
     public CompileOptions gcc(String path) { this.gccPath = path; return this; }
-    public CompileOptions gcLibDir(String dir) { this.gcLibDir = dir; return this; }
+    public CompileOptions libRoot(String dir) { this.libRoot = dir; return this; }
     public CompileOptions quiet(boolean q) { this.quiet = q; return this; }
 
     public String getTarget() { return target; }
@@ -36,6 +37,6 @@ public class CompileOptions {
     public String getOutputName() { return outputName; }
     public String getClangPath() { return clangPath; }
     public String getGccPath() { return gccPath; }
-    public String getGcLibDir() { return gcLibDir; }
+    public String getLibRoot() { return libRoot; }
     public boolean isQuiet() { return quiet; }
 }

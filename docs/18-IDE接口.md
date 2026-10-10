@@ -114,7 +114,7 @@ if (r.isSuccess()) {
 ```
 
 - **单实例串行**：编译器内部是进程级状态，调用在内部锁上排队（不要指望并行两路编译提速）；
-- **GC 库定位与 cwd 无关**：`.gcLibDir(目录)` 会在 `<目录>/lib/` 下按平台名查找
+- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
   （如 `window_amd64_libgc.a`，另认 `<目录>/lib/libgc.a`、`<目录>/libgc.a` 与文件直传）——
   IDE 进程的 cwd 不是编译器安装目录时**必须传**，否则报
   `Boehm GC static library not found for windows target`；CLI 的 `--gc-lib <目录>` 同语义；

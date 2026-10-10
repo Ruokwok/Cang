@@ -44,7 +44,7 @@ public class Cang {
         String clangPath = "clang";
         String gccPath = "gcc";
         boolean gc = true;          // Boehm GC is on by default
-        String gcLibDir = null;
+        String libRoot = null;   // --gc-lib: 库根目录（其下 lib/ 存库文件）
         String outputName = null;   // -o / --output: executable name (.exe optional)
 
         for (int i = 1; i < args.length; i++) {
@@ -56,7 +56,7 @@ public class Cang {
                 case "--gcc": gccPath = requireValue(args, ++i, "--gcc", "<path>"); break;
                 case "--gc": gc = true; break;
                 case "--no-gc": gc = false; break;
-                case "--gc-lib": gcLibDir = requireValue(args, ++i, "--gc-lib", "<dir>"); break;
+                case "--gc-lib": libRoot = requireValue(args, ++i, "--gc-lib", "<dir>"); break;
                 case "-o":
                 case "--output": outputName = requireValue(args, ++i, "-o", "<name>"); break;
                 default:
@@ -86,9 +86,9 @@ public class Cang {
                 return;
             }
             switch (target) {
-                case "windows": compileWindows(llFile, baseName, clangPath, gccPath, gc, gcLibDir); break;
-                case "linux":   compileLinux(llFile, baseName, gc, gcLibDir); break;
-                case "macos":   compileMacOS(llFile, baseName, gc, gcLibDir); break;
+                case "windows": compileWindows(llFile, baseName, clangPath, gccPath, gc, libRoot); break;
+                case "linux":   compileLinux(llFile, baseName, gc, libRoot); break;
+                case "macos":   compileMacOS(llFile, baseName, gc, libRoot); break;
                 default:
                     System.err.println("error: unknown target '" + target + "'; expected windows|linux|macos");
                     printUsage();
@@ -764,7 +764,7 @@ public class Cang {
     }
 
     public static void compileWindows(String llFile, String baseName,
-                                        String clangPath, String gccPath, boolean gc, String gcLibDir) throws IOException, InterruptedException {
+                                        String clangPath, String gccPath, boolean gc, String libRoot) throws IOException, InterruptedException {
         String objFile = baseName + ".o";
         String exeFile = baseName + ".exe";
 
@@ -796,7 +796,7 @@ public class Cang {
         linkArgs.add("-o");
         linkArgs.add(exeFile);
         if (gc) {
-            String gcLib = findGcLib("windows", gcLibDir);
+            String gcLib = findGcLib("windows", libRoot);
             if (gcLib == null) {
                 throw new LinkFailed("Boehm GC static library not found for windows target");
             }
@@ -844,7 +844,7 @@ public class Cang {
         String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
         String altKey = target.equals("windows") ? "windows" : osKey;
         String[] libNames = { osKey + "_amd64_libgc.a", altKey + "_amd64_libgc.a" };
-        // 1) explicit --gc-lib / CompileOptions.gcLibDir: a file as-is, or a directory:
+        // 1) explicit --gc-lib / CompileOptions.libRoot: a file as-is, or a directory:
         //    <dir>/libgc.a, <dir>/lib/libgc.a, or <dir>/lib/<os>_amd64_libgc.a (project layout)
         if (override != null) {
             File f = new File(override);
@@ -916,14 +916,14 @@ public class Cang {
         return toolName;
     }
 
-    public static void compileLinux(String llFile, String baseName, boolean gc, String gcLibDir) throws IOException, InterruptedException {
+    public static void compileLinux(String llFile, String baseName, boolean gc, String libRoot) throws IOException, InterruptedException {
         String exeFile = baseName;
         String wslLlFile = toWslPath(llFile);
         String wslExeFile = toWslPath(exeFile);
 
         String gcArgs = "";
         if (gc) {
-            String gcLib = findGcLib("linux", gcLibDir);
+            String gcLib = findGcLib("linux", libRoot);
             if (gcLib == null) {
                 throw new LinkFailed("Boehm GC static library not found for linux target");
             }
@@ -944,7 +944,7 @@ public class Cang {
         }
     }
 
-    public static void compileMacOS(String llFile, String baseName, boolean gc, String gcLibDir) throws IOException, InterruptedException {
+    public static void compileMacOS(String llFile, String baseName, boolean gc, String libRoot) throws IOException, InterruptedException {
         throw new LinkFailed("macOS target is not implemented");
     }
 
