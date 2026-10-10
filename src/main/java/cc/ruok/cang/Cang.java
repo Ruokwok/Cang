@@ -234,19 +234,48 @@ public class Cang {
 
         // Determine source root:
         // Main file at <root>/cc/ruok/Main.cang, namespace "cc/ruok" → root is <root>
+        // Source root: the namespace is a directory suffix of the main file's folder
+        // (namespace cc/ruok + .../cc/ruok/Main.cang -> root ...). Compared on the full
+        // directory path so a file named test_args.cang can never match a "/test" prefix.
         String mainPath = new File(mainFilename).getCanonicalPath().replace('\\', '/');
         String sourceRoot = mainPath;
+        int lastSlash = mainPath.lastIndexOf('/');
+        String mainDir = lastSlash >= 0 ? mainPath.substring(0, lastSlash) : ".";
         if (!namespace.isEmpty()) {
-            // Remove namespace path from main file path
-            String nsPath = "/" + namespace.replace('/', '/');
-            int idx = sourceRoot.lastIndexOf(nsPath);
-            if (idx > 0) {
-                sourceRoot = sourceRoot.substring(0, idx);
+            String suffix = "/" + namespace;
+            if (mainDir.endsWith(suffix)) {
+                String root = mainDir.substring(0, mainDir.length() - suffix.length());
+                sourceRoot = root.isEmpty() ? "/" : root;
+            } else {
+                sourceRoot = mainDir;
             }
         } else {
-            // No namespace: source root is main file's directory
-            int lastSlash = mainPath.lastIndexOf('/');
-            sourceRoot = lastSlash >= 0 ? mainPath.substring(0, lastSlash) : ".";
+            // No namespace: source root is the main file's directory
+            sourceRoot = mainDir;
+        }
+
+        // Statement-before-class is validated on the MAIN file only: imported classes are
+        // merged first and must not make a class-less main look class-bearing (debug.md #36
+        // pair). A class-less main keeps its top-level statements as the auto-main body.
+        boolean mainHasClass = false;
+        for (AST member : mainProgram.members) {
+            if (member instanceof AST.ClassDecl) { mainHasClass = true; break; }
+        }
+        if (mainHasClass) {
+            boolean seenClass = false;
+            for (AST member : mainProgram.members) {
+                if (member instanceof AST.ClassDecl) { seenClass = true; continue; }
+                boolean decl = member instanceof AST.FuncDecl || member instanceof AST.NamespaceDecl
+                    || member instanceof AST.ImportDecl;
+                if (!seenClass && !decl) {
+                    String[] srcLines = sourceCode.split("\n", -1);
+                    int ln = Math.max(1, Math.min(member.line, srcLines.length));
+                    String srcLine = srcLines[ln - 1];
+                    int col = srcLine.length() - srcLine.stripLeading().length() + 1;
+                    throw new CompileError("statements are not allowed before the class",
+                        sourceFile, ln, col, srcLine, Math.max(1, srcLine.strip().length()));
+                }
+            }
         }
 
         // Collect all members
@@ -261,93 +290,6 @@ public class Cang {
             allMembers.addAll(loadImport(importPath, sourceRoot, visitedFiles));
         }
 
-        // Auto-load classes in the same namespace (no explicit import needed)
-        if (!namespace.isEmpty()) {
-            String nsDir = sourceRoot + "/" + namespace.replace('/', File.separatorChar);
-            File dir = new File(nsDir);
-            if (dir.isDirectory()) {
-                File[] files = dir.listFiles((d, name) -> name.endsWith(".cang"));
-                if (files != null) {
-                    for (File f : files) {
-                        String canonical = f.getCanonicalPath();
-                        if (visitedFiles.contains(canonical)) continue;
-                        // Skip files already explicitly imported
-                        boolean explicitlyImported = false;
-                        List<String> imports = collectImports(mainProgram);
-                        for (String imp : imports) {
-                            String impFile = resolveImportFile(sourceRoot, imp);
-                            if (impFile != null && new File(impFile).getCanonicalPath().equals(canonical)) {
-                                explicitlyImported = true;
-                                break;
-                            }
-                        }
-                        if (explicitlyImported) continue;
-
-                        System.out.println("      \u2192 " + f.getName());
-                        visitedFiles.add(canonical);
-                        String code = Files.readString(f.toPath());
-
-                        // Save source context
-                        String prevFile = sourceFile;
-                        String prevCode = sourceCode;
-                        sourceFile = f.getPath();
-                        sourceCode = code;
-
-                        try {
-                            Lexer lexer = new Lexer(code);
-                            List<Token> tokens = lexer.tokenize();
-                            Parser parser = new Parser(tokens);
-                            AST.Program prog;
-                            try {
-                                prog = parser.parse();
-                                prog.setSourceFile(f.getPath());
-                            } catch (RuntimeException e) {
-                                throw wrapError(e);
-                            } catch (StackOverflowError e) {
-                                throw new CompileError("Expression nesting too deep", f.getPath(), 1, 1, "", 1);
-                            }
-
-                            // Find class and attach methods
-                            AST.ClassDecl classDecl = null;
-                            for (AST m : prog.members) {
-                                if (m instanceof AST.ClassDecl) {
-                                    classDecl = (AST.ClassDecl) m;
-                                    classDecl.isEntryPoint = false;
-                                    break;
-                                }
-                            }
-                            if (classDecl != null) {
-                                if (!classDecl.topLevelBody.isEmpty()) {
-                                    for (AST stmt : classDecl.topLevelBody) {
-                                        if (stmt instanceof AST.FuncDecl || stmt instanceof AST.FieldDecl) {
-                                            classDecl.members.add(stmt);
-                                        }
-                                    }
-                                    classDecl.topLevelBody.clear();
-                                }
-                                // Load nested imports first
-                                for (AST m : prog.members) {
-                                    if (m instanceof AST.ImportDecl) {
-                                        allMembers.addAll(loadImport(
-                                            ((AST.ImportDecl) m).path, sourceRoot, visitedFiles));
-                                    }
-                                }
-                                // Add the class
-                                for (AST m : prog.members) {
-                                    if (m instanceof AST.ClassDecl) {
-                                        allMembers.add(m);
-                                    }
-                                }
-                            }
-                        } finally {
-                            // Restore source context
-                            sourceFile = prevFile;
-                            sourceCode = prevCode;
-                        }
-                    }
-                }
-            }
-        }
 
         // Add main file's members LAST (after imports so parents are collected first)
         for (AST member : mainProgram.members) {

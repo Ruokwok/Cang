@@ -309,12 +309,14 @@ public class LLVMGen {
         List<AST> mainStatements = new ArrayList<>(); // top-level statements for main()
         ClassDecl entryClass = null;
 
-        // Statements in `members` (outside any class) can only sit BEFORE the first class —
-        // once a class exists they would be dropped by generateEntryPointMain. Reject them
-        // (mirror of debug.md #36). A program with no class at all keeps them for auto-main.
-        boolean hasClassDecl = false;
+        // Only the MAIN file's own class (isEntryPoint) gates top-level statements:
+        // imported classes arrive merged first and must not disqualify a class-less main's
+        // auto-main statements. Statement-before-class itself is validated on the main
+        // program during import resolution; a class-bearing main cannot contribute
+        // statements here (the parser rejects them in the class body).
+        boolean hasEntryClass = false;
         for (AST m : program.members) {
-            if (m instanceof ClassDecl) { hasClassDecl = true; break; }
+            if (m instanceof ClassDecl && ((ClassDecl) m).isEntryPoint) { hasEntryClass = true; break; }
         }
 
         for (AST member : program.members) {
@@ -354,7 +356,7 @@ public class LLVMGen {
             } else {
                 // Top-level statement outside class — legal only in a class-less program;
                 // with a class present it would be silently dropped (debug.md #36 pair).
-                if (hasClassDecl) {
+                if (hasEntryClass) {
                     throw new RuntimeException("statements are not allowed before the class (at line " + member.line + ")");
                 }
                 mainStatements.add(member);
