@@ -435,6 +435,14 @@ public abstract class AST {
         }
     }
 
+    /** super(args); inside init — invokes the parent constructor (Java-style). */
+    public static class SuperCall extends AST {
+        public List<AST> args;
+        public SuperCall(List<AST> args, int line) {
+            super(line); this.args = args;
+        }
+    }
+
     public static class ConstructorDecl extends AST {
         public String className;
         public List<Parameter> params;

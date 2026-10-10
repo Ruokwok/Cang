@@ -138,6 +138,11 @@ public class Parser {
     }
 
     private AST parseTopLevel() {
+        return parseTopLevel(false);
+    }
+
+    /** inClass=true: a type-start that is not a method parses as a class field (new class model). */
+    private AST parseTopLevel(boolean inClass) {
         // abstract class Shape(...) / abstract func ... — modifier before the keyword
         if (check(TokenType.ABSTRACT)) {
             if (peek(1).type == TokenType.FUNC) {
@@ -153,6 +158,12 @@ public class Parser {
             return cd;
         }
         if (check(TokenType.CLASS)) return parseClassDecl();
+
+        // constructor declarations inside a class: init(...) { } / _init(...) { }
+        if (check(TokenType.IDENT) && peek(1).type == TokenType.LPAREN
+                && (current().value.equals("init") || current().value.equals("_init"))) {
+            return parseClassMember();
+        }
 
         // native modifier for top-level functions
         if (check(TokenType.NATIVE)) {
@@ -183,7 +194,10 @@ public class Parser {
                 fd.isFinal = true;
                 return fd;
             }
-            // final var/type declaration
+            // final var/type declaration (in a class: final field/method via the member parser)
+            if (inClass && !check(TokenType.FUNC)) {
+                return parseClassMember();
+            }
             AST stmt = parseStatement();
             if (stmt instanceof VarDecl) ((VarDecl) stmt).isFinal = true;
             return stmt;
@@ -254,6 +268,10 @@ public class Parser {
             }
             // Not a function — rewind and parse as statement
             pos = saved;
+        }
+        // In a class body a non-method type start is a FIELD, not a statement
+        if (inClass && isTypeStart()) {
+            return parseClassMember();
         }
         // Top-level statement (var decl, expression, if, while, etc.)
         return parseStatement();
@@ -599,6 +617,7 @@ public class Parser {
 
     private AST parseStatement() {
         if (check(TokenType.IF)) return parseIfStmt();
+        if (check(TokenType.SUPER)) return parseSuperStmt();
         if (check(TokenType.TRY)) return parseTryStmt();
         if (check(TokenType.THROW)) return parseThrowStmt();
         if (check(TokenType.SWITCH)) return parseSwitchStmt();
@@ -622,6 +641,23 @@ public class Parser {
         }
         if (isTypeStart()) return parseVarDecl();
         return parseExprStmt();
+    }
+
+    /** super(args); — parent-constructor call, only meaningful inside init (validated in codegen). */
+    private AST parseSuperStmt() {
+        int line = advance().line;
+        expect(TokenType.LPAREN);
+        List<AST> args = new ArrayList<>();
+        if (!check(TokenType.RPAREN)) {
+            args.add(parseExpression());
+            while (check(TokenType.COMMA)) {
+                advance();
+                args.add(parseExpression());
+            }
+        }
+        expect(TokenType.RPAREN);
+        optionalSemicolon();
+        return new AST.SuperCall(args, line);
     }
 
     private ThrowStmt parseThrowStmt() {
