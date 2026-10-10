@@ -1,9 +1,11 @@
 package cc.ruok.cang.api;
 
+import cc.ruok.cang.Cang;
 import cc.ruok.cang.lexer.Lexer;
 import cc.ruok.cang.lexer.TokenType;
 import cc.ruok.cang.parser.AST;
 import cc.ruok.cang.parser.Parser;
+import cc.ruok.cang.util.CompileError;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -66,6 +68,80 @@ public final class CangApi {
             roots.clear();
             index = null;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 编译（in-process：不 spawn 子进程、不 System.exit、默认静默）
+    // ------------------------------------------------------------------
+
+    private static final Object COMPILE_LOCK = new Object();
+
+    /** 默认选项编译一个 .cang 源文件（含 import 解析；链接出可执行文件）。 */
+    public static CompileResult compile(String sourceFile) {
+        return compile(sourceFile, new CompileOptions());
+    }
+
+    /**
+     * 编译源文件。编译器内部为单实例状态，调用被 {@code COMPILE_LOCK} 串行化。
+     *
+     * <p>结果：{@code success} + {@code diagnostics}（源码错误带行列；构建错误 0:0）、
+     * {@code llFile}、{@code exeFile}（链接后）、{@code irText}（IR 预览）、
+     * {@code buildOutput}（链接失败时的 clang/gcc 原文）。
+     * 默认 {@code quiet}：过程输出不进 stdout。
+     */
+    public static CompileResult compile(String sourceFile, CompileOptions opt) {
+        if (opt == null) opt = new CompileOptions();
+        CompileResult r = new CompileResult();
+        r.diagnostics = new ArrayList<>();
+        synchronized (COMPILE_LOCK) {
+            Cang.setLogStream(opt.isQuiet() ? null : System.out);
+            try {
+                String code = java.nio.file.Files.readString(java.nio.file.Path.of(sourceFile));
+                String base = Cang.outputBase(sourceFile, opt.getOutputName());
+                String ll = Cang.compile(sourceFile, code, opt.isNoLink(), opt.getTarget(),
+                        opt.getArch(), opt.isGc(), base);
+                r.llFile = base + ".ll";
+                if (!opt.isNoLink()) {
+                    switch (opt.getTarget()) {
+                        case "windows":
+                            Cang.compileWindows(ll, base, opt.getClangPath(), opt.getGccPath(),
+                                    opt.isGc(), opt.getGcLibDir());
+                            r.exeFile = base + ".exe";
+                            break;
+                        case "linux":
+                            Cang.compileLinux(ll, base, opt.isGc(), opt.getGcLibDir());
+                            r.exeFile = base;
+                            break;
+                        case "macos":
+                            Cang.compileMacOS(ll, base, opt.isGc(), opt.getGcLibDir());
+                            r.exeFile = base;
+                            break;
+                        default:
+                            r.diagnostics.add(new Diagnostic("unknown target: " + opt.getTarget(), 0, 0));
+                            return r;
+                    }
+                }
+                try {
+                    java.nio.file.Path llPath = java.nio.file.Path.of(r.llFile);
+                    if (java.nio.file.Files.exists(llPath)) {
+                        r.irText = java.nio.file.Files.readString(llPath);
+                    }
+                } catch (java.io.IOException ignored) {
+                }
+                r.success = true;
+            } catch (Cang.LinkFailed e) {
+                r.diagnostics.add(new Diagnostic(e.getMessage(), 0, 0));
+                r.buildOutput = e.output;
+            } catch (CompileError e) {
+                r.diagnostics.add(new Diagnostic(e.getMessage(), e.line, e.column));
+            } catch (Exception e) {
+                String m = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                r.diagnostics.add(new Diagnostic(m, 0, 0));
+            } finally {
+                Cang.setLogStream(System.out);
+            }
+        }
+        return r;
     }
 
     /** 索引是否需要重建（源码根变更后为 true）。 */

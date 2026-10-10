@@ -87,6 +87,36 @@ List<Diagnostic> ds = CangApi.check(buffer);   // 空 = 语法正确
 // 消息为编译器原文（短错误风格），如 "statements are not allowed in the class body"
 ```
 
+## 编译 API（in-process）
+
+IDE 内直接调用编译器——**不 spawn 子进程、不 System.exit**，结果全部结构化返回：
+
+```java
+CompileResult r = CangApi.compile("src/Main.cang",
+        new CompileOptions()
+            .outputName("myapp")     // 可执行文件名（.exe 可省）；null = 与源文件同名
+            .noLink(false)           // true = 只生成 .ll
+            .target("windows")       // windows | linux | macos
+            .gc(true)                // Boehm GC（默认开）
+            .quiet(true));           // 默认静默：过程输出不进 stdout
+
+if (r.isSuccess()) {
+    r.getExeFile();                  // "target/myapp.exe"
+    r.getLlFile();                   // "target/myapp.ll"
+    r.getIrText();                   // LLVM IR 文本（编辑器预览）
+} else {
+    for (Diagnostic d : r.getDiagnostics()) {
+        // 源码错误带行列（如 7:1）；构建/链接错误为 0:0
+        d.getLine(); d.getColumn(); d.getMessage();
+    }
+    r.getBuildOutput();              // 链接失败时的 clang/gcc 原文（可放 IDE 输出面板）
+}
+```
+
+- **单实例串行**：编译器内部是进程级状态，调用在内部锁上排队（不要指望并行两路编译提速）；
+- **诊断**：词法/语法/语义错误 = `CompileError` 原文 + 真实行列；`LinkFailed`（工具链失败、目标未实现等）= 短消息 + `buildOutput`；
+- **静默默认**：`quiet(true)` 时进度（[1/3]…、[OK] Compiled）走 null sink；`quiet(false)` 与 CLI 完全一致；
+- **未保存缓冲**：编译以磁盘文件为单位（import 按路径解析）——先写临时文件再调 `compile(tempPath)`。
 ## 编辑器集成流程（伪代码）
 
 ```text
