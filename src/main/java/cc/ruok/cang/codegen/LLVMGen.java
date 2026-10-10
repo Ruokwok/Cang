@@ -355,7 +355,7 @@ public class LLVMGen {
                 // Top-level statement outside class — legal only in a class-less program;
                 // with a class present it would be silently dropped (debug.md #36 pair).
                 if (hasClassDecl) {
-                    throw new RuntimeException("statements before the class are only allowed in a class-less program; move this statement into static void main(String[] args) (at line " + member.line + ")");
+                    throw new RuntimeException("statements are not allowed before the class (at line " + member.line + ")");
                 }
                 mainStatements.add(member);
             }
@@ -408,8 +408,8 @@ public class LLVMGen {
         if (entryClass != null) {
             FuncInfo mainFi = findStaticMain(entryClass);
             if (mainFi == null) {
-                throw new RuntimeException("no entry point: declare 'static void main(String[] args)' in class '"
-                    + entryClass.name + "'");
+                throw new RuntimeException("no entry point: class '"
+                    + entryClass.name + "' has no static void main");
             }
             generateMainEntry(mainFi);
         } else if (!mainStatements.isEmpty()) {
@@ -808,8 +808,7 @@ public class LLVMGen {
                     if (!checked.add(sig)) continue;
                     if (!hasConcreteImpl(f, shortName, ci)) {
                         throw new RuntimeException("Class '" + cd.name + "' must implement abstract method '"
-                            + sig + "' from '" + cur.simpleName + "' (at line " + cd.line
-                            + "); implement it or declare the class abstract");
+                            + sig + "' from '" + cur.simpleName + "' (at line " + cd.line + ")");
                     }
                 }
                 cur = cur.parentName != null ? classes.get(cur.parentName) : null;
@@ -3940,8 +3939,7 @@ public class LLVMGen {
                 throw new RuntimeException("Unknown method in reference: this::" + node.method + " (at line " + line + ")");
             }
             if (fi.isStatic) {
-                throw new RuntimeException("this:: requires an instance method; use "
-                    + classes.get(currentClassName).simpleName + "::" + node.method + " for static methods (at line " + line + ")");
+                throw new RuntimeException("this:: requires an instance method (at line " + line + ")");
             }
             LLVMValue receiver = scope.lookup("this");
             if (receiver == null) {
@@ -5522,7 +5520,7 @@ public class LLVMGen {
                 && node.method.equals("spawn")) {
             // Thread.spawn was removed — the object-style API is the only explicit form.
             // (thread { } still uses generateThreadSpawn internally through a direct call.)
-            throw new RuntimeException("Thread.spawn has been removed; use new Thread().task(fn).start() (at line "
+            throw new RuntimeException("Thread.spawn has been removed (at line "
                 + node.line + ")");
         }
         // Object-style Thread: task(fn) / start() on new Thread() results (exact type gate so
@@ -7528,7 +7526,7 @@ public class LLVMGen {
         if (ci.isPrivateCtor) {
             if (currentClassName == null || !currentClassName.equals(ci.fullName)) {
                 throw new RuntimeException("Class '" + node.className
-                    + "' has a private constructor; new is only allowed inside the class itself (at line "
+                    + "' has a private constructor (at line "
                     + node.line + ")");
             }
         }
@@ -7566,7 +7564,7 @@ public class LLVMGen {
             if (ci.privateInitSigs.contains(String.join(",", fi.paramTypes))) {
                 if (currentClassName == null || !currentClassName.equals(ci.fullName)) {
                     throw new RuntimeException("Class '" + node.className
-                        + "' has a private constructor (_init); new is only allowed inside the class itself (at line "
+                        + "' has a private constructor (_init) (at line "
                         + node.line + ")");
                 }
             }

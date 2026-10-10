@@ -17,7 +17,7 @@ t.join()
 ```
 
 - **`Thread.spawn(fn, args...)` 已移除**——现在调用会在编译期报错：
-  `Thread.spawn has been removed; use new Thread().task(fn).start()`；
+  `Thread.spawn has been removed`；
 - 原 spawn 支持的**值类型返回 join**（`Thread<int> t = Thread.spawn(...); t.join()` 取值）
   随移除一并消失，当前对象式与 `thread { }` 均为 **void 任务**（`start()` 返回的句柄可
   `join()` 等待完成，但不携带返回值）；需要输出结果请在任务内部打印或写入共享变量；

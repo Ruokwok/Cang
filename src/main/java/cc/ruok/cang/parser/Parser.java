@@ -38,7 +38,7 @@ public class Parser {
             if (check(TokenType.CLASS) || (check(TokenType.ABSTRACT) && peek(1).type == TokenType.CLASS)) {
                 // One class per file (class-model reform): a second class is an error.
                 if (currentClass != null) {
-                    error("Only one class per file is allowed; the class body extends from the class declaration to the end of the file");
+                    error("Only one class per file");
                 }
                 // New class (possibly 'abstract class') - not entry point initially
                 AST parsed = parseTopLevel();
@@ -229,7 +229,7 @@ public class Parser {
             String type = parseType();
             String name = expect(TokenType.IDENT).value;
             if (check(TokenType.LPAREN)) {
-                error("Static methods must use 'func': static func " + type + " " + name + "(...)");
+                error("static members must use 'func'");
             }
             AST init = null;
             if (check(TokenType.ASSIGN)) {
@@ -276,7 +276,7 @@ public class Parser {
         // Class body holds only fields and methods; statements live inside a method or
         // static void main(String[] args) (class-model reform).
         if (inClass) {
-            error("statements are not allowed in the class body; move them into a method or static void main(String[] args) (at line " + current().line + ")");
+            error("statements are not allowed in the class body (at line " + current().line + ")");
         }
         // Top-level statement (var decl, expression, if, while, etc.)
         return parseStatement();
@@ -291,12 +291,12 @@ public class Parser {
         boolean isPrivate = false;
         String name;
         if (check(TokenType.IDENT) && current().value.equals("_")) {
-            error("the class-name '_' modifier was removed; use a private constructor _init() instead");
+            error("the class-name '_' modifier is not allowed");
             advance();
             name = expect(TokenType.IDENT).value;
         } else if (check(TokenType.IDENT) && current().value.length() > 1
                 && current().value.startsWith("_")) {
-            error("the class-name '_' modifier was removed; use a private constructor _init() instead");
+            error("the class-name '_' modifier is not allowed");
             name = advance().value.substring(1);
         } else if (check(TokenType.IDENT)) {
             name = advance().value;
@@ -328,7 +328,7 @@ public class Parser {
         // in the class body now (class-model reform, batch 4).
         List<Parameter> ctorParams = new ArrayList<>();
         if (check(TokenType.LPAREN)) {
-            error("class '" + name + "' cannot declare constructor parameters; declare fields in the class body and write init(...) instead");
+            error("class '" + name + "' cannot declare constructor parameters");
         }
 
         // Inheritance: : Parent(args)
@@ -337,7 +337,7 @@ public class Parser {
             superClass = expect(TokenType.IDENT).value;
             // Parent constructor args moved to super() inside init(...) (batch 4).
             if (check(TokenType.LPAREN)) {
-                error("parent constructor arguments belong in super() inside init(...); ': " + superClass + "(...)' was removed");
+                error("parent constructor arguments are not allowed (': " + superClass + "(...)')");
             }
         }
 
@@ -404,7 +404,7 @@ public class Parser {
         if (!isStatic && check(TokenType.IDENT) && peek(1).type == TokenType.LPAREN) {
             String ctorName = advance().value;
             if (!ctorName.equals("init") && !ctorName.equals("_init")) {
-                error("constructors must be named init(...) or _init(...); '" + ctorName + "(...)' was removed");
+                error("constructors must be named init or _init");
             }
             List<Parameter> params = parseParams();
             AST body = parseBlock();
@@ -424,7 +424,7 @@ public class Parser {
             }
 
             if (isStatic && check(TokenType.LPAREN)) {
-                error("Static methods must use 'func' keyword: static func " + type + " " + name + "(...)");
+                error("static members must use 'func'");
             }
 
             // Field: type name [= expr] ;
@@ -451,7 +451,7 @@ public class Parser {
         }
         // Reject the removed legacy Array<T> spelling with a focused diagnostic.
         if (check(TokenType.IDENT) && current().value.equals("Array") && peek(1).type == TokenType.LT) {
-            error("Array<T> syntax has been removed; use T[] or T[N]");
+            error("Array<T> syntax has been removed");
         }
         // Function<R, ...> callable type
         if (check(TokenType.IDENT) && current().value.equals("Function") && peek(1).type == TokenType.LT) {
@@ -504,7 +504,7 @@ public class Parser {
         }
         // Array suffix: T[] (length inferred) or T[N] (fixed size); nesting: T[][], T[2][]
         if (base.equals("var")) {
-            error("Cannot use 'var' with array syntax; use 'var arr = [...]' for type inference");
+            error("Cannot use 'var' with array syntax");
         }
         if (base.equals("void")) {
             error("'void' cannot be an array element type");
@@ -516,7 +516,7 @@ public class Parser {
                 advance(); // T[] — length inferred
             } else {
                 if (dim > 0) {
-                    error("Only the outermost dimension can have a fixed length; use T[2][] for nested arrays");
+                    error("Only the outermost dimension can have a fixed length");
                 }
                 if (!check(TokenType.INT_LIT)) {
                     error("Array size must be a positive integer literal, e.g. int[10]");
@@ -553,7 +553,7 @@ public class Parser {
         if (check(TokenType.VOID)) { advance(); return "void"; }
         if (check(TokenType.VAR)) { advance(); return "var"; }
         if (check(TokenType.IDENT) && current().value.equals("Array") && peek(1).type == TokenType.LT) {
-            error("Array<T> syntax has been removed; use T[] or T[N]");
+            error("Array<T> syntax has been removed");
         }
         if (check(TokenType.IDENT) && current().value.equals("Function") && peek(1).type == TokenType.LT) {
             advance();
