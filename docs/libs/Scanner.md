@@ -4,7 +4,7 @@
 
 ## 要点
 
-- `cang/io/Scanner`：键盘/标准输入读取，**单例**（`class _ Scanner` 私有构造 + 静态工厂）
+- `cang/io/Scanner`：键盘/标准输入读取，**单例**（`_init` 私有构造 + 静态工厂）
 - 读取方法**阻塞当前线程**等待输入：`readLine(ms?)` 整行（超时/EOF → null）、`readKey(ms?)` 单键（超时/EOF → -1；含 esc/enter/方向键）
 - `KEY_*` 静态常量用于比较键码；显式 `import cang/io/Scanner`（cang/io 不自动加载）
 
@@ -13,21 +13,23 @@
 ```cang
 import cang/io/Scanner
 
-class Main()
-var sc = Scanner.get()                 # 静态工厂取单例（不可 new）
-String line = sc.readLine()            # 阻塞读一行（回显，enter 结束，去末尾换行）
-Stdout.println(line)
+class Main
+    static func void main(String[] args) {
+        var sc = Scanner.get()                 # 静态工厂取单例（外部 new 报私有构造错误）
+        String line = sc.readLine()            # 阻塞读一行（回显，enter 结束，去末尾换行）
+        Stdout.println(line)
 
-int k = sc.readKey()                   # 阻塞读一个键（无回显）
-if (k == Scanner.KEY_ENTER) {
-    Stdout.println("enter")
-}
-if (k == Scanner.KEY_ESC) {
-    Stdout.println("esc")
-}
-if (k == Scanner.KEY_UP) {
-    Stdout.println("up")
-}
+        int k = sc.readKey()                   # 阻塞读一个键（无回显）
+        if (k == Scanner.KEY_ENTER) {
+            Stdout.println("enter")
+        }
+        if (k == Scanner.KEY_ESC) {
+            Stdout.println("esc")
+        }
+        if (k == Scanner.KEY_UP) {
+            Stdout.println("up")
+        }
+    }
 ```
 
 ## API
@@ -46,15 +48,17 @@ if (k == Scanner.KEY_UP) {
 ```cang
 import cang/io/Scanner
 
-class Main()
-var sc = Scanner.get()
-Stdout.println("type, esc to quit")
-while (true) {
-    String ch = sc.readChar()        # 单字符；中文聚合成一个字符串
-    if (ch == "<ESC>") { break }     # 特殊键用命名串比较
-    if (ch == "<ENTER>") { Stdout.println() }
-    Stdout.println(ch)
-}
+class Main
+    static func void main(String[] args) {
+        var sc = Scanner.get()
+        Stdout.println("type, esc to quit")
+        while (true) {
+            String ch = sc.readChar()        # 单字符；中文聚合成一个字符串
+            if (ch == "<ESC>") { break }     # 特殊键用命名串比较
+            if (ch == "<ENTER>") { Stdout.println() }
+            Stdout.println(ch)
+        }
+    }
 ```
 
 - `readChar(ms)` 超时或 EOF 返回 `null`（监听循环可 `if (ch == null) break`）；
@@ -66,22 +70,24 @@ while (true) {
 ```cang
 import cang/io/Scanner
 
-class Main()
-var sc = Scanner.get()
-Stdout.println("press q to quit")
-while (true) {
-    int k = sc.readKey()
-    if (k == 113) {           # 'q'
-        break
+class Main
+    static func void main(String[] args) {
+        var sc = Scanner.get()
+        Stdout.println("press q to quit")
+        while (true) {
+            int k = sc.readKey()
+            if (k == 113) {           # 'q'
+                break
+            }
+            if (k == Scanner.KEY_ENTER) {
+                Stdout.println("<CR>")
+            } else if (k == Scanner.KEY_ESC) {
+                Stdout.println("<ESC>")
+            } else {
+                Stdout.println(k)
+            }
+        }
     }
-    if (k == Scanner.KEY_ENTER) {
-        Stdout.println("<CR>")
-    } else if (k == Scanner.KEY_ESC) {
-        Stdout.println("<ESC>")
-    } else {
-        Stdout.println(k)
-    }
-}
 ```
 
 ## 平台差异（必读）

@@ -14,13 +14,15 @@
 ```cang
 import cang/lang/List
 
-class Main()
-var list = new List<String>()          # 默认容量 10（对应 Java DEFAULT_CAPACITY）
-list.add("a")
-list.add("b")
+class Main
+    static func void main(String[] args) {
+        var list = new List<String>()          # 默认容量 10（对应 Java DEFAULT_CAPACITY）
+        list.add("a")
+        list.add("b")
 
-List<int> nums = new List<>()          # diamond 从声明推断元素类型
-nums.add(1)
+        List<int> nums = new List<>()          # diamond 从声明推断元素类型
+        nums.add(1)
+    }
 ```
 
 - 泛型单态化：每个元素类型组合（`List<String>`、`List<int>`…）各生成一份具体类型；
@@ -107,11 +109,13 @@ for (int n : nums) {
 ```cang
 import cang/lang/List
 
-class Main()
-var list = new List<String>()
-list.add("apple")
-list.add("banana")
-list.add(1, "apricot")           # 错误写法示意：List 用 insertAt(1, "apricot")
+class Main
+    static func void main(String[] args) {
+        var list = new List<String>()
+        list.add("apple")
+        list.add("banana")
+        list.add(1, "apricot")           # 错误写法示意：List 用 insertAt(1, "apricot")
+    }
 ```
 
 正确写法：
@@ -119,15 +123,17 @@ list.add(1, "apricot")           # 错误写法示意：List 用 insertAt(1, "ap
 ```cang
 import cang/lang/List
 
-class Main()
-var list = new List<String>()
-list.add("apple")
-list.add("banana")
-list.insertAt(1, "apricot")      # [apple, apricot, banana]
-Stdout.println(list.size())      # 3
-Stdout.println(list.indexOf("banana"))   # 2
-Stdout.println(list.remove(0))   # apple
-for (String s : list) {
-    Stdout.println(s)            # apricot / banana
-}
+class Main
+    static func void main(String[] args) {
+        var list = new List<String>()
+        list.add("apple")
+        list.add("banana")
+        list.insertAt(1, "apricot")      # [apple, apricot, banana]
+        Stdout.println(list.size())      # 3
+        Stdout.println(list.indexOf("banana"))   # 2
+        Stdout.println(list.remove(0))   # apple
+        for (String s : list) {
+            Stdout.println(s)            # apricot / banana
+        }
+    }
 ```

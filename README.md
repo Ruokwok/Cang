@@ -14,7 +14,8 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - 输出 `.ll` LLVM IR，并通过 clang/gcc 生成本地可执行文件；
 - 基本类型：`byte`、`int`、`long`、`float`、`double`、`bool`、`string`；
 - 引用字符串类型 `String`，支持双引号和反引号多行字符串；
-- 类、单继承、构造参数、实例方法、静态方法和类型 ID 动态分派；
+- 类、单继承（`: Parent`，构造参数经 `super(...)` 传递）、`init`/`_init` 构造方法、字段、实例方法、静态方法和类型 ID 动态分派；一个文件一个类；
+- 抽象类与抽象方法（`abstract class` / `abstract func`）；
 - 泛型类：编译期单态化，支持多类型参数（`Pair<K, V>`）与多实参特化；
 - 数组、定长数组、多维数组和 `length()`；
 - 数组边界检查；
@@ -31,58 +32,63 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 ## 快速示例
 
 ```cang
-class Main()
-
 func int add(int a, int b) {
     return a + b
 }
 
-int[] values = [1, 2, 3]
-Stdout.println(values.length())
-Stdout.println(add(values[0], values[1]))
+class Main
+    static func void main(String[] args) {
+        int[] values = [1, 2, 3]
+        Stdout.println(values.length())
+        Stdout.println(add(values[0], values[1]))
+    }
 ```
 
-函数定义和逻辑代码位于入口 `class` 之后。`class` 之前只允许 `namespace`、`import` 和注释。
+一个文件一个类（`class` 起到文件末尾都是类体）；入口是类中的 `static void main(String[] args)`。`class` 之前允许 `namespace`、`import`、全局函数和注释。
 
 ## 函数对象示例
 
 ```cang
-class Main()
+class Main
+    func void call(Function<Void, int> f) {
+        f(123)
+    }
 
-func void call(Function<Void, int> f) {
-    f(123)
-}
-
-call((i) -> void {
-    Stdout.println(i)
-})
+    static func void main(String[] args) {
+        var self = new Main()
+        self.call((i) -> void {
+            Stdout.println(i)
+        })
+    }
 ```
 
 lambda 按值捕获外部变量（创建时快照，与 Java 一致）：
 
 ```cang
-class Main()
-
-int x = 41
-Function<Void, int> f = (i) -> void {
-    Stdout.println(i + x)   # 按值捕获 x
-}
-f(1)                       # 42
-x = 100
-f(2)                       # 43（仍是创建时的 41）
+class Main
+    static func void main(String[] args) {
+        int x = 41
+        Function<Void, int> f = (i) -> void {
+            Stdout.println(i + x)   # 按值捕获 x
+        }
+        f(1)                       # 42
+        x = 100
+        f(2)                       # 43（仍是创建时的 41）
+    }
 ```
 
 ## 数组示例
 
 ```cang
-class Main()
+class Main
+    static func void main(String[] args) {
+        int[10] fixed = []
+        int[] values = [1, 2, 3]
+        int[][] matrix = [[1, 2], [3, 4]]
 
-int[10] fixed = []
-int[] values = [1, 2, 3]
-int[][] matrix = [[1, 2], [3, 4]]
-
-Stdout.println(values.length())
-Stdout.println(matrix[0][1])
+        Stdout.println(values.length())
+        Stdout.println(matrix[0][1])
+    }
 ```
 
 ## 异常示例
@@ -90,15 +96,16 @@ Stdout.println(matrix[0][1])
 ```cang
 import cang/lang/Error
 
-class Main()
-
-try {
-    throw new Error("something failed")
-} catch (Error e) {
-    Stdout.println(e.message)
-} finally {
-    Stdout.println("finished")
-}
+class Main
+    static func void main(String[] args) {
+        try {
+            throw new Error("something failed")
+        } catch (Error e) {
+            Stdout.println(e.message)
+        } finally {
+            Stdout.println("finished")
+        }
+    }
 ```
 
 当前异常系统仍是第一版实现，存在跨函数传播和运行时错误覆盖范围有限等限制。
@@ -165,7 +172,7 @@ cang test/example.cang --target macos --arch amd64
 `cang` 是仓库根目录的启动脚本（`cang.cmd` / `cang`）；没有该命令时等价于：
 
 ```powershell
-java -cp target\classes Cang <参数>
+java -cp target\classes cc.ruok.cang.Cang <参数>
 ```
 
 `--target` 和 `--arch` 会影响 `System.OS_TYPE` 与 `System.ARCH_TYPE`。真正的跨架构链接还需要对应的 clang、gcc 和系统库。
@@ -175,20 +182,21 @@ java -cp target\classes Cang <参数>
 Cang 默认使用 Boehm GC 自动回收，`free` 可选用于提前释放：
 
 ```cang
-class Main()
+class Main
+    static func void main(String[] args) {
+        int[] values = [1, 2, 3]
+        System.gc()        # 手动触发一次回收（可选）
 
-int[] values = [1, 2, 3]
-System.gc()        # 手动触发一次回收（可选）
-
-# 也可以提前释放
-free values
+        # 也可以提前释放
+        free values
+    }
 ```
 
 编译开关：
 
 ```powershell
-Cang app.cang              # 默认 Boehm GC（GC_malloc 静态链接）
-Cang app.cang --no-gc      # 切回纯手动 free 模式
+cang app.cang              # 默认 Boehm GC（GC_malloc 静态链接）
+cang app.cang --no-gc      # 切回纯手动 free 模式
 ```
 
 重要限制：
@@ -249,7 +257,6 @@ Cang 目前不应被视为稳定语言或生产级编译器，主要限制包括
 - 编译器缺少完整的自动化测试、持续集成和模糊测试体系；
 - 错误恢复和诊断能力仍有限；
 - 标准库规模较小，缺少成熟的集合、文件、网络、JSON 等 API；
-- lambda 仅支持单参数 `Function<Void, T>` 形式（可按值捕获）；
 - 异常系统目前只覆盖第一版同函数控制流场景；
 - 数组越界和空指针等部分运行时错误仍可能直接终止程序；
 - 在别名场景下提前 `free` 存在 use-after-free 风险；

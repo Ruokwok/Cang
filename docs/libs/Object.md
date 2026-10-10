@@ -12,9 +12,14 @@
 ## 自动继承
 
 ```cang
-class Point(int x = 0, int y = 0)
+class Point
+    int x = 0;
+    int y = 0;
+
 # 等价于
-class Point(int x = 0, int y = 0) : Object()
+class Point : Object
+    int x = 0;
+    int y = 0;
 ```
 
 编译器在收集阶段为未声明父类的类补上 `superClass = "Object"`，无需手写。
@@ -22,14 +27,16 @@ class Point(int x = 0, int y = 0) : Object()
 ## 根类型判断
 
 ```cang
-class Main()
-var p = new Point(1, 2)
-if (p like Point) {
-    Stdout.println("is Point")
-}
-if (p like Object) {
-    Stdout.println("any object is an Object")   # 总是成立
-}
+class Main
+    static func void main(String[] args) {
+        var p = new Point(1, 2)
+        if (p like Point) {
+            Stdout.println("is Point")
+        }
+        if (p like Object) {
+            Stdout.println("any object is an Object")   # 总是成立
+        }
+    }
 ```
 
 - `like` 读取对象头类型 ID，沿继承链判断是否为目标类或其子类；
@@ -38,19 +45,42 @@ if (p like Object) {
 ## 继承中的 Object
 
 ```cang
-class Animal(String name = "animal")
-class Dog(String name = "dog") : Animal(name)
+# Animal.cang
+class Animal
+    String name = "animal";
 
-class Main()
-var d = new Dog("rex")
-Stdout.println(d.name)        # rex（父类字段经父类构造初始化）
-if (d like Animal) {
-    Stdout.println("Dog is an Animal")   # 继承链命中
-}
+    init(String name) {
+        this.name = name;
+    }
+```
+
+```cang
+# Dog.cang
+import Animal
+
+class Dog : Animal
+    init(String name) {
+        super(name);
+    }
+```
+
+```cang
+# Main.cang
+import Animal
+import Dog
+
+class Main
+    static func void main(String[] args) {
+        var d = new Dog("rex")
+        Stdout.println(d.name)        # rex（父类字段经父类构造初始化）
+        if (d like Animal) {
+            Stdout.println("Dog is an Animal")   # 继承链命中
+        }
+    }
 ```
 
 ## 注意
 
-- Cang 是**单继承**，不支持多继承；
+- Cang 是**单继承**（`class A : B, C` 不支持），多级链合法；
 - 与 Java 不同：Cang 类没有从 Object 继承来的通用 `toString()/equals()/hashCode()` 方法可用——相等用 `==`（`String` 内容比较、对象引用比较），字符串化用字符串拼接或 `Stdout.println`；
 - `final` 类不可被继承（见 [继承与多态](../14-继承与多态.md)）。

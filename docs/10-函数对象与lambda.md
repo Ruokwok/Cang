@@ -32,36 +32,39 @@ Function<Void, int>
 
 ### 9.2 方法作为参数
 
-函数定义放在 `class` 之后，因此它们属于当前类的方法。可以使用对象方法引用传递：
+方法是类体成员，可通过实例方法引用传递：
 
 ```cang
-class Main()
+class Main
+    func int inc(int x) {
+        return x + 1
+    }
 
-func int inc(int x) {
-    return x + 1
-}
+    func int apply(Function<int, int> f, int value) {
+        return f(value)
+    }
 
-func int apply(Function<int, int> f, int value) {
-    return f(value)
-}
-
-var main = new Main()
-Stdout.println(main.apply(main::inc, 41))
+    static func void main(String[] args) {
+        var main = new Main()
+        Stdout.println(main.apply(main::inc, 41))
+    }
 ```
 
 ### 9.3 lambda 捕获外部变量
 
 ```cang
-class Main()
+class Main
+    func void call(Function<Void, int> f) {
+        f(123)
+    }
 
-func void call(Function<Void, int> f) {
-    f(123)
-}
-
-int x = 41
-call((i) -> {
-    Stdout.println(i + x)     # 按值捕获 x
-})
+    static func void main(String[] args) {
+        int x = 41
+        var self = new Main()
+        self.call((i) -> {
+            Stdout.println(i + x)     # 按值捕获 x
+        })
+    }
 ```
 
 - **任意个参数（0..N）**：``(x, y) -> { ... }``、``() -> { ... }``；同名参数编译报错（``Duplicate lambda parameter``）；参数个数必须与期望的 ``Function<R, P1..PN>`` 一致；
@@ -92,42 +95,42 @@ f(2)        # 43（仍是创建时的 41）
 ### 9.4 this 方法引用
 
 ```cang
-class Main()
+class Main
+    func void add() {
+        Stdout.println(7)
+    }
 
-func void add() {
-    Stdout.println(7)
-}
+    func void run(Function<Void> f) {
+        f()
+    }
 
-func void run(Function<Void> f) {
-    f()
-}
+    func void test() {
+        this.run(this::add)
+    }
 
-func void test() {
-    this.run(this::add)
-}
-
-var obj = new Main()
-obj.test()
+    static func void main(String[] args) {
+        var obj = new Main()
+        obj.test()
+    }
 ```
 
-`this::add` 会绑定当前对象的 `this`。
+`this::add` 会绑定当前对象的 `this`（仅实例方法内可用）。
 
 ### 9.5 对象方法引用
 
 ```cang
-class Main()
+class Main
+    func void add() {
+        Stdout.println(7)
+    }
 
-func void add() {
-    Stdout.println(7)
-}
+    func void run(Function<Void> f) {
+        f()
+    }
 
-func void run(Function<Void> f) {
-    f()
-}
-
-func void test(Main obj) {
-    this.run(obj::add)
-}
+    func void test(Main obj) {
+        this.run(obj::add)
+    }
 ```
 
 `obj::add` 会绑定对象 `obj`。
@@ -135,18 +138,18 @@ func void test(Main obj) {
 ### 9.6 静态方法引用
 
 ```cang
-class Main()
+class Main
+    static func int twice(int x) {
+        return x * 2
+    }
 
-static func int twice(int x) {
-    return x * 2
-}
+    static func int apply(Function<int, int> f, int x) {
+        return f(x)
+    }
 
-func int apply(Function<int, int> f, int x) {
-    return f(x)
-}
-
-class Entry()
-Stdout.println(apply(Main::twice, 21))
+    static func void main(String[] args) {
+        Stdout.println(apply(Main::twice, 21))
+    }
 ```
 
 静态方法不需要 receiver，因此使用：
@@ -167,4 +170,3 @@ ClassName::staticMethod
 `Class::instanceMethod`、`obj::staticMethod` 等错误引用会被拒绝。
 
 ---
-

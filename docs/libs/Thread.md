@@ -60,24 +60,29 @@ th.join()                                      # 需要时显式等待
 参考 Java 的线程写法：先创建线程对象，绑定任务，再启动：
 
 ```cang
-class Main()
-func void run() {
-    Stdout.println("in thread")
-}
+class Main
+    func void run() {
+        Stdout.println("in thread")
+    }
 
-var t = new Thread().task(this::run).start()
-t.join()
-Stdout.println("main done")
+    static func void main(String[] args) {
+        var self = new Main()
+        var t = new Thread().task(self::run).start()
+        t.join()
+        Stdout.println("main done")
+    }
 ```
 
 无参 lambda 也可以直接作为任务（返回类型可省略）：
 
 ```cang
-class Main()
-var t = new Thread().task(() -> {
-    Stdout.println("lambda task")
-}).start()
-t.join()
+class Main
+    static func void main(String[] args) {
+        var t = new Thread().task(() -> {
+            Stdout.println("lambda task")
+        }).start()
+        t.join()
+    }
 ```
 
 - `new Thread()` / `new Thread(false)` = **非守护**（默认）；`new Thread(true)` = **守护**（参数必须 bool，其他类型编译报错）；任务与句柄字段初始为空；

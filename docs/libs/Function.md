@@ -27,18 +27,22 @@ func int applyTwice(int x, Function<int, int> f) {
     return f(f(x))
 }
 
-class Main()
-Stdout.println(applyTwice(3, (x) -> x + 1))   # 5
+class Main
+    static func void main(String[] args) {
+        Stdout.println(applyTwice(3, (x) -> x + 1))   # 5
+    }
 ```
 
 ## lambda 捕获（按值快照）
 
 ```cang
-class Main()
-int base = 10
-Function<int> getBase = () -> base     # 创建时快照 base 的值
-base = 99
-Stdout.println(getBase())              # 10（不是 99）
+class Main
+    static func void main(String[] args) {
+        int base = 10
+        Function<int> getBase = () -> base     # 创建时快照 base 的值
+        base = 99
+        Stdout.println(getBase())              # 10（不是 99）
+    }
 ```
 
 - 捕获对象/数组/List 时快照**引用本身**（内容共享、外部可见）；
@@ -48,25 +52,43 @@ Stdout.println(getBase())              # 10（不是 99）
 ## 方法引用
 
 ```cang
-class Greeter(String name = "world")
-func void hello() {
-    Stdout.println("hi " + this.name)
-}
+# Greeter.cang
+class Greeter
+    String name = "world";
 
+    init(String name) {
+        this.name = name;
+    }
+
+    func void hello() {
+        Stdout.println("hi " + this.name)
+    }
+```
+
+```cang
 func int inc(int x) { return x + 1 }
 
-class Main()
-# this:: —— 绑定当前实例（顶层语句中 this = 入口类实例）
-Function<void> f = this::someMethod
+class Main
+    func void run(Function<Void> f) {
+        f()
+    }
 
-# 对象方法引用
-var g = new Greeter("cang")
-Function<void> h = g.hello               # 或 g::hello 形式按语言支持书写
+    static func void main(String[] args) {
+        var self = new Main()
 
-# 静态/顶层函数引用
-Function<int, int> p = inc
-Stdout.println(p(41))                    # 42
+        # 对象方法引用
+        var g = new Greeter("cang")
+        Function<void> h = g::hello
+        self.run(h)                              # hi cang
+
+        # 顶层函数引用
+        Function<int, int> p = inc
+        Stdout.println(p(41))                    # 42
+    }
 ```
+
+- `this::m` 仅在实例方法内可用（绑定当前实例）；
+- `obj::m` 绑定对象；`Class::m` 绑定静态方法，顶层函数名可直接作值。
 
 ## 类型检查
 

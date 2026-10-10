@@ -14,17 +14,19 @@
 ```cang
 import cang/lang/Dict
 
-class Main()
-var d = new Dict<String, int>()
-d.put("a", 1)
-d.put("b", 2)
-d.put("a", 10)                            # 同键覆盖
-Stdout.println(d.get("a"))                # 10
-Stdout.println(d.getOrDefault("zz", -1))  # -1（键不存在）
-Stdout.println(d.size())                  # 2
-for (String k : d.keys()) {
-    Stdout.println(k + " = " + d.get(k))
-}
+class Main
+    static func void main(String[] args) {
+        var d = new Dict<String, int>()
+        d.put("a", 1)
+        d.put("b", 2)
+        d.put("a", 10)                            # 同键覆盖
+        Stdout.println(d.get("a"))                # 10
+        Stdout.println(d.getOrDefault("zz", -1))  # -1（键不存在）
+        Stdout.println(d.size())                  # 2
+        for (String k : d.keys()) {
+            Stdout.println(k + " = " + d.get(k))
+        }
+    }
 ```
 
 - API：`put` / `get` / `getOrDefault` / `containsKey` / `remove` / `size` / `isEmpty` / `clear` / `keys` / `values`；

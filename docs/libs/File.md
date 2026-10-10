@@ -13,9 +13,11 @@
 ```cang
 import cang/io/File
 
-class Main()
-File f = new File("data/abc.txt")
-Stdout.println(f.exists())
+class Main
+    static func void main(String[] args) {
+        File f = new File("data/abc.txt")
+        Stdout.println(f.exists())
+    }
 ```
 
 ### 18.1 系统路径分隔符

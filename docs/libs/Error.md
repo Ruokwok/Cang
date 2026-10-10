@@ -4,7 +4,7 @@
 
 ## 要点
 
-- `cang/lang/Error`：所有可抛出/可捕获异常的基类，字段为构造参数模型
+- `cang/lang/Error`：所有可抛出/可捕获异常的基类，字段在类体声明、构造为 `init`
 - `throw new Error(message)` 抛出；`catch (Error e)` 捕获（含自定义子类）
 - `e.message` 取错误消息；未捕获异常打印消息与位置并以退出码 1 结束
 - 完整控制流语法见 [异常处理](../15-异常处理.md)
@@ -12,26 +12,37 @@
 ## 类声明
 
 ```cang
-class Error(String message = "", String[] stack = [])
+class Error
+    String message = "";
+    String[] stack = [];
+
+    init() {
+    }
+
+    init(String message) {
+        this.message = message;
+    }
 ```
 
 - `message`：错误描述文本，默认空串；
 - `stack`：运行时填充的调用栈文本数组（简化版运行时堆栈跟踪）；
-- 采用**参数即构造器**模型（无花括号字段体）。
+- 字段在类体声明（含默认值），`init` 构造方法赋值。
 
 ## 抛出与捕获
 
 ```cang
 import cang/lang/Error
 
-class Main()
-try {
-    throw new Error("boom")
-} catch (Error e) {
-    Stdout.println(e.message)     # boom
-} finally {
-    Stdout.println("done")        # 无论是否异常都会执行
-}
+class Main
+    static func void main(String[] args) {
+        try {
+            throw new Error("boom")
+        } catch (Error e) {
+            Stdout.println(e.message)     # boom
+        } finally {
+            Stdout.println("done")        # 无论是否异常都会执行
+        }
+    }
 ```
 
 ## 自定义错误类型
@@ -39,9 +50,19 @@ try {
 捕获类型必须是 `Error` 或其子类——用继承定义领域错误：
 
 ```cang
+# ValidationError.cang
 import cang/lang/Error
 
-class ValidationError(String message = "") : Error(message)
+class ValidationError : Error
+    init(String message) {
+        super(message);
+    }
+```
+
+```cang
+# Main.cang
+import cang/lang/Error
+import ValidationError
 
 func void check(int age) {
     if (age < 0) {
@@ -49,12 +70,14 @@ func void check(int age) {
     }
 }
 
-class Main()
-try {
-    check(-1)
-} catch (Error e) {
-    Stdout.println(e.message)     # age must be >= 0
-}
+class Main
+    static func void main(String[] args) {
+        try {
+            check(-1)
+        } catch (Error e) {
+            Stdout.println(e.message)     # age must be >= 0
+        }
+    }
 ```
 
 ## 运行时错误也会走异常
@@ -69,13 +92,15 @@ try {
 ```cang
 import cang/lang/Error
 
-class Main()
-int[] a = null
-try {
-    Stdout.println(a[0])
-} catch (Error e) {
-    Stdout.println("caught: " + e.message)
-}
+class Main
+    static func void main(String[] args) {
+        int[] a = null
+        try {
+            Stdout.println(a[0])
+        } catch (Error e) {
+            Stdout.println("caught: " + e.message)
+        }
+    }
 ```
 
 ## 注意
