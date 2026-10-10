@@ -438,6 +438,11 @@ public class LLVMGen {
             // Class-less file with only function definitions: nothing to run.
             throw new RuntimeException("no main method (at line "
                 + (firstTopFuncLine > 0 ? firstTopFuncLine : 1) + ")");
+        } else {
+            // No class, no statements, no functions (imports/namespace only, or an empty
+            // file): nothing would be emitted — fail here instead of letting the linker
+            // die on "undefined reference to WinMain".
+            throw new RuntimeException("no entry point: no class and no top-level statements (at line 1)");
         }
 
         return header.toString() + "\n" + body.toString() + extraDefs.toString();
