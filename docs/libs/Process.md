@@ -4,7 +4,7 @@
 
 ## 要点
 
-- `Process.exec(cmd, call, timeout)` 执行本地命令，按行回调输出，返回退出码
+- `Process.exec(cmd, call[, timeout])` 执行本地命令，按行回调输出，返回退出码；`timeout` 可省略（默认 -1 = 永久等待）
 - argv 数组直接执行（**不经过 shell**），天然免疫命令注入
 - 超时或启动失败返回 `-1`；超时会终止子进程，已回调的输出保留
 - stderr 继承当前终端（不进回调）
@@ -21,7 +21,7 @@ Function<Void, String> cb = (line) -> {
     Stdout.println(">> " + line)
 }
 
-# timeout 毫秒；-1 = 永久等待
+# timeout 毫秒，可省略；缺省 -1 = 永久等待
 int code = Process.exec(cmd, cb, -1)
 if (code == -1) {
     Stdout.println("启动失败或超时")
