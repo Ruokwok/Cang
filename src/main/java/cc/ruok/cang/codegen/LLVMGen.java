@@ -9061,11 +9061,7 @@ pb.append("  br label %").append(lblSpawn).append("\n");
             pb.append("  ").append(hInP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 80\n");
             pb.append("  ").append(hInPP).append(" = bitcast i8* ").append(hInP).append(" to i8**\n");
             pb.append("  store i8* ").append(hIn).append(", i8** ").append(hInPP).append("\n");
-            String hErr = "%prv.herr." + tmpCount++, hErrP = "%prv.herrp." + tmpCount++, hErrPP = "%prv.herrpp." + tmpCount++;
-            pb.append("  ").append(hErr).append(" = call i8* @GetStdHandle(i32 -12)\n");
-            pb.append("  ").append(hErrP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 96\n");
-            pb.append("  ").append(hErrPP).append(" = bitcast i8* ").append(hErrP).append(" to i8**\n");
-            pb.append("  store i8* ").append(hErr).append(", i8** ").append(hErrPP).append("\n");
+
             // CreatePipe(&rd, &wr, &sa, 0)
             String cpr = "%prv.cpr." + tmpCount++;
             pb.append("  ").append(cpr).append(" = call i32 @CreatePipe(i8** ").append(rd).append(", i8** ").append(wr)
@@ -9076,6 +9072,11 @@ pb.append("  br label %").append(lblSpawn).append("\n");
             String wrV = "%prv.wrv." + tmpCount++;
             pb.append("  ").append(wrV).append(" = load i8*, i8** ").append(wr).append("\n");
             pb.append("  store i8* ").append(wrV).append(", i8** ").append(hOutPP).append("\n");
+            // hStdError = the SAME pipe write end: stderr lines flow into the callback too.
+            String hErrP = "%prv.herrp." + tmpCount++, hErrPP = "%prv.herrpp." + tmpCount++;
+            pb.append("  ").append(hErrP).append(" = getelementptr i8, i8* ").append(si8).append(", i64 96\n");
+            pb.append("  ").append(hErrPP).append(" = bitcast i8* ").append(hErrP).append(" to i8**\n");
+            pb.append("  store i8* ").append(wrV).append(", i8** ").append(hErrPP).append("\n");
             String cprOk = "%prv.cprok." + tmpCount++;
             pb.append("  ").append(cprOk).append(" = icmp eq i32 ").append(cpr).append(", 0\n");
             pb.append("  br i1 ").append(cprOk).append(", label %prl.pfail." + id + ", label %prl.proc." + id + "\n");
@@ -9254,7 +9255,7 @@ pb.append("prl.finish.").append(id).append(":\n");
             String pidZero = "%prv.pzero." + tmpCount++;
             pb.append("  ").append(pidZero).append(" = icmp eq i32 ").append(pid).append(", 0\n");
             pb.append("  br i1 ").append(pidZero).append(", label %prl.child." + id + ", label %prl.parent." + id + "\n");
-            // child: close read end, dup2 write -> stdout, execvp(argv[0], argv); _exit(127)
+            // child: close read end, dup2 write -> stdout+stderr, execvp; _exit(127)
             pb.append("prl.child.").append(id).append(":\n");
             String f0c = "%prv.f0c." + tmpCount;
             String f0cg = f0c + "g";
@@ -9270,6 +9271,8 @@ pb.append("prl.finish.").append(id).append(":\n");
             tmpCount++;
             String d2 = "%prv.d2." + tmpCount++;
             pb.append("  ").append(d2).append(" = call i32 @dup2(i32 ").append(f1c).append(", i32 1)\n");
+            String d2e = "%prv.d2e." + tmpCount++;
+            pb.append("  ").append(d2e).append(" = call i32 @dup2(i32 ").append(f1c).append(", i32 2)\n");
             String cl1 = "%prv.cl1." + tmpCount++;
             pb.append("  ").append(cl1).append(" = call i32 @close(i32 ").append(f1c).append(")\n");
             String a0s2 = "%prv.a0s2." + tmpCount++;
