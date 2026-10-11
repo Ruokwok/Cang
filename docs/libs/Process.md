@@ -6,7 +6,7 @@
 
 - `Process.exec(cmd, call[, timeout])` 执行本地命令，按行回调输出，返回退出码；`timeout` 可省略（默认 -1 = 永久等待）
 - argv 数组直接执行（**不经过 shell**），天然免疫命令注入
-- 超时或启动失败返回 `-1`；超时会终止子进程，已回调的输出保留
+- 超时返回 `-1`（会终止子进程，已回调的输出保留）；**无法启动进程抛出 `Error`**（消息 `cannot start '程序名'`，可 catch，未捕获则打印后 exit 1）
 - stderr 继承当前终端（不进回调）
 
 ## 用法
@@ -22,9 +22,13 @@ Function<Void, String> cb = (line) -> {
 }
 
 # timeout 毫秒，可省略；缺省 -1 = 永久等待
-int code = Process.exec(cmd, cb, -1)
-if (code == -1) {
-    Stdout.println("启动失败或超时")
+try {
+    int code = Process.exec(cmd, cb)
+    if (code == -1) {
+        Stdout.println("超时")
+    }
+} catch (Error e) {
+    Stdout.println(e.message)     # cannot start ''git''
 }
 ```
 
@@ -33,7 +37,7 @@ if (code == -1) {
 | 情况 | 行为 |
 |---|---|
 | 正常结束 | 返回子进程退出码；stdout 每行回调一次（含末行无换行内容） |
-| 命令不存在 / 无法启动 | 返回 `-1` |
+| 命令不存在 / 无法启动 | 抛出 `Error`：`cannot start '<cmd[0]>'` |
 | 超时 | 终止子进程，返回 `-1`；超时前已读到的行仍会回调 |
 | 空行 / 行尾 `\r` | 空行正常回调；`\r\n` 自动剥离为行内容 |
 

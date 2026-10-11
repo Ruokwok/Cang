@@ -2233,14 +2233,19 @@ public class LLVMGen {
 
     private void generateThrow(ThrowStmt stmt) {
         LLVMValue value = generateExpr(stmt.value);
+        emitThrowValue(value, stmt.line);
+    }
+
+    /** Hand a constructed Error object to the in-scope catch (or the uncaught path). */
+    private void emitThrowValue(LLVMValue value, int line) {
         if (!(value.type.endsWith("*") && value.type.startsWith("%"))) {
-            throw new RuntimeException("throw requires Error or an Error subclass (at line " + stmt.line + ")");
+            throw new RuntimeException("throw requires Error or an Error subclass (at line " + line + ")");
         }
         String raw = "%throw.raw." + tmpCount++;
         body.append("  ").append(raw).append(" = bitcast ").append(value.type).append(" ").append(value.value).append(" to i8*\n");
         body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
         if (exceptionHandlers.isEmpty()) {
-            emitUncaughtError(stmt.line);
+            emitUncaughtError(line);
             body.append("throw.dead.").append(labelCount++).append(":\n");
         } else {
             // Throw from a CATCH clause: inline every enclosing finally before propagating
@@ -2256,6 +2261,103 @@ public class LLVMGen {
             // Statements after throw are dead code but must still form a valid LLVM block.
             body.append("throw.dead.").append(labelCount++).append(":\n");
         }
+    }
+
+    /** Process.exec returned -2: the executable could not be started (catchable Error). */
+    private void emitSpawnFailThrow(String codeVal, int line) {
+        int id = labelCount++;
+        String sf = "psf.throw." + id, cont = "psf.cont." + id;
+        String cmp = "%psf.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp eq i32 ").append(codeVal).append(", -2\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(sf).append(", label %").append(cont).append("\n");
+        body.append(sf).append(":\n");
+        LLVMValue msg = emitSpawnFailMessage();
+        LLVMValue err = buildErrorWithMessage(msg);
+        if (err != null) {
+            emitThrowValue(err, line);
+        } else {
+            // Program did not import Error: nothing catchable exists — surface it like
+            // an uncaught runtime error instead of vanishing.
+            emitUncaughtErrorWith(msg, line);
+            body.append("psf.dead.").append(id).append(":\n");
+        }
+        body.append("  br label %").append(cont).append("\n");
+        body.append(cont).append(":\n");
+    }
+
+    /** "cannot start 'argv0'" (or a plain fallback) formatted into a fresh buffer. */
+    private LLVMValue emitSpawnFailMessage() {
+        String fmtWith = ensureStringConstant("@.str.psf.with", "cannot start '%s'\\00", 18);
+        String fmtPlain = ensureStringConstant("@.str.psf.plain", "cannot start process\\00", 21);
+        String buf = "%psf.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = alloca [192 x i8]\n");
+        String bp = "%psf.bp." + tmpCount++;
+        body.append("  ").append(bp).append(" = bitcast [192 x i8]* ").append(buf).append(" to i8*\n");
+        String nm = "%psf.nm." + tmpCount++;
+        body.append("  ").append(nm).append(" = load i8*, i8** @cang.proc.spawnname\n");
+        String has = "%psf.has." + tmpCount++;
+        body.append("  ").append(has).append(" = icmp ne i8* ").append(nm).append(", null\n");
+        String fmt = "%psf.fmt." + tmpCount++;
+        body.append("  ").append(fmt).append(" = select i1 ").append(has)
+             .append(", i8* ").append(fmtWith).append(", i8* ").append(fmtPlain).append("\n");
+        body.append("  call i32 (i8*, i8*, ...) @sprintf(i8* ").append(bp)
+             .append(", i8* ").append(fmt).append(", i8* ").append(nm).append(")\n");
+        return new LLVMValue(bp, "i8*");
+    }
+
+    /** Build a fresh Error object carrying the message (null when Error is unavailable). */
+    private LLVMValue buildErrorWithMessage(LLVMValue msg) {
+        ClassInfo ei = classes.get("Error");
+        if (ei == null) return null;
+        Integer msgIdx = ei.fieldIndices.get("message");
+        if (msgIdx == null) return null;
+        String ctorSym = null;
+        List<FuncInfo> grp = overloadGroups.get(ei.fullName + ".constructor");
+        if (grp != null) {
+            for (FuncInfo f : grp) {
+                if (f.paramTypes.isEmpty()) {
+                    ctorSym = f.llvmName != null ? f.llvmName : f.name;
+                    break;
+                }
+            }
+        }
+        if (ctorSym == null) return null;
+        String sizeVar = "%psf.size." + tmpCount++;
+        body.append("  ").append(sizeVar).append(" = getelementptr ").append(ei.llvmName)
+             .append(", ").append(ei.llvmName).append("* null, i32 1\n");
+        String sz = "%psf.sizeof." + tmpCount++;
+        body.append("  ").append(sz).append(" = ptrtoint ").append(ei.llvmName).append("* ")
+             .append(sizeVar).append(" to i64\n");
+        String raw = "%psf.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn())
+             .append("(i64 ").append(sz).append(")\n");
+        registerRegionAllocation(raw);
+        String obj = "%psf.err." + tmpCount++;
+        body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to ")
+             .append(ei.llvmName).append("*\n");
+        body.append("  call void @").append(ctorSym).append("(").append(ei.llvmName)
+             .append("* ").append(obj).append(")\n");
+        String mp = "%psf.msgp." + tmpCount++;
+        body.append("  ").append(mp).append(" = getelementptr ").append(ei.llvmName)
+             .append(", ").append(ei.llvmName).append("* ").append(obj)
+             .append(", i32 0, i32 ").append(msgIdx).append("\n");
+        body.append("  store i8* ").append(msg.value).append(", i8** ").append(mp).append("\n");
+        return new LLVMValue(obj, ei.llvmName + "*");
+    }
+
+    /** Uncaught variant with an explicit message (no Error object involved). */
+    private void emitUncaughtErrorWith(LLVMValue msgValue, int line) {
+        String uncaught = "uncaught." + labelCount++;
+        body.append("  br label %").append(uncaught).append("\n");
+        body.append(uncaught).append(":\n");
+        String fileName = ensureStringConstant("@.str.srcfile", escapeBytes(sourceFile.replace('\\', '/')) + "\\00", utf8Len(sourceFile) + 1);
+        ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0), i8* ")
+             .append(msgValue.value).append(")\n");
+        body.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* @.str.locfmt, i32 0, i32 0), i8* ")
+             .append(fileName).append(", i32 ").append(line).append(")\n");
+        body.append("  call void @exit(i32 1)\n");
+        body.append("  unreachable\n");
     }
 
     /** Jump out of a loop: inline enclosing finally layers first (debug.md #20), then branch.
@@ -6717,10 +6819,21 @@ public class LLVMGen {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
+            if (isProcessExec(fi)) {
+                emitSpawnFailThrow(result, line);
+            }
             String retSem = (callResultCarriesSemantic(fi.returnType))
                 ? fi.returnType : null;
             return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
         }
+    }
+
+    /** Process.exec: spawn failure returns -2 from the wrapper and throws at the call site. */
+    private static boolean isProcessExec(FuncInfo fi) {
+        boolean byClass = "cang_io_Process".equals(fi.className);
+        boolean byName = fi.name != null && fi.name.endsWith(".exec")
+                && (fi.className != null || fi.name.startsWith("cang_io_Process."));
+        return (byClass || byName) && "int".equals(fi.returnType) && !fi.isStatic == false;
     }
 
     /** The native String surface (stdlib/cang/lang/String.cang) — dispatched intrinsically. */
@@ -8530,7 +8643,8 @@ public class LLVMGen {
     /**
      * cang/io/Process — exec(String[] cmd, Function<Void,String> cb, int timeoutMs).
      * argv direct exec (no shell). stdout line-split -> callback per line; stderr inherits
-     * the terminal. Returns the child exit code; -1 = spawn failure or timeout (killed).
+     * the terminal. Returns the child exit code; -1 = timeout (killed), -2 = the
+     * executable could not be started (surfaced as a throw at the call site).
      * Labels prl.* / values prv.* — kept apart from the start (collision #6 lesson).
      */
     private void emitProcessRuntime() {
@@ -8544,6 +8658,9 @@ public class LLVMGen {
         }
         if (!header.toString().contains("@.pr.exe = ")) {
             header.append("@.pr.exe = private constant [5 x i16] [i16 46, i16 101, i16 120, i16 101, i16 0]\n");
+        }
+        if (!header.toString().contains("@cang.proc.spawnname = ")) {
+            header.append("@cang.proc.spawnname = global i8* null\n");
         }
         if (win) {
             if (!header.toString().contains("declare i32 @CreatePipe(")) {
@@ -8657,6 +8774,14 @@ public class LLVMGen {
         String nullSlot = "%prv.ns." + tmpCount++;
         pb.append("  ").append(nullSlot).append(" = getelementptr i8*, i8** ").append(argvAs2).append(", i64 ").append(icur).append("\n");
         pb.append("  store i8* null, i8** ").append(nullSlot).append("\n");
+        // Record argv[0] so the call site can say which program failed to start.
+        String psnCast = "%prv.psn." + tmpCount++;
+        pb.append("  ").append(psnCast).append(" = bitcast i8* ").append(argv).append(" to i8**\n");
+        String psnP = "%prv.psnp." + tmpCount++;
+        pb.append("  ").append(psnP).append(" = getelementptr i8*, i8** ").append(psnCast).append(", i64 0\n");
+        String psnV = "%prv.psnv." + tmpCount++;
+        pb.append("  ").append(psnV).append(" = load i8*, i8** ").append(psnP).append("\n");
+        pb.append("  store i8* ").append(psnV).append(", i8** @cang.proc.spawnname\n");
 pb.append("  br label %").append(lblSpawn).append("\n");
         if (win) {
             // ---- Windows spawn: PATH-resolve argv[0] (CreateProcess does NOT search PATH),
@@ -8970,8 +9095,10 @@ String cpOk = "%prv.cpok." + tmpCount++;
             String wrV1 = "%prv.wrv1." + tmpCount++;
             pb.append("  ").append(wrV1).append(" = load i8*, i8** ").append(wr).append("\n");
             pb.append("  %prv.cc2.").append(id).append(" = call i32 @CloseHandle(i8* ").append(wrV1).append(")\n");
+            pb.append("  store i32 -2, i32* ").append(codeSlot).append("\n");
             pb.append("  br label %").append(lblRet).append("\n");
             pb.append("prl.pfail.").append(id).append(":\n");
+            pb.append("  store i32 -2, i32* ").append(codeSlot).append("\n");
             pb.append("  br label %").append(lblRet).append("\n");
             pb.append("prl.cok.").append(id).append(":\n");
             String wrV2 = "%prv.wrv2." + tmpCount++;
@@ -9101,7 +9228,11 @@ pb.append("prl.finish.").append(id).append(":\n");
             pb.append("  ").append(pr).append(" = call i32 @pipe(i32* ").append(fdsp).append(")\n");
             String prOk = "%prv.prok." + tmpCount++;
             pb.append("  ").append(prOk).append(" = icmp eq i32 ").append(pr).append(", 0\n");
-            pb.append("  br i1 ").append(prOk).append(", label %prl.fork." + id + ", label %").append(lblRet).append("\n");
+            String pipeFail = "prl.pipefail." + id;
+            pb.append("  br i1 ").append(prOk).append(", label %prl.fork." + id + ", label %").append(pipeFail).append("\n");
+            pb.append(pipeFail).append(":\n");
+            pb.append("  store i32 -2, i32* ").append(codeSlot).append("\n");
+            pb.append("  br label %").append(lblRet).append("\n");
             pb.append("prl.fork.").append(id).append(":\n");
             String pidV = "%prv.pid." + tmpCount++;
             pb.append("  ").append(pidV).append(" = alloca i32\n");
@@ -9198,6 +9329,7 @@ pb.append("prl.finish.").append(id).append(":\n");
             tmpCount++;
             String cl1k = "%prv.cl1k." + tmpCount++;
             pb.append("  ").append(cl1k).append(" = call i32 @close(i32 ").append(f1k).append(")\n");
+            pb.append("  store i32 -2, i32* ").append(codeSlot).append("\n");
             pb.append("  br label %").append(lblRet).append("\n");
             // ---- read loop (posix): pack pollfd {fd, POLLIN} as i64, poll(20ms), read ----
             pb.append(lblReadLoop).append(":\n");
@@ -9313,7 +9445,7 @@ pb.append("prl.finish.").append(id).append(":\n");
             String c127 = "%prv.c127." + tmpCount++;
             pb.append("  ").append(c127).append(" = icmp eq i32 ").append(cOk).append(", 127\n");
             String cNf = "%prv.cnf." + tmpCount++;
-            pb.append("  ").append(cNf).append(" = select i1 ").append(c127).append(", i32 -1, i32 ").append(cOk).append("\n");
+            pb.append("  ").append(cNf).append(" = select i1 ").append(c127).append(", i32 -2, i32 ").append(cOk).append("\n");
             String tD2 = "%prv.td2p." + tmpCount;
             pb.append("  ").append(tD2).append(" = load i32, i32* ").append(timedOut).append("\n");
             tmpCount++;
