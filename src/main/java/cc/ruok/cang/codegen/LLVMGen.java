@@ -1378,6 +1378,9 @@ public class LLVMGen {
         header.append("declare i8* @realloc(i8*, i64)\n");
         header.append("declare void @free(i8*)\n");
         header.append("declare i32 @printf(i8*, ...)\n");
+        if (!header.toString().contains("declare i32 @fflush(")) {
+            header.append("declare i32 @fflush(i8*)\n");
+        }
         header.append("declare i32 @fprintf(i8*, i8*, ...)\n");
         if (targetPlatform.equals("windows")) {
             // MinGW/UCRT stderr = __acrt_iob_func(2) (FILE* slot for STDERR; linkprobe-verified)
@@ -8280,6 +8283,8 @@ public class LLVMGen {
         rk.append("}\n\n");
         // 1-arg: timeout in milliseconds; -1 = block forever; timeout/EOF -> -1
         rk.append("define i32 @cang_io_Scanner.readKey.1(i8* %this, i32 %timeoutMs) {\nentry:\n");
+        // Make earlier println output visible before we block on input (CRT buffering).
+        rk.append("  call i32 @fflush(i8* null)\n");
         // Pending byte from a multi-byte sequence whose first byte looked like a 0xE0 prefix
         // (CJK encoding data, not a scan code) — serve it before any waiting.
         rk.append("  %pd = load i32, i32* @cang.sc.pending\n");
@@ -8438,6 +8443,8 @@ public class LLVMGen {
         rl.append("}\n\n");
         // 1-arg main: gate readiness before fgets; timeout -> null (same as EOF)
         rl.append("define i8* @cang_io_Scanner.readLine.1(i8* %this, i32 %timeoutMs) {\nentry:\n");
+        // Make earlier println output visible before we block on input (CRT buffering).
+        rl.append("  call i32 @fflush(i8* null)\n");
         rl.append("  %pfdrl = alloca i64\n");
         if (win) {
             // -1 skips the wait. Console: WaitForSingleObject; pipe: PeekNamedPipe polling
@@ -8725,7 +8732,9 @@ public class LLVMGen {
                avail = "%prv.avail." + tmpCount, startT = "%prv.start." + tmpCount;
         tmpCount++;
         pb.append("define i32 @cang_io_Process.exec(i8* %cmd, %CangFunction %cb, i32 %timeoutMs) {\n");
+        // Flush pending parent output so it is visible while we wait on the child.
         pb.append("entry:\n");
+        pb.append("  call i32 @fflush(i8* null)\n");
         pb.append("  ").append(argc).append(" = load i64, i64* %cmd\n");
         pb.append("  ").append(pend).append(" = alloca i8*\n  store i8* null, i8** ").append(pend).append("\n");
         pb.append("  ").append(pendLen).append(" = alloca i64\n  store i64 0, i64* ").append(pendLen).append("\n");
