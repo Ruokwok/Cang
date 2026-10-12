@@ -6744,10 +6744,50 @@ public class LLVMGen {
             return new LLVMValue("void", "void");
         }
         if (method.equals("currentTimeMillis") && nodes.isEmpty()) {
-            String seconds = "%system.time.seconds." + tmpCount++;
+            // True millisecond wall clock (was time()*1000 = second resolution).
             String millis = "%system.time.millis." + tmpCount++;
-            body.append("  ").append(seconds).append(" = call i64 @time(i64* null)\n");
-            body.append("  ").append(millis).append(" = mul i64 ").append(seconds).append(", 1000\n");
+            if (targetPlatform.equals("windows")) {
+                // FILETIME (100ns since 1601) -> Unix ms; Precise keeps sub-ms updates.
+                if (!header.toString().contains("declare void @GetSystemTimePreciseAsFileTime(i8*)")) {
+                    header.append("declare void @GetSystemTimePreciseAsFileTime(i8*)\n");
+                }
+                String ft = "%system.time.ft." + tmpCount++;
+                body.append("  ").append(ft).append(" = alloca i64\n");
+                String ftp = "%system.time.ftp." + tmpCount++;
+                body.append("  ").append(ftp).append(" = bitcast i64* ").append(ft).append(" to i8*\n");
+                body.append("  call void @GetSystemTimePreciseAsFileTime(i8* ").append(ftp).append(")\n");
+                String ftv = "%system.time.ftv." + tmpCount++;
+                body.append("  ").append(ftv).append(" = load i64, i64* ").append(ft).append("\n");
+                String adj = "%system.time.adj." + tmpCount++;
+                body.append("  ").append(adj).append(" = sub i64 ").append(ftv).append(", 116444736000000000\n");
+                body.append("  ").append(millis).append(" = udiv i64 ").append(adj).append(", 10000\n");
+            } else {
+                // posix: gettimeofday(&tv, NULL); tv = { tv_sec, tv_usec }
+                if (!header.toString().contains("declare i32 @gettimeofday(")) {
+                    header.append("declare i32 @gettimeofday(i8*, i8*)\n");
+                }
+                String tv = "%system.time.tv." + tmpCount++;
+                body.append("  ").append(tv).append(" = alloca { i64, i64 }\n");
+                String tvp = "%system.time.tvp." + tmpCount++;
+                body.append("  ").append(tvp).append(" = bitcast { i64, i64 }* ").append(tv).append(" to i8*\n");
+                body.append("  %system.time.tvr.").append(tmpCount++)
+                     .append(" = call i32 @gettimeofday(i8* ").append(tvp).append(", i8* null)\n");
+                String secp = "%system.time.secp." + tmpCount++;
+                body.append("  ").append(secp).append(" = getelementptr { i64, i64 }, { i64, i64 }* ").append(tv)
+                     .append(", i32 0, i32 0\n");
+                String sec = "%system.time.sec." + tmpCount++;
+                body.append("  ").append(sec).append(" = load i64, i64* ").append(secp).append("\n");
+                String usecp = "%system.time.usecp." + tmpCount++;
+                body.append("  ").append(usecp).append(" = getelementptr { i64, i64 }, { i64, i64 }* ").append(tv)
+                     .append(", i32 0, i32 1\n");
+                String usec = "%system.time.usec." + tmpCount++;
+                body.append("  ").append(usec).append(" = load i64, i64* ").append(usecp).append("\n");
+                String secMs = "%system.time.secms." + tmpCount++;
+                body.append("  ").append(secMs).append(" = mul i64 ").append(sec).append(", 1000\n");
+                String usecMs = "%system.time.usecms." + tmpCount++;
+                body.append("  ").append(usecMs).append(" = sdiv i64 ").append(usec).append(", 1000\n");
+                body.append("  ").append(millis).append(" = add i64 ").append(secMs).append(", ").append(usecMs).append("\n");
+            }
             return new LLVMValue(millis, "i64");
         }
         if (method.equals("getCwd") && nodes.isEmpty()) {
