@@ -373,6 +373,9 @@ public class LLVMGen {
             }
         }
 
+        // Ban writes to captured outer locals inside lambda/thread{} blocks (by-value capture).
+        validateLambdaCaptures(classDecls, topLevelFuncs, mainStatements);
+
         // Register import aliases now that every class has been collected: alias -> same
         // ClassInfo as the real simple name (aliases never generate code of their own).
         for (AST member : program.members) {
@@ -2264,6 +2267,163 @@ public class LLVMGen {
             // Statements after throw are dead code but must still form a valid LLVM block.
             body.append("throw.dead.").append(labelCount++).append(":\n");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Lambda / thread{} capture validation: outer locals are captured BY VALUE,
+    // so assigning (or ++) to them inside the block is a compile error (Java-style
+    // effectively-final). Fields/globals are shared storage and stay allowed.
+    // ------------------------------------------------------------------
+
+    private void validateLambdaCaptures(java.util.List<ClassDecl> classDecls,
+                                        java.util.List<AST> topLevelFuncs,
+                                        java.util.List<AST> mainStatements) {
+        java.util.Deque<java.util.Set<String>> frames = new java.util.ArrayDeque<>();
+        for (AST cd : classDecls) {
+            if (!(cd instanceof ClassDecl)) continue;
+            for (AST cm : ((ClassDecl) cd).members) {
+                if (cm instanceof FuncDecl) {
+                    validateInFunction((FuncDecl) cm, frames);
+                } else if (cm instanceof ConstructorDecl) {
+                    validateInCtor((ConstructorDecl) cm, frames);
+                } else if (cm instanceof FieldDecl) {
+                    AST init = ((FieldDecl) cm).init;
+                    if (init != null) {
+                        frames.push(new java.util.LinkedHashSet<>());
+                        validateCaptures(init, frames);
+                        frames.pop();
+                    }
+                }
+            }
+        }
+        for (AST f : topLevelFuncs) {
+            if (f instanceof FuncDecl) validateInFunction((FuncDecl) f, frames);
+        }
+        if (!mainStatements.isEmpty()) {
+            frames.push(new java.util.LinkedHashSet<>());
+            for (AST s : mainStatements) validateCaptures(s, frames);
+            frames.pop();
+        }
+    }
+
+    private void validateInFunction(FuncDecl fd, java.util.Deque<java.util.Set<String>> frames) {
+        java.util.Set<String> p = new java.util.LinkedHashSet<>();
+        if (fd.params != null) for (AST.Parameter prm : fd.params) p.add(prm.name);
+        frames.push(p);
+        validateCaptures(fd.body, frames);
+        frames.pop();
+    }
+
+    private void validateInCtor(ConstructorDecl cd, java.util.Deque<java.util.Set<String>> frames) {
+        java.util.Set<String> p = new java.util.LinkedHashSet<>();
+        if (cd.params != null) for (AST.Parameter prm : cd.params) p.add(prm.name);
+        frames.push(p);
+        validateCaptures(cd.body, frames);
+        frames.pop();
+    }
+
+    /** Depth-0 frame = current function; each lambda/thread{} pushes another. */
+    private void validateCaptures(AST node, java.util.Deque<java.util.Set<String>> frames) {
+        if (node == null) return;
+
+        if (node instanceof LambdaExpr) {
+            LambdaExpr lam = (LambdaExpr) node;
+            java.util.Set<String> p = new java.util.LinkedHashSet<>();
+            if (lam.parameters != null) p.addAll(lam.parameters);
+            frames.push(p);
+            validateCaptures(lam.body, frames);
+            frames.pop();
+            return;
+        }
+        if (node instanceof ThreadBlockStmt) {
+            frames.push(new java.util.LinkedHashSet<>());
+            validateCaptures(((ThreadBlockStmt) node).body, frames);
+            frames.pop();
+            return;
+        }
+        if (node instanceof ThreadBlockExpr) {
+            frames.push(new java.util.LinkedHashSet<>());
+            validateCaptures(((ThreadBlockExpr) node).body, frames);
+            frames.pop();
+            return;
+        }
+        if (node instanceof FuncDecl) {
+            validateInFunction((FuncDecl) node, frames);
+            return;
+        }
+        if (node instanceof ConstructorDecl) {
+            validateInCtor((ConstructorDecl) node, frames);
+            return;
+        }
+        if (node instanceof AssignExpr) {
+            AssignExpr a = (AssignExpr) node;
+            if (a.target instanceof Identifier) {
+                checkCapturedWrite(((Identifier) a.target).name, node.line, frames);
+            } else {
+                validateCaptures(a.target, frames);
+            }
+            validateCaptures(a.value, frames);
+            return;
+        }
+        if (node instanceof UnaryExpr) {
+            UnaryExpr u = (UnaryExpr) node;
+            if ("++".equals(u.op) || "--".equals(u.op)) {
+                if (u.operand instanceof Identifier) {
+                    checkCapturedWrite(((Identifier) u.operand).name, node.line, frames);
+                }
+            }
+            validateCaptures(u.operand, frames);
+            return;
+        }
+        if (node instanceof VarDecl) {
+            VarDecl v = (VarDecl) node;
+            validateCaptures(v.init, frames);          // initializer runs before the name exists
+            if (frames.peek() != null && v.name != null) frames.peek().add(v.name);
+            return;
+        }
+        if (node instanceof ForEachStmt) {
+            ForEachStmt fe = (ForEachStmt) node;
+            validateCaptures(fe.iterable, frames);
+            if (frames.peek() != null) frames.peek().add(fe.varName);
+            validateCaptures(fe.body, frames);
+            return;
+        }
+        if (node instanceof CatchClause) {
+            CatchClause cc = (CatchClause) node;
+            if (frames.peek() != null && cc.name != null) frames.peek().add(cc.name);
+            validateCaptures(cc.body, frames);
+            return;
+        }
+
+        // Generic walk (statement/expression containers); scope carriers handled above.
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) {
+                    validateCaptures((AST) v, frames);
+                } else if (v instanceof java.util.List) {
+                    for (Object x : (java.util.List<?>) v) {
+                        if (x instanceof AST) validateCaptures((AST) x, frames);
+                    }
+                }
+            } catch (IllegalAccessException ignored) {
+            }
+        }
+    }
+
+    /** A write target found in an enclosing frame is a captured outer local — ban it. */
+    private void checkCapturedWrite(String name, int line, java.util.Deque<java.util.Set<String>> frames) {
+        if (name == null) return;
+        int k = 0;
+        for (java.util.Set<String> frame : frames) {
+            if (frame.contains(name)) {
+                if (k == 0) return;          // current frame: own local/param — fine
+                throw new RuntimeException("cannot assign to captured variable '" + name
+                    + "' (at line " + line + ")");
+            }
+            k++;
+        }
+        // Not a local anywhere: field/global/static — shared storage, allowed.
     }
 
     /** Process.exec returned -2: the executable could not be started (catchable Error). */

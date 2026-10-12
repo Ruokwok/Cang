@@ -87,7 +87,7 @@ x = 100
 f(2)        # 43（仍是创建时的 41）
 ```
 
-- lambda 内对被捕获变量赋值只修改**副本**，不影响外部变量；
+- **lambda 内对外部（被捕获）变量赋值 / `++` 是编译错误**（`cannot assign to captured variable`——与 Java effectively-final 同思路）；要回传结果请用容器（StringBuilder/数组/对象）或字段；
 - lambda 内声明的同名局部变量会遮蔽捕获（同名局部优先）；
 - 捕获数组、List 或类实例只快照引用本身，对象内容仍共享（对 List 的 add/remove 外部可见）；
 - 线程块 `thread { }` 仍然**禁止捕获**（见文档开头 Thread 章节）。
