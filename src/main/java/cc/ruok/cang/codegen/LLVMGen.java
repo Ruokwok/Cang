@@ -8399,7 +8399,7 @@ public class LLVMGen {
      *  POSIX v1: getchar (line-buffered downgrade) + fgets — documented. */
     private void emitScannerRuntime() {
         ClassInfo scCi = classes.get("cang_io_Scanner");
-        if (scCi == null || !imports.contains("cang/io/Scanner")) return;
+        if (scCi == null) return;
         boolean win = targetPlatform.equals("windows");
 
         // Pending byte for a 0xE0-prefixed CJK sequence (readKey only; -1 = none)
@@ -8816,7 +8816,7 @@ public class LLVMGen {
      */
     private void emitProcessRuntime() {
         ClassInfo pCi = classes.get("cang_io_Process");
-        if (pCi == null || !imports.contains("cang/io/Process")) return;
+        if (pCi == null) return;
         boolean win = targetPlatform.equals("windows");
         StringBuilder pb = new StringBuilder();
         // libc / kernel32 declares (contains-guarded; scanner may already declare Sleep/Peek/GetTickCount64)
@@ -9825,7 +9825,7 @@ pb.append("prl.finish.").append(id).append(":\n");
 
     private void emitFileRuntime() {
         ClassInfo fileCi = classes.get("cang_io_File");
-        if (fileCi == null || !imports.contains("cang/io/File")) return;
+        if (fileCi == null) return;
         if (fileCi.fieldIndices.get("path") == null) return;
 
         // --- string constants used by helpers ---

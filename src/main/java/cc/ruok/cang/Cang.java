@@ -3,6 +3,7 @@ package cc.ruok.cang;
 import cc.ruok.cang.codegen.LLVMGen;
 import cc.ruok.cang.lexer.Lexer;
 import cc.ruok.cang.lexer.Token;
+import cc.ruok.cang.lexer.TokenType;
 import cc.ruok.cang.parser.AST;
 import cc.ruok.cang.parser.Parser;
 import cc.ruok.cang.util.CompileError;
@@ -363,12 +364,200 @@ public class Cang {
         }
 
 
+        // Bare type references resolve as: explicit imports (above) -> stdlib cang/lang/
+        // -> stdlib cang/io/. Anything else stays unresolved and fails later with
+        // "Unknown class". Keywords (int/String/...) are builtin and never looked up.
+        java.util.Set<String> autoTried = new java.util.HashSet<>();
+        for (int round = 0; round < 32; round++) {
+            java.util.Set<String> refs = new java.util.LinkedHashSet<>();
+            collectTypeRefs(mainProgram, refs);
+            for (AST m : allMembers) collectTypeRefs(m, refs);
+            java.util.Set<String> known = new java.util.HashSet<>();
+            for (AST m : allMembers) {
+                if (m instanceof AST.ClassDecl) known.add(((AST.ClassDecl) m).name);
+            }
+            for (AST m : mainProgram.members) {
+                if (m instanceof AST.ClassDecl) known.add(((AST.ClassDecl) m).name);
+            }
+            boolean loadedAny = false;
+            for (String r : refs) {
+                if (r == null || known.contains(r) || autoTried.contains(r)) continue;
+                autoTried.add(r);
+                if (TokenType.keywords().contains(r)) continue;
+                String pkg = null;
+                if (resolveImportFile(sourceRoot, "cang/lang/" + r) != null) {
+                    pkg = "cang/lang/" + r;
+                } else if (resolveImportFile(sourceRoot, "cang/io/" + r) != null) {
+                    pkg = "cang/io/" + r;
+                }
+                if (pkg == null) continue;
+                List<AST> more = loadImport(pkg, sourceRoot, visitedFiles);
+                if (!more.isEmpty()) {
+                    allMembers.addAll(more);
+                    loadedAny = true;
+                }
+            }
+            if (!loadedAny) break;
+        }
+
         // Add main file's members LAST (after imports so parents are collected first)
         for (AST member : mainProgram.members) {
             allMembers.add(member);
         }
 
         return new AST.Program(allMembers);
+    }
+
+    private static void collectTypeRefs(java.util.List<?> nodes, java.util.Set<String> out) {
+        if (nodes == null) return;
+        for (Object n : nodes) {
+            if (n instanceof AST) collectTypeRefs((AST) n, out);
+        }
+    }
+
+    /** Collect referenced type names from an AST subtree (type positions only). */
+    private static void collectTypeRefs(AST node, java.util.Set<String> out) {
+        if (node == null) return;
+        if (node instanceof AST.VarDecl) {
+            AST.VarDecl v = (AST.VarDecl) node;
+            addTypeName(v.type, out);
+            collectTypeRefs(v.init, out);
+            return;
+        }
+        if (node instanceof AST.FieldDecl) {
+            AST.FieldDecl f = (AST.FieldDecl) node;
+            addTypeName(f.type, out);
+            collectTypeRefs(f.init, out);
+            return;
+        }
+        if (node instanceof AST.FuncDecl) {
+            AST.FuncDecl f = (AST.FuncDecl) node;
+            addTypeName(f.returnType, out);
+            collectTypeRefs(f.params, out);
+            collectTypeRefs(f.body, out);
+            return;
+        }
+        if (node instanceof AST.ConstructorDecl) {
+            AST.ConstructorDecl c = (AST.ConstructorDecl) node;
+            collectTypeRefs(c.params, out);
+            collectTypeRefs(c.body, out);
+            return;
+        }
+        if (node instanceof AST.Parameter) {
+            AST.Parameter p = (AST.Parameter) node;
+            addTypeName(p.type, out);
+            collectTypeRefs(p.defaultValue, out);
+            return;
+        }
+        if (node instanceof AST.ClassDecl) {
+            addTypeName(((AST.ClassDecl) node).superClass, out);
+            // fall through to the generic walk for members / ctor params
+        } else if (node instanceof AST.NewExpr) {
+            AST.NewExpr n = (AST.NewExpr) node;
+            addTypeName(n.className, out);
+            if (n.typeArgs != null) for (String t : n.typeArgs) addTypeName(t, out);
+            collectTypeRefs(n.args, out);
+            return;
+        } else if (node instanceof AST.NewArrayExpr) {
+            AST.NewArrayExpr a = (AST.NewArrayExpr) node;
+            addTypeName(a.type, out);
+            collectTypeRefs(a.size, out);
+            return;
+        } else if (node instanceof AST.CatchClause) {
+            AST.CatchClause c = (AST.CatchClause) node;
+            addTypeName(c.type, out);
+            collectTypeRefs(c.body, out);
+            return;
+        } else if (node instanceof AST.ForEachStmt) {
+            AST.ForEachStmt fe = (AST.ForEachStmt) node;
+            addTypeName(fe.varType, out);
+            collectTypeRefs(fe.iterable, out);
+            collectTypeRefs(fe.body, out);
+            return;
+        } else if (node instanceof AST.MethodCallExpr) {
+            AST.MethodCallExpr mc = (AST.MethodCallExpr) node;
+            // Static-call candidate: `Process.exec(...)` names the class as the receiver.
+            if (mc.object instanceof AST.Identifier) {
+                addTypeName(((AST.Identifier) mc.object).name, out);
+            }
+            collectTypeRefs(mc.object, out);
+            collectTypeRefs(mc.args, out);
+            return;
+        } else if (node instanceof AST.FunctionRefExpr) {
+            AST.FunctionRefExpr fr = (AST.FunctionRefExpr) node;
+            if (fr.receiver instanceof AST.Identifier) {
+                addTypeName(((AST.Identifier) fr.receiver).name, out);
+            }
+            collectTypeRefs(fr.receiver, out);
+            return;
+        } else if (node instanceof AST.LikeExpr) {
+            addTypeName(((AST.LikeExpr) node).className, out);
+            collectTypeRefs(((AST.LikeExpr) node).expr, out);
+            return;
+        } else if (node instanceof AST.LambdaExpr) {
+            AST.LambdaExpr lam = (AST.LambdaExpr) node;
+            addTypeName(lam.returnType, out);
+            collectTypeRefs(lam.body, out);
+            return;
+        }
+
+        for (java.lang.reflect.Field f : node.getClass().getFields()) {
+            try {
+                Object v = f.get(node);
+                if (v instanceof AST) {
+                    collectTypeRefs((AST) v, out);
+                } else if (v instanceof java.util.List) {
+                    for (Object x : (java.util.List<?>) v) {
+                        if (x instanceof AST) collectTypeRefs((AST) x, out);
+                    }
+                }
+            } catch (IllegalAccessException ignored) {
+            }
+        }
+    }
+
+    /**
+     * Normalize a type string to candidate class names: strips array dims, walks into
+     * generic arguments (Function&lt;Void, Error&gt; contributes Function AND Error),
+     * keeps plain identifiers only.
+     */
+    private static void addTypeName(String raw, java.util.Set<String> out) {
+        if (raw == null) return;
+        String s = raw.trim();
+        if (s.isEmpty()) return;
+        while (s.endsWith("]")) {
+            int i = s.lastIndexOf('[');
+            if (i <= 0) return;
+            s = s.substring(0, i).trim();
+        }
+        int lt = s.indexOf('<');
+        if (lt > 0 && s.endsWith(">")) {
+            addTypeName(s.substring(0, lt), out);
+            for (String part : splitTopLevelArgs(s.substring(lt + 1, s.length() - 1))) {
+                addTypeName(part, out);
+            }
+            return;
+        }
+        if (s.indexOf('/') >= 0) return;
+        if (!s.matches("[A-Za-z_][A-Za-z_0-9]*")) return;
+        out.add(s);
+    }
+
+    /** Split on top-level commas (nesting-aware for &lt;&gt; () []). */
+    private static List<String> splitTopLevelArgs(String s) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '<' || c == '(' || c == '[') depth++;
+            else if (c == '>' || c == ')' || c == ']') depth--;
+            else if (c == ',' && depth == 0) {
+                parts.add(s.substring(start, i));
+                start = i + 1;
+            }
+        }
+        if (start < s.length()) parts.add(s.substring(start));
+        return parts;
     }
 
     /**
