@@ -5874,6 +5874,12 @@ public class LLVMGen {
                     && classes.containsKey("cang_io_File")) {
                 return makeStringConstant(targetPlatform.equals("windows") ? "\\" : "/");
             }
+            if (objName.equals("Thread") && node.method.equals("sleep")) {
+                if (node.args.size() != 1) {
+                    throw new RuntimeException("Thread.sleep expects one argument (at line " + node.line + ")");
+                }
+                return generateThreadSleep(node.args.get(0), node.line);
+            }
         }
 
         // Arrays expose length() as a built-in method. The length is stored in the i64 header.
@@ -6480,6 +6486,56 @@ public class LLVMGen {
         if (posix) x.append("  ret i8* null\n}\n\n");
         else x.append("  ret i32 0\n}\n\n");
         extraDefs.append(x);
+    }
+
+    /**
+     * static Thread.sleep(time): park the CURRENT thread for `time` milliseconds.
+     * Windows Sleep(DWORD); posix nanosleep(timespec). Negative clamps to 0.
+     */
+    private LLVMValue generateThreadSleep(AST msAst, int line) {
+        LLVMValue msVal = generateExpr(msAst);
+        String ms64 = castValue(msVal, "i64");
+        String neg = "%sleep.neg." + tmpCount++;
+        body.append("  ").append(neg).append(" = icmp slt i64 ").append(ms64).append(", 0\n");
+        String z = "%sleep.z." + tmpCount++;
+        body.append("  ").append(z).append(" = select i1 ").append(neg).append(", i64 0, i64 ").append(ms64).append("\n");
+        if (targetPlatform.equals("windows")) {
+            if (!header.toString().contains("declare void @Sleep(i32)")) {
+                header.append("declare void @Sleep(i32)\n");
+            }
+            String big = "%sleep.big." + tmpCount++;
+            body.append("  ").append(big).append(" = icmp sgt i64 ").append(z).append(", 4294967295\n");
+            String clamped = "%sleep.cl." + tmpCount++;
+            body.append("  ").append(clamped).append(" = select i1 ").append(big).append(", i64 4294967295, i64 ").append(z).append("\n");
+            String ms32 = "%sleep.ms32." + tmpCount++;
+            body.append("  ").append(ms32).append(" = trunc i64 ").append(clamped).append(" to i32\n");
+            body.append("  call void @Sleep(i32 ").append(ms32).append(")\n");
+        } else {
+            if (!header.toString().contains("declare i32 @nanosleep(")) {
+                header.append("declare i32 @nanosleep(i8*, i8*)\n");
+            }
+            String sec = "%sleep.sec." + tmpCount++;
+            body.append("  ").append(sec).append(" = sdiv i64 ").append(z).append(", 1000\n");
+            String rem = "%sleep.rem." + tmpCount++;
+            body.append("  ").append(rem).append(" = srem i64 ").append(z).append(", 1000\n");
+            String nsec = "%sleep.ns." + tmpCount++;
+            body.append("  ").append(nsec).append(" = mul i64 ").append(rem).append(", 1000000\n");
+            String ts = "%sleep.ts." + tmpCount++;
+            body.append("  ").append(ts).append(" = alloca { i64, i64 }\n");
+            String ts0 = "%sleep.ts0." + tmpCount++;
+            body.append("  ").append(ts0).append(" = getelementptr { i64, i64 }, { i64, i64 }* ").append(ts)
+                 .append(", i32 0, i32 0\n");
+            body.append("  store i64 ").append(sec).append(", i64* ").append(ts0).append("\n");
+            String ts1 = "%sleep.ts1." + tmpCount++;
+            body.append("  ").append(ts1).append(" = getelementptr { i64, i64 }, { i64, i64 }* ").append(ts)
+                 .append(", i32 0, i32 1\n");
+            body.append("  store i64 ").append(nsec).append(", i64* ").append(ts1).append("\n");
+            String tsp = "%sleep.tsp." + tmpCount++;
+            body.append("  ").append(tsp).append(" = bitcast { i64, i64 }* ").append(ts).append(" to i8*\n");
+            body.append("  %sleep.rv.").append(tmpCount++)
+                 .append(" = call i32 @nanosleep(i8* ").append(tsp).append(", i8* null)\n");
+        }
+        return new LLVMValue("void", "void");
     }
 
     private LLVMValue generateThreadJoin(LLVMValue receiver, int line) {

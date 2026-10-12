@@ -5,7 +5,7 @@
 ## 要点
 - 对象式 new Thread([daemon]).task(fn).start() + join；thread { } 是其语法糖（= new Thread(false).task(...).start()，可捕获、可 `var th =` 拿句柄）；非守护退出前等待，new Thread(true) 守护不等
 - **Thread.spawn 已移除**（编译期报错并提示迁移）；对象式任务为 void 无参，fn 收方法引用/顶层函数/无参 lambda
-- 仅值类型跨线程（对象式任务的 receiver 除外）；与 Boehm GC 兼容（GC_CreateThread）
+- 仅值类型跨线程（对象式任务的 receiver 除外）；与 Boehm GC 兼容（GC_CreateThread）；`Thread.sleep(ms)` 休眠**当前线程**（long 毫秒，可省 import）
 
 ## Thread<T> 与 spawn 的移除
 
@@ -32,6 +32,18 @@ t.join()
 `thread_reject` 断言 spawn 移除报错；`thread_double_join` 断言重复 join 运行时错误。
 Linux/macOS 已验证 LLVM IR 与目标文件编译，实际链接运行需对应平台环境。
 
+### Thread.sleep — 休眠当前线程
+
+```cang
+Thread.sleep(200)          # 阻塞当前线程 200 毫秒（参数 long，可写 int 字面量）
+long ms = 150
+Thread.sleep(ms)
+```
+
+- 语义 = **当前线程**：写在 main 里休眠主线程，写在 `thread { }` / 对象式任务里休眠该工作线程；
+- Windows 走 `Sleep(DWORD)`（负值按 0、超 DWORD 饱和），posix 走 `nanosleep`；
+- `sleep()` 缺参或多参是编译错误（`Thread.sleep expects one argument`）；
+- 静态方法，标准库自动查找——无需 import。
 ### thread { } 语法糖
 
 `thread { ... }` 等价于对象式写法（**非守护** + 无参 lambda 任务），可作为语句，也可以

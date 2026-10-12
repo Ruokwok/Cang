@@ -86,7 +86,7 @@ $pos = @("arr_syntax","arr_class","arr_nested","arr_assign","function_full","try
          "t_num_lit","t_switch","t_print_obj","t_sys_exit","t_free_file","t_freed_scope",
          "t_range_ok","t_print_bool","t_private_ctor","t_singleton","t_string","t_parse","t_math2",
          "t_process","t_process_missing","t_process_to","t_sys_cwd","t_str_utf8","t_sys_execdir",
-         "t_lambda_ok",
+         "t_lambda_ok","t_thread_sleep",
          "t_stringbuilder")
 $err = @("t_nullfield","t_nullfield_w","t_nullfield_chain","t_divzero","t_stackoverflow",
          "t_arraylist_bounds","t_arrwrite","t_arrnull","t_thread_obj_err2","t_dict_err",
