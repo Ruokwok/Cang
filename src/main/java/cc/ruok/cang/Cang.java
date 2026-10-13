@@ -1045,16 +1045,16 @@ public class Cang {
 
     /**
      * Locate the Boehm GC static library FILE for --gc linking.
-     * override accepts a file path or a directory containing libgc.a.
-     * Search order: lib/{os}_amd64_libgc.a (cwd, then parent), then the
-     * legacy runtime/boehm/<os>-amd64/lib/libgc.a layout.
+     * override accepts a file path or a directory containing libgc.a
+     * (plus lib/libgc_<os>_amd64.a inside that directory).
+     * Default search: ONLY lib/libgc_<os>_amd64.a under cwd and its parent.
      */
     private static String findGcLib(String target, String override) {
         String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
         String altKey = target.equals("windows") ? "windows" : osKey;
-        String[] libNames = { osKey + "_amd64_libgc.a", altKey + "_amd64_libgc.a" };
+        String[] libNames = { "libgc_" + osKey + "_amd64.a", "libgc_" + altKey + "_amd64.a" };
         // 1) explicit --gc-lib / CompileOptions.libRoot: a file as-is, or a directory:
-        //    <dir>/libgc.a, <dir>/lib/libgc.a, or <dir>/lib/<os>_amd64_libgc.a (project layout)
+        //    <dir>/libgc.a, <dir>/lib/libgc.a, or <dir>/lib/libgc_<os>_amd64.a (project layout)
         if (override != null) {
             File f = new File(override);
             if (f.isFile()) return f.getAbsolutePath();
@@ -1073,8 +1073,10 @@ public class Cang {
                 }
             }
         }
+        // 2) default: ONLY lib/libgc_<os>_amd64.a under cwd and its parent
+        //    (the old runtime/boehm + boehm-build fallbacks are removed —
+        //    they are machine-local leftovers and absent on other devices)
         String cwd = System.getProperty("user.dir");
-        // 2) cwd lib/ layout: window_/linux_/mac_ + amd64 (also accept the 'windows' spelling)
         String[] bases = { cwd, cwd + File.separator + ".." };
         for (String base : bases) {
             for (String name : libNames) {
@@ -1085,25 +1087,6 @@ public class Cang {
                     } catch (IOException e) {
                         return f.getAbsolutePath();
                     }
-                }
-            }
-        }
-        // 3) legacy layout fallback
-        String[] legacyDirs = {
-            cwd + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib",
-            cwd + File.separator + ".." + File.separator + "runtime" + File.separator + "boehm" + File.separator + target + "-amd64" + File.separator + "lib",
-            target.equals("windows")
-                ? cwd + File.separator + "target" + File.separator + "boehm-build" + File.separator + "bdwgc"
-                : null
-        };
-        for (String dir : legacyDirs) {
-            if (dir == null) continue;
-            File f = new File(dir, "libgc.a");
-            if (f.isFile()) {
-                try {
-                    return f.getCanonicalPath();
-                } catch (IOException e) {
-                    return f.getAbsolutePath();
                 }
             }
         }

@@ -119,7 +119,7 @@ if (r.isSuccess()) {
 - **产物目录**：`.targetRoot(目录)` → 产物一律在 `<目录>/target/` 下
   （`xxx.exe` / `.ll` / `.o` 同基名；不传 = 进程 cwd 的 `target/`，与 CLI 一致）。
   与 `outputName` 组合即 `<targetRoot>/target/<name>.exe`；`outputName` 自带路径分隔符时
-  视为显式路径、忽略 targetRoot。- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
+  视为显式路径、忽略 targetRoot。- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。GC 默认查找**只认** `lib/libgc_<os>_amd64.a`（cwd 及其上级的 lib/，无 runtime 兜底）——IDE 进程 cwd 不在编译器目录时必须传 `libRoot`。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
   （如 `window_amd64_libgc.a`，另认 `<目录>/lib/libgc.a`、`<目录>/libgc.a` 与文件直传）——
   IDE 进程的 cwd 不是编译器安装目录时**必须传**，否则报
   `Boehm GC static library not found for windows target`；CLI 的 `--gc-lib <目录>` 同语义；
