@@ -1110,29 +1110,43 @@ public class Cang {
 
     public static void compileLinux(String llFile, String baseName, boolean gc, String libRoot) throws IOException, InterruptedException {
         String exeFile = baseName;
-        String wslLlFile = toWslPath(llFile);
-        String wslExeFile = toWslPath(exeFile);
 
-        String gcArgs = "";
+        String clangPath = findTool("clang.exe", new String[]{
+            "D:\\Program Files\\LLVM\\bin\\clang.exe",
+            "C:\\Program Files\\LLVM\\bin\\clang.exe"
+        });
+        String sysroot = findLinuxSysroot();
+        if (sysroot == null) {
+            throw new LinkFailed("linux sysroot not found");
+        }
+
+        List<String> args = new ArrayList<>();
+        args.add(clangPath);
+        args.add("--target=x86_64-unknown-linux-gnu");
+        args.add("--sysroot=" + sysroot);
+        args.add("--gcc-toolchain=" + sysroot + File.separator + "usr");
+        args.add("-fuse-ld=lld");
+        args.add("-rtlib=libgcc");
+        args.add(llFile);
         if (gc) {
             String gcLib = findGcLib("linux", libRoot);
             if (gcLib == null) {
                 throw new LinkFailed("Boehm GC static library not found for linux target");
             }
-            gcArgs = " \"" + toWslPath(gcLib) + "\"";
+            args.add(gcLib);
         }
+        args.add("-o");
+        args.add(exeFile);
 
-        log.println("Compiling for Linux via WSL...");
-        ProcessBuilder pb = new ProcessBuilder("wsl",
-            "sh", "-c",
-            "clang -target x86_64-unknown-linux-gnu -fuse-ld=lld \"" + wslLlFile + "\"" + gcArgs + " -o \"" + wslExeFile + "\"");
+        log.println("Compiling for Linux (local cross)...");
+        ProcessBuilder pb = new ProcessBuilder(args);
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        String wslOut = new String(p.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        String linkOut = new String(p.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         if (p.waitFor() == 0) {
             log.println("Success: " + exeFile + " (Linux ELF)");
         } else {
-            throw new LinkFailed("linux link failed", wslOut.trim());
+            throw new LinkFailed("linux link failed", linkOut.trim());
         }
     }
 
@@ -1140,13 +1154,28 @@ public class Cang {
         throw new LinkFailed("macOS target is not implemented");
     }
 
-    private static String toWslPath(String winPath) {
-        String p = winPath.replace('\\', '/');
-        if (p.length() >= 2 && p.charAt(1) == ':') {
-            char drive = Character.toLowerCase(p.charAt(0));
-            p = "/mnt/" + drive + p.substring(2);
+    /**
+     * Locate pkg/sysroot-linux-amd64 (glibc sysroot for local cross-linking)
+     * under cwd and its parent. Must contain crt1.o.
+     */
+    private static String findLinuxSysroot() {
+        String cwd = System.getProperty("user.dir");
+        String[] candidates = {
+            cwd + File.separator + "pkg" + File.separator + "sysroot-linux-amd64",
+            cwd + File.separator + ".." + File.separator + "pkg" + File.separator + "sysroot-linux-amd64",
+            cwd + File.separator + "sysroot-linux-amd64"
+        };
+        for (String c : candidates) {
+            File f = new File(c);
+            if (new File(f, "usr" + File.separator + "lib" + File.separator + "x86_64-linux-gnu" + File.separator + "crt1.o").isFile()) {
+                try {
+                    return f.getCanonicalPath();
+                } catch (IOException e) {
+                    return f.getAbsolutePath();
+                }
+            }
         }
-        return p;
+        return null;
     }
 
     /**
