@@ -7089,9 +7089,9 @@ public class LLVMGen {
 
     /** ProcessBuilder.exec: spawn failure returns -2 from the wrapper and throws at the call site. */
     private static boolean isProcessExec(FuncInfo fi) {
-        boolean byClass = "cang_io_ProcessBuilder".equals(fi.className);
+        boolean byClass = "cang_lang_ProcessBuilder".equals(fi.className);
         boolean byName = fi.name != null && fi.name.endsWith(".exec")
-                && (fi.className != null || fi.name.startsWith("cang_io_ProcessBuilder."));
+                && (fi.className != null || fi.name.startsWith("cang_lang_ProcessBuilder."));
         return (byClass || byName) && "int".equals(fi.returnType) && !fi.isStatic == false;
     }
 
@@ -8904,14 +8904,14 @@ public class LLVMGen {
     }
 
     /**
-     * cang/io/ProcessBuilder — exec(String[] cmd, Function<Void,String> cb, int timeoutMs).
+     * cang/lang/ProcessBuilder — exec(String[] cmd, Function<Void,String> cb, int timeoutMs).
      * argv direct exec (no shell). stdout line-split -> callback per line; stderr inherits
      * the terminal. Returns the child exit code; -1 = timeout (killed), -2 = the
      * executable could not be started (surfaced as a throw at the call site).
      * Labels prl.* / values prv.* — kept apart from the start (collision #6 lesson).
      */
     private void emitProcessRuntime() {
-        ClassInfo pCi = classes.get("cang_io_ProcessBuilder");
+        ClassInfo pCi = classes.get("cang_lang_ProcessBuilder");
         if (pCi == null) return;
         boolean win = targetPlatform.equals("windows");
         StringBuilder pb = new StringBuilder();
@@ -8987,7 +8987,7 @@ public class LLVMGen {
                tmpBuf = "%prv.tmpbuf." + tmpCount, nrd = "%prv.nrd." + tmpCount,
                avail = "%prv.avail." + tmpCount, startT = "%prv.start." + tmpCount;
         tmpCount++;
-        pb.append("define i32 @cang_io_ProcessBuilder.exec(i8* %cmd, %CangFunction %cb, i32 %timeoutMs) {\n");
+        pb.append("define i32 @cang_lang_ProcessBuilder.exec(i8* %cmd, %CangFunction %cb, i32 %timeoutMs) {\n");
         // Flush pending parent output so it is visible while we wait on the child.
         pb.append("entry:\n");
         pb.append("  call i32 @fflush(i8* null)\n");

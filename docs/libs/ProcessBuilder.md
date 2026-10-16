@@ -12,7 +12,7 @@
 ## 用法
 
 ```cang
-import cang/io/ProcessBuilder
+import cang/lang/ProcessBuilder
 
 # 命令 + 参数数组；cmd[0] 是可执行文件（PATH 搜索 / 绝对路径均可）
 String[] cmd = ["git", "log", "--oneline", "-3"]
