@@ -1,7 +1,7 @@
 namespace cang/io
 
-# Process - 执行本地命令（编译器内建，需 import cang/io/Process）
-class Process
+# ProcessBuilder - 执行本地命令（编译器内建，需 import cang/io/ProcessBuilder）
+class ProcessBuilder
 
 # 执行命令：cmd[0] 为可执行文件、其余为参数（无 shell，注入安全）。
 # call 是输出回调：stdout 与 stderr 合并（等价 2>&1），每读到一行调用一次 call(line)。

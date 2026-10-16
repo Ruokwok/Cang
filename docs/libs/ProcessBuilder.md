@@ -1,10 +1,10 @@
-# Process 本地命令执行
+# ProcessBuilder 本地命令执行
 
 > 返回 [文档索引](../README.md)
 
 ## 要点
 
-- `Process.exec(cmd, call[, timeout])` 执行本地命令，按行回调输出，返回退出码；`timeout` 可省略（默认 -1 = 永久等待）
+- `ProcessBuilder.exec(cmd, call[, timeout])` 执行本地命令，按行回调输出，返回退出码；`timeout` 可省略（默认 -1 = 永久等待）
 - argv 数组直接执行（**不经过 shell**），天然免疫命令注入
 - 超时返回 `-1`（会终止子进程，已回调的输出保留）；**无法启动进程抛出 `Error`**（消息 `cannot start '程序名'`，可 catch，未捕获则打印后 exit 1）
 - stderr 与 stdout **合并进同一回调**（等价 `2>&1`，行序按到达顺序交错）
@@ -12,7 +12,7 @@
 ## 用法
 
 ```cang
-import cang/io/Process
+import cang/io/ProcessBuilder
 
 # 命令 + 参数数组；cmd[0] 是可执行文件（PATH 搜索 / 绝对路径均可）
 String[] cmd = ["git", "log", "--oneline", "-3"]
@@ -23,7 +23,7 @@ Function<Void, String> cb = (line) -> {
 
 # timeout 毫秒，可省略；缺省 -1 = 永久等待
 try {
-    int code = Process.exec(cmd, cb)
+    int code = ProcessBuilder.exec(cmd, cb)
     if (code == -1) {
         Stdout.println("超时")
     }

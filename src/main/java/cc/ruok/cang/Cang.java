@@ -476,7 +476,7 @@ public class Cang {
             return;
         } else if (node instanceof AST.MethodCallExpr) {
             AST.MethodCallExpr mc = (AST.MethodCallExpr) node;
-            // Static-call candidate: `Process.exec(...)` names the class as the receiver.
+            // Static-call candidate: `ProcessBuilder.exec(...)` names the class as the receiver.
             if (mc.object instanceof AST.Identifier) {
                 addTypeName(((AST.Identifier) mc.object).name, out);
             }
@@ -766,7 +766,7 @@ public class Cang {
         "cang/lang/Dict.cang",
         "cang/io/File.cang",
         "cang/io/Scanner.cang",
-        "cang/io/Process.cang",
+        "cang/io/ProcessBuilder.cang",
         "cang/lang/StringBuilder.cang"
     };
 

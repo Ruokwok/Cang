@@ -1,4 +1,4 @@
-import cang/io/Process
+import cang/io/ProcessBuilder
 import cang/io/File
 import cang/lang/System
 
@@ -156,6 +156,6 @@ if (addGcc) {
 Function<Void, String> cb = (line) -> {
     Stdout.println(line)
 }
-int code = Process.exec(cmd, cb, -1)
+int code = ProcessBuilder.exec(cmd, cb, -1)
 System.exit(code)
 }
