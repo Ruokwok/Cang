@@ -1496,9 +1496,11 @@ public class LLVMGen {
 
         // Function object: { code pointer, receiver/environment }
         header.append("%CangFunction = type { i8*, i8* }\n");
-        // Handle { osTid, resultSlot, joined, id, parent } — id: atomic 0..N-1;
-        // parent: creator's self handle (uncollectable, identity-stable) or null for main.
-        header.append("%CangThreadHandle = type { i64, i8*, i32, i32, i8* }\n");
+        // Handle { osTid, resultSlot, joined, id, parent, kind } — id: atomic 0..N-1;
+        // parent: creator's self handle (uncollectable) or null for main;
+        // kind: 0 = birth handle (osTid = OS handle / pthread_t), 1 = currentThread self
+        // handle (osTid = thread id) — isAlive probes differ per kind on Windows.
+        header.append("%CangThreadHandle = type { i64, i8*, i32, i32, i8*, i32 }\n");
         // Object-style Thread: new Thread().task(fn).start() — { task code, task receiver,
         // handle, daemon, id, parent } — id/parent assigned at new Thread(), copied at start().
         header.append("%CangThreadObj = type { i8*, i8*, i8*, i1, i32, i8* }\n");
@@ -5859,39 +5861,79 @@ public class LLVMGen {
                 return generateThreadJoin(receiver, node.line);
             }
         }
-        // getId / getParent: logical id on the object (assigned at new Thread()) or on any
-        // Thread handle; parent = creator's self handle (null for the main thread).
+        // getId / getParent / isAlive: logical id on the object (assigned at new Thread()) or
+        // on any Thread handle; parent = creator's self handle (null for main); isAlive probes
+        // the OS thread (unstarted object is never alive).
         if (objCache == null && node.object != null
-                && (node.method.equals("getId") || node.method.equals("getParent"))) {
+                && (node.method.equals("getId") || node.method.equals("getParent")
+                        || node.method.equals("isAlive"))) {
             objCache = generateExpr(node.object);
             LLVMValue receiver = objCache;
             if (!node.args.isEmpty()) {
                 throw new RuntimeException("Thread." + node.method + " accepts no arguments (at line " + node.line + ")");
             }
             boolean wantParent = node.method.equals("getParent");
-            String gep = null;
-            if (receiver.type.equals("%CangThreadObj*")) {
-                gep = "%thr.getid.objp." + tmpCount++;
-                body.append("  ").append(gep).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
-                     .append(", i32 0, i32 ").append(wantParent ? 5 : 4).append("\n");
-            } else if (receiver.type.equals("%CangThreadHandle*")
-                    && receiver.semanticType != null && isThreadType(receiver.semanticType)) {
-                gep = "%thr.getid.hp." + tmpCount++;
-                body.append("  ").append(gep).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value)
-                     .append(", i32 0, i32 ").append(wantParent ? 4 : 3).append("\n");
-            }
-            if (gep != null) {
-                String val = "%thr.getid.v." + tmpCount++;
-                if (wantParent) {
-                    body.append("  ").append(val).append(" = load i8*, i8** ").append(gep).append("\n");
-                    String typed = "%thr.getid.t." + tmpCount++;
-                    body.append("  ").append(typed).append(" = bitcast i8* ").append(val).append(" to %CangThreadHandle*\n");
-                    return new LLVMValue(typed, "%CangThreadHandle*", "Thread<void>");
+            boolean wantAlive = node.method.equals("isAlive");
+            if (wantAlive) {
+                emitThreadIsAliveHelper();
+                if (receiver.type.equals("%CangThreadObj*")) {
+                    String hp = "%thr.alive.hp." + tmpCount++;
+                    body.append("  ").append(hp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+                         .append(", i32 0, i32 2\n");
+                    String h = "%thr.alive.h." + tmpCount++;
+                    body.append("  ").append(h).append(" = load i8*, i8** ").append(hp).append("\n");
+                    String hn = "%thr.alive.hn." + tmpCount++;
+                    body.append("  ").append(hn).append(" = icmp eq i8* ").append(h).append(", null\n");
+                    int lbl = labelCount++;
+                    String notStarted = "thr.alive.ns." + lbl;
+                    String probe = "thr.alive.pr." + lbl;
+                    String res = "thr.alive.res." + lbl;
+                    body.append("  br i1 ").append(hn).append(", label %").append(notStarted).append(", label %").append(probe).append("\n");
+                    body.append(notStarted).append(":\n");
+                    body.append("  br label %").append(res).append("\n");
+                    body.append(probe).append(":\n");
+                    String a = "%thr.alive.a." + tmpCount++;
+                    body.append("  ").append(a).append(" = call i1 @cang.thread.isalive(i8* ").append(h).append(")\n");
+                    body.append("  br label %").append(res).append("\n");
+                    body.append(res).append(":\n");
+                    String r = "%thr.alive.r." + tmpCount++;
+                    body.append("  ").append(r).append(" = phi i1 [ false, %").append(notStarted).append(" ], [ ").append(a).append(", %").append(probe).append(" ]\n");
+                    return new LLVMValue(r, "i1");
                 }
-                body.append("  ").append(val).append(" = load i32, i32* ").append(gep).append("\n");
-                return new LLVMValue(val, "i32");
+                if (receiver.type.equals("%CangThreadHandle*")
+                        && receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+                    String cast = "%thr.alive.c." + tmpCount++;
+                    body.append("  ").append(cast).append(" = bitcast %CangThreadHandle* ").append(receiver.value).append(" to i8*\n");
+                    String r = "%thr.alive.r." + tmpCount++;
+                    body.append("  ").append(r).append(" = call i1 @cang.thread.isalive(i8* ").append(cast).append(")\n");
+                    return new LLVMValue(r, "i1");
+                }
+                // not a Thread receiver — fall through
+            } else {
+                String gep = null;
+                if (receiver.type.equals("%CangThreadObj*")) {
+                    gep = "%thr.getid.objp." + tmpCount++;
+                    body.append("  ").append(gep).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+                         .append(", i32 0, i32 ").append(wantParent ? 5 : 4).append("\n");
+                } else if (receiver.type.equals("%CangThreadHandle*")
+                        && receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+                    gep = "%thr.getid.hp." + tmpCount++;
+                    body.append("  ").append(gep).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value)
+                         .append(", i32 0, i32 ").append(wantParent ? 4 : 3).append("\n");
+                }
+                if (gep != null) {
+                    String val = "%thr.getid.v." + tmpCount++;
+                    if (wantParent) {
+                        body.append("  ").append(val).append(" = load i8*, i8** ").append(gep).append("\n");
+                        String typed = "%thr.getid.t." + tmpCount++;
+                        body.append("  ").append(typed).append(" = bitcast i8* ").append(val).append(" to %CangThreadHandle*\n");
+                        return new LLVMValue(typed, "%CangThreadHandle*", "Thread<void>");
+                    }
+                    body.append("  ").append(val).append(" = load i32, i32* ").append(gep).append("\n");
+                    return new LLVMValue(val, "i32");
+                }
+                // not a Thread receiver — fall through to the normal instance path
             }
-            // not a Thread receiver — fall through to the normal instance path
         }
 
         // Handle built-in Stdout.print
@@ -6248,6 +6290,9 @@ public class LLVMGen {
         String hparent = "%thread.hpf." + tmpCount++;
         body.append("  ").append(hparent).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 4\n");
         body.append("  store i8* ").append(parentCast).append(", i8** ").append(hparent).append("\n");
+        String hkind = "%thread.hk." + tmpCount++;
+        body.append("  ").append(hkind).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 5\n");
+        body.append("  store i32 0, i32* ").append(hkind).append("\n");
 
         emitThreadEntry(ordinary, startType, isVoid, packIdIndex, threadCount);
         emitThreadCreate(raw, tid, node.line);
@@ -6538,6 +6583,10 @@ public class LLVMGen {
         body.append("  ").append(hpar).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
              .append(", i32 0, i32 4\n");
         body.append("  store i8* ").append(objParent).append(", i8** ").append(hpar).append("\n");
+        String hkind = "%thr.start.hk." + tmpCount++;
+        body.append("  ").append(hkind).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
+             .append(", i32 0, i32 5\n");
+        body.append("  store i32 0, i32* ").append(hkind).append("\n");
         body.append("  store i8* ").append(handleRaw).append(", i8** ").append(hfield).append("\n");
 
         // Non-daemon threads join at main exit; daemon (new Thread(true)) does not register.
@@ -6795,12 +6844,110 @@ public class LLVMGen {
         String birthParent = "%thr.self.bp." + tmpCount++;
         body.append("  ").append(birthParent).append(" = load i8*, i8** @cang.thread.parent\n");
         body.append("  store i8* ").append(birthParent).append(", i8** ").append(parentPtr).append("\n");
+        String kindPtr = "%thr.self.kp." + tmpCount++;
+        body.append("  ").append(kindPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(h)
+             .append(", i32 0, i32 5\n");
+        body.append("  store i32 1, i32* ").append(kindPtr).append("\n");
         body.append("  store i8* ").append(raw).append(", i8** @cang.thread.self\n");
         body.append("  br label %").append(done).append("\n");
         body.append(done).append(":\n");
         String res = "%thr.self.res." + tmpCount++;
         body.append("  ").append(res).append(" = load i8*, i8** @cang.thread.self\n");
         return new LLVMValue(res, "%CangThreadHandle*", "Thread<void>");
+    }
+
+    /**
+     * Header helper: is the thread behind this handle still running?
+     * Birth handles (kind=0): joined flag short-circuits to false; Windows probes the OS
+     * handle via GetExitCodeThread (closed at join → dead), posix pthread_kill(tid, 0).
+     * Self handles (kind=1): osTid is a thread id on both platforms — Windows OpenThread
+     * + WaitForSingleObject(0): WAIT_TIMEOUT = alive; posix pthread_kill on pthread_t.
+     */
+    private void emitThreadIsAliveHelper() {
+        if (header.toString().contains("define i1 @cang.thread.isalive(")) return;
+        boolean win = targetPlatform.equals("windows");
+        StringBuilder x = new StringBuilder();
+        if (win) {
+            if (!header.toString().contains("declare i32 @GetExitCodeThread(")) {
+                header.append("declare i32 @GetExitCodeThread(i8*, i32*)\n");
+            }
+            if (!header.toString().contains("declare i8* @OpenThread(")) {
+                header.append("declare i8* @OpenThread(i32, i32, i32)\n");
+            }
+            if (!header.toString().contains("declare i32 @WaitForSingleObject(")) {
+                header.append("declare i32 @WaitForSingleObject(i8*, i32)\n");
+            }
+            if (!header.toString().contains("declare i32 @CloseHandle(")) {
+                header.append("declare i32 @CloseHandle(i8*)\n");
+            }
+        } else {
+            if (!header.toString().contains("declare i32 @pthread_kill(")) {
+                header.append("declare i32 @pthread_kill(i64, i32)\n");
+            }
+        }
+        x.append("define i1 @cang.thread.isalive(i8* %hraw) {\n");
+        x.append("entry:\n");
+        x.append("  %h = bitcast i8* %hraw to %CangThreadHandle*\n");
+        x.append("  %kp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 5\n");
+        x.append("  %kind = load i32, i32* %kp\n");
+        x.append("  %isself = icmp eq i32 %kind, 1\n");
+        x.append("  br i1 %isself, label %SELF, label %BIRTH\n");
+        x.append("BIRTH:\n");
+        x.append("  %jp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 2\n");
+        x.append("  %j = load i32, i32* %jp\n");
+        x.append("  %jc = icmp eq i32 %j, 1\n");
+        x.append("  br i1 %jc, label %DEAD, label %BPROBE\n");
+        if (win) {
+            x.append("BPROBE:\n");
+            x.append("  %btp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 0\n");
+            x.append("  %bth = load i64, i64* %btp\n");
+            x.append("  %bhh = inttoptr i64 %bth to i8*\n");
+            x.append("  %cp = alloca i32\n");
+            x.append("  %ok = call i32 @GetExitCodeThread(i8* %bhh, i32* %cp)\n");
+            x.append("  %okn = icmp ne i32 %ok, 0\n");
+            x.append("  %st = load i32, i32* %cp\n");
+            x.append("  %sta = icmp eq i32 %st, 259\n");
+            x.append("  %ba = and i1 %okn, %sta\n");
+            x.append("  br label %RES\n");
+            x.append("DEAD:\n");
+            x.append("  br label %RES\n");
+            x.append("SELF:\n");
+            x.append("  %stp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 0\n");
+            x.append("  %stid = load i64, i64* %stp\n");
+            x.append("  %stid32 = trunc i64 %stid to i32\n");
+            x.append("  %oh = call i8* @OpenThread(i32 1048576, i32 0, i32 %stid32)\n");
+            x.append("  %ohn = icmp eq i8* %oh, null\n");
+            x.append("  br i1 %ohn, label %SDEAD, label %SWAIT\n");
+            x.append("SDEAD:\n");
+            x.append("  br label %RES\n");
+            x.append("SWAIT:\n");
+            x.append("  %w = call i32 @WaitForSingleObject(i8* %oh, i32 0)\n");
+            x.append("  %c1 = call i32 @CloseHandle(i8* %oh)\n");
+            x.append("  %wt = icmp eq i32 %w, 258\n");
+            x.append("  br label %RES\n");
+            x.append("RES:\n");
+            x.append("  %r = phi i1 [ false, %DEAD ], [ %ba, %BPROBE ], [ false, %SDEAD ], [ %wt, %SWAIT ]\n");
+        } else {
+            x.append("BPROBE:\n");
+            x.append("  %btp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 0\n");
+            x.append("  %btt = load i64, i64* %btp\n");
+            x.append("  %be = call i32 @pthread_kill(i64 %btt, i32 0)\n");
+            x.append("  %ba = icmp eq i32 %be, 0\n");
+            x.append("  br label %RES\n");
+            x.append("DEAD:\n");
+            x.append("  br label %RES\n");
+            x.append("SELF:\n");
+            x.append("  %stp = getelementptr %CangThreadHandle, %CangThreadHandle* %h, i32 0, i32 0\n");
+            x.append("  %stt = load i64, i64* %stp\n");
+            x.append("  %se = call i32 @pthread_kill(i64 %stt, i32 0)\n");
+            x.append("  %sa = icmp eq i32 %se, 0\n");
+            x.append("  br label %RES\n");
+            x.append("RES:\n");
+            x.append("  %r = phi i1 [ false, %DEAD ], [ %ba, %BPROBE ], [ %sa, %SELF ]\n");
+        }
+        x.append("  ret i1 %r\n");
+        x.append("}\n\n");
+        header.append(x);
     }
 
     private LLVMValue generateThreadCurrent() {
