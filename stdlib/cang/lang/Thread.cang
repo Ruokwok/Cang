@@ -6,7 +6,7 @@ namespace cang/lang
 # thread { } 语法糖不受影响（退出前自动 join）。
 # 对象式任务为 void 无参；对象、数组、Function、lambda 不允许跨线程（任务的 receiver 除外）。
 # 与 Boehm GC 兼容：Windows 经 GC_CreateThread 附着，posix 在线程入口注册线程栈。
-# task/setDaemon/start/join/currentThread 均为编译器内建：native 声明仅供 IDE 补全与方法检查，主编译器不生成实现。
+# task/setDaemon/start/join/currentThread/getId 均为编译器内建：native 声明仅供 IDE 补全与方法检查，主编译器不生成实现。
 class Thread<T>
 
 # 休眠当前线程 time 毫秒（long）。阻塞调用线程（main 里 = 主线程，thread{} 里 = 该工作线程）。
@@ -15,6 +15,10 @@ static native func void sleep(long time)
 # 返回当前执行所在线程的句柄（每线程缓存：同一线程多次调用返回同一实例，可 == 比较身份）。
 # 句柄仅供识别与传递：不可 join（已标记为已 join，join 会报运行时错误），也不能再 task/start/setDaemon。
 static native func Thread<void> currentThread()
+
+# 线程逻辑 id（int，创建时经全局计数器从 0 自增分配，线程安全）。
+# new Thread() 时分配给对象，start() 复制到句柄；工作线程内 currentThread().getId() 与出生句柄一致。
+native func int getId()
 
 # 注册任务 fn（方法引用/顶层函数/无参 lambda，须为 Function<void>），返回自身供链式调用。
 native func Thread<void> task(Function<void> fn)

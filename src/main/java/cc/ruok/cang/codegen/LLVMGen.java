@@ -1496,12 +1496,17 @@ public class LLVMGen {
 
         // Function object: { code pointer, receiver/environment }
         header.append("%CangFunction = type { i8*, i8* }\n");
-        header.append("%CangThreadHandle = type { i64, i8*, i32 }\n");
-        // Object-style Thread: new Thread().task(fn).start() — { task code, task receiver, handle }
-        header.append("%CangThreadObj = type { i8*, i8*, i8*, i1 }\n");
+        // Handle { osTid, resultSlot, joined, id } — id: logical thread id, atomic 0..N-1.
+        header.append("%CangThreadHandle = type { i64, i8*, i32, i32 }\n");
+        // Object-style Thread: new Thread().task(fn).start() — { task code, task receiver,
+        // handle, daemon, id } — id assigned at new Thread(), copied into the handle at start().
+        header.append("%CangThreadObj = type { i8*, i8*, i8*, i1, i32 }\n");
         // Registry of non-daemon object-style threads: joined at main exit unless daemon.
         header.append("@cang.thr.regs = internal global [256 x i8*] zeroinitializer\n");
         header.append("@cang.thr.regc = internal global i64 0\n");
+        // Global logical-id counter (atomic, from 0) + per-thread birth id (-1 = unassigned).
+        header.append("@cang.thr.seq = internal global i32 0\n");
+        header.append("@cang.thread.id = thread_local global i32 -1\n");
         // Thread.currentThread(): per-thread cached synthetic handle (identity only, not joinable).
         header.append("@cang.thread.self = thread_local global i8* null\n");
         header.append("%CangList = type { i8*, i64, i64 }\n\n");
@@ -5851,6 +5856,32 @@ public class LLVMGen {
                 return generateThreadJoin(receiver, node.line);
             }
         }
+        // getId: logical thread id on the object (assigned at new Thread()) or on any
+        // Thread handle (start() copy / currentThread birth id).
+        if (objCache == null && node.object != null && node.method.equals("getId")) {
+            objCache = generateExpr(node.object);
+            LLVMValue receiver = objCache;
+            if (!node.args.isEmpty()) {
+                throw new RuntimeException("Thread.getId accepts no arguments (at line " + node.line + ")");
+            }
+            String idGep = null;
+            if (receiver.type.equals("%CangThreadObj*")) {
+                idGep = "%thr.getid.objp." + tmpCount++;
+                body.append("  ").append(idGep).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+                     .append(", i32 0, i32 4\n");
+            } else if (receiver.type.equals("%CangThreadHandle*")
+                    && receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+                idGep = "%thr.getid.hp." + tmpCount++;
+                body.append("  ").append(idGep).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(receiver.value)
+                     .append(", i32 0, i32 3\n");
+            }
+            if (idGep != null) {
+                String idVal = "%thr.getid.v." + tmpCount++;
+                body.append("  ").append(idVal).append(" = load i32, i32* ").append(idGep).append("\n");
+                return new LLVMValue(idVal, "i32");
+            }
+            // not a Thread receiver — fall through to the normal instance path
+        }
 
         // Handle built-in Stdout.print
         if (node.object instanceof Identifier) {
@@ -6098,6 +6129,13 @@ public class LLVMGen {
             || t.equals("String") || t.equals("str");
     }
 
+    /** Next logical thread id: atomic increment of @cang.thr.seq (0-based, thread-safe). */
+    private String emitThreadIdAlloc() {
+        String id = "%thr.seq.id." + tmpCount++;
+        body.append("  ").append(id).append(" = atomicrmw add i32* @cang.thr.seq, i32 1 seq_cst\n");
+        return id;
+    }
+
     private LLVMValue generateThreadSpawn(MethodCallExpr node) {
         if (node.args.isEmpty()) throw new RuntimeException("Thread.spawn requires a non-capturing ordinary function identifier (at line " + node.line + ")");
         AST entry = node.args.get(0);
@@ -6128,11 +6166,11 @@ public class LLVMGen {
 
         boolean isVoid = ordinary.returnType.equals("void");
 
-        // Pack layout: { fn ptr, args..., [i8* resultSlot] }
+        // Pack layout: { fn ptr, args..., [i8* resultSlot], i32 threadId }
         StringBuilder st = new StringBuilder("{ i8*");
         for (String p : ordinary.paramTypes) st.append(", ").append(toLLVMType(p));
         if (!isVoid) st.append(", i8*");
-        st.append(" }");
+        st.append(", i32 }");
         String startType = st.toString();
 
         List<LLVMValue> values = new ArrayList<>();
@@ -6154,6 +6192,7 @@ public class LLVMGen {
             body.append("  store ").append(paramLLVM).append(" ").append(castValue(values.get(i), paramLLVM)).append(", ").append(paramLLVM).append("* ").append(ap).append("\n");
         }
         String rpRaw = "null";
+        int resultIndex = -1;
         if (!isVoid) {
             String resultLLVM = toLLVMType(ordinary.returnType);
             long bits = llvmTypeBits(resultLLVM);
@@ -6161,12 +6200,18 @@ public class LLVMGen {
             rpRaw = "%thread.result.raw." + tmpCount++;
             body.append("  ").append(rpRaw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(slotBytes).append(")\n");
             String rfield = "%thread.rfield." + tmpCount++;
-            int resultIndex = 1 + values.size();
+            resultIndex = 1 + values.size();
             body.append("  ").append(rfield).append(" = getelementptr ").append(startType).append(", ").append(startType).append("* ").append(start).append(", i32 0, i32 ").append(resultIndex).append("\n");
             body.append("  store i8* ").append(rpRaw).append(", i8** ").append(rfield).append("\n");
         }
+        int packIdIndex = (resultIndex >= 0 ? resultIndex : values.size()) + 1;
+        String threadId = emitThreadIdAlloc();
+        String idField = "%thread.idf." + tmpCount++;
+        body.append("  ").append(idField).append(" = getelementptr ").append(startType).append(", ").append(startType)
+             .append("* ").append(start).append(", i32 0, i32 ").append(packIdIndex).append("\n");
+        body.append("  store i32 ").append(threadId).append(", i32* ").append(idField).append("\n");
         String handleRaw = "%thread.handle.raw." + tmpCount++;
-        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 32)\n");
         String handle = "%thread.handle." + tmpCount++;
         body.append("  ").append(handle).append(" = bitcast i8* ").append(handleRaw).append(" to %CangThreadHandle*\n");
         String tid = "%thread.id." + tmpCount++;
@@ -6177,8 +6222,11 @@ public class LLVMGen {
         String joined = "%thread.joined." + tmpCount++;
         body.append("  ").append(joined).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 2\n");
         body.append("  store i32 0, i32* ").append(joined).append("\n");
+        String hid = "%thread.hid." + tmpCount++;
+        body.append("  ").append(hid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle).append(", i32 0, i32 3\n");
+        body.append("  store i32 ").append(threadId).append(", i32* ").append(hid).append("\n");
 
-        emitThreadEntry(ordinary, startType, isVoid, threadCount);
+        emitThreadEntry(ordinary, startType, isVoid, packIdIndex, threadCount);
         emitThreadCreate(raw, tid, node.line);
 
         threadCount++;
@@ -6226,7 +6274,7 @@ public class LLVMGen {
         }
     }
 
-    private void emitThreadEntry(FuncInfo ordinary, String startType, boolean isVoid, int id) {
+    private void emitThreadEntry(FuncInfo ordinary, String startType, boolean isVoid, int packIdIndex, int id) {
         String retLLVM = toLLVMType(ordinary.returnType);
         boolean posix = !targetPlatform.equals("windows");
         StringBuilder x = new StringBuilder();
@@ -6249,6 +6297,11 @@ public class LLVMGen {
         }
 
         x.append("  %s = bitcast i8* %arg to ").append(startType).append("*\n");
+        // Birth id → TLS so Thread.currentThread().getId() matches the spawn/start handle id.
+        x.append("  %tidp = getelementptr ").append(startType).append(", ").append(startType)
+         .append("* %s, i32 0, i32 ").append(packIdIndex).append("\n");
+        x.append("  %tidv = load i32, i32* %tidp\n");
+        x.append("  store i32 %tidv, i32* @cang.thread.id\n");
         x.append("  %f = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 0\n");
         x.append("  %code = load i8*, i8** %f\n");
 
@@ -6401,10 +6454,15 @@ public class LLVMGen {
         emitRuntimeError("Thread already started", node.line, startOk);
         body.append(startOk).append(":\n");
 
-        // Pack { i8* code, i8* receiver }
-        String startType = "{ i8*, i8* }";
+        // Pack { i8* code, i8* receiver, i32 threadId } — id assigned at new Thread().
+        String objIdPtr = "%thr.start.idp." + tmpCount++;
+        body.append("  ").append(objIdPtr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 4\n");
+        String objId = "%thr.start.id." + tmpCount++;
+        body.append("  ").append(objId).append(" = load i32, i32* ").append(objIdPtr).append("\n");
+        String startType = "{ i8*, i8*, i32 }";
         String raw = "%thr.start.raw." + tmpCount++;
-        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 16)\n");
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
         String start = "%thr.start.pack." + tmpCount++;
         body.append("  ").append(start).append(" = bitcast i8* ").append(raw).append(" to ").append(startType).append("*\n");
         String p0 = "%thr.start.p0." + tmpCount++;
@@ -6415,10 +6473,14 @@ public class LLVMGen {
         body.append("  ").append(p1).append(" = getelementptr ").append(startType).append(", ").append(startType)
              .append("* ").append(start).append(", i32 0, i32 1\n");
         body.append("  store i8* ").append(recv).append(", i8** ").append(p1).append("\n");
+        String p2 = "%thr.start.p2." + tmpCount++;
+        body.append("  ").append(p2).append(" = getelementptr ").append(startType).append(", ").append(startType)
+             .append("* ").append(start).append(", i32 0, i32 2\n");
+        body.append("  store i32 ").append(objId).append(", i32* ").append(p2).append("\n");
 
-        // Handle { tid, resultSlot=null, joined=0 }, store into obj field 2
+        // Handle { tid, resultSlot=null, joined=0, id }, store into obj field 2
         String handleRaw = "%thr.start.hraw." + tmpCount++;
-        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 24)\n");
+        body.append("  ").append(handleRaw).append(" = call i8* @").append(allocFn()).append("(i64 32)\n");
         String handle = "%thr.start.handle." + tmpCount++;
         body.append("  ").append(handle).append(" = bitcast i8* ").append(handleRaw).append(" to %CangThreadHandle*\n");
         String tid = "%thr.start.tid." + tmpCount++;
@@ -6432,6 +6494,10 @@ public class LLVMGen {
         body.append("  ").append(joined).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
              .append(", i32 0, i32 2\n");
         body.append("  store i32 0, i32* ").append(joined).append("\n");
+        String hid = "%thr.start.hid." + tmpCount++;
+        body.append("  ").append(hid).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(handle)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i32 ").append(objId).append(", i32* ").append(hid).append("\n");
         body.append("  store i8* ").append(handleRaw).append(", i8** ").append(hfield).append("\n");
 
         // Non-daemon threads join at main exit; daemon (new Thread(true)) does not register.
@@ -6496,7 +6562,7 @@ public class LLVMGen {
 
     /** Thread entry for the object-style pack { i8* code, i8* receiver }: call void (i8*, i8*). */
     private void emitThreadEntryFunction(int id) {
-        String startType = "{ i8*, i8* }";
+        String startType = "{ i8*, i8*, i32 }";
         boolean posix = !targetPlatform.equals("windows");
         StringBuilder x = new StringBuilder();
         x.append("define ").append(posix ? "i8*" : "i32")
@@ -6513,6 +6579,11 @@ public class LLVMGen {
             x.append("  %gc.sbres2.").append(id).append(" = call i32 @GC_register_my_thread(i8* ").append(sb8).append(")\n");
         }
         x.append("  %s = bitcast i8* %arg to ").append(startType).append("*\n");
+        // Birth id → TLS so Thread.currentThread().getId() matches the start() handle id.
+        x.append("  %tidp = getelementptr ").append(startType).append(", ").append(startType)
+         .append("* %s, i32 0, i32 2\n");
+        x.append("  %tidv = load i32, i32* %tidp\n");
+        x.append("  store i32 %tidv, i32* @cang.thread.id\n");
         x.append("  %cf = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 0\n");
         x.append("  %code = load i8*, i8** %cf\n");
         x.append("  %rf = getelementptr ").append(startType).append(", ").append(startType).append("* %s, i32 0, i32 1\n");
@@ -6591,6 +6662,26 @@ public class LLVMGen {
         if (!header.toString().contains("@cang.thread.self = ")) {
             header.append("@cang.thread.self = thread_local global i8* null\n");
         }
+        if (!header.toString().contains("@cang.thread.id = ")) {
+            header.append("@cang.thread.id = thread_local global i32 -1\n");
+        }
+        // Birth id: entry functions store it before the task runs; main lazily takes one.
+        int idLbl = labelCount++;
+        String idAlloc = "thr.self.idalloc." + idLbl;
+        String idDone = "thr.self.iddone." + idLbl;
+        String curId = "%thr.self.curid." + tmpCount++;
+        body.append("  ").append(curId).append(" = load i32, i32* @cang.thread.id\n");
+        String hasId = "%thr.self.hasid." + tmpCount++;
+        body.append("  ").append(hasId).append(" = icmp sge i32 ").append(curId).append(", 0\n");
+        body.append("  br i1 ").append(hasId).append(", label %").append(idDone).append(", label %").append(idAlloc).append("\n");
+        body.append(idAlloc).append(":\n");
+        String freshId = emitThreadIdAlloc();
+        body.append("  store i32 ").append(freshId).append(", i32* @cang.thread.id\n");
+        body.append("  br label %").append(idDone).append("\n");
+        body.append(idDone).append(":\n");
+        String threadId = "%thr.self.tid." + tmpCount++;
+        body.append("  ").append(threadId).append(" = load i32, i32* @cang.thread.id\n");
+
         String cur = "%thr.self.cur." + tmpCount++;
         body.append("  ").append(cur).append(" = load i8*, i8** @cang.thread.self\n");
         String isNull = "%thr.self.isnull." + tmpCount++;
@@ -6606,9 +6697,9 @@ public class LLVMGen {
             if (!header.toString().contains("declare i8* @GC_malloc_uncollectable(")) {
                 header.append("declare i8* @GC_malloc_uncollectable(i64)\n");
             }
-            body.append("  ").append(raw).append(" = call i8* @GC_malloc_uncollectable(i64 24)\n");
+            body.append("  ").append(raw).append(" = call i8* @GC_malloc_uncollectable(i64 32)\n");
         } else {
-            body.append("  ").append(raw).append(" = call i8* @malloc(i64 24)\n");
+            body.append("  ").append(raw).append(" = call i8* @malloc(i64 32)\n");
         }
         String h = "%thr.self.h." + tmpCount++;
         body.append("  ").append(h).append(" = bitcast i8* ").append(raw).append(" to %CangThreadHandle*\n");
@@ -6628,9 +6719,9 @@ public class LLVMGen {
             if (!header.toString().contains("declare i64 @pthread_self(")) {
                 header.append("declare i64 @pthread_self()\n");
             }
-            String tid = "%thr.self.tid." + tmpCount++;
-            body.append("  ").append(tid).append(" = call i64 @pthread_self()\n");
-            body.append("  store i64 ").append(tid).append(", i64* ").append(tidPtr).append("\n");
+            String osTid = "%thr.self.ostid." + tmpCount++;
+            body.append("  ").append(osTid).append(" = call i64 @pthread_self()\n");
+            body.append("  store i64 ").append(osTid).append(", i64* ").append(tidPtr).append("\n");
         }
         String resPtr = "%thr.self.resp." + tmpCount++;
         body.append("  ").append(resPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(h)
@@ -6640,6 +6731,10 @@ public class LLVMGen {
         body.append("  ").append(joinPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(h)
              .append(", i32 0, i32 2\n");
         body.append("  store i32 1, i32* ").append(joinPtr).append("\n");
+        String idFieldPtr = "%thr.self.idfp." + tmpCount++;
+        body.append("  ").append(idFieldPtr).append(" = getelementptr %CangThreadHandle, %CangThreadHandle* ").append(h)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i32 ").append(threadId).append(", i32* ").append(idFieldPtr).append("\n");
         body.append("  store i8* ").append(raw).append(", i8** @cang.thread.self\n");
         body.append("  br label %").append(done).append("\n");
         body.append(done).append(":\n");
@@ -8017,7 +8112,7 @@ public class LLVMGen {
                 daemonVal = flag.value;
             }
             String raw = "%thr.obj.raw." + tmpCount++;
-            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 32)\n");
+            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 40)\n");
             String obj = "%thr.obj." + tmpCount++;
             body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangThreadObj*\n");
             for (int f = 0; f < 3; f++) {
@@ -8030,6 +8125,11 @@ public class LLVMGen {
             body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
                  .append(", i32 0, i32 3\n");
             body.append("  store i1 ").append(daemonVal).append(", i1* ").append(dptr).append("\n");
+            String threadId = emitThreadIdAlloc();
+            String iptr = "%thr.obj.idp." + tmpCount++;
+            body.append("  ").append(iptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+                 .append(", i32 0, i32 4\n");
+            body.append("  store i32 ").append(threadId).append(", i32* ").append(iptr).append("\n");
             return new LLVMValue(obj, "%CangThreadObj*", "Thread<void>");
         }
 
