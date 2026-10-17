@@ -5825,12 +5825,14 @@ public class LLVMGen {
             throw new RuntimeException("Thread.spawn has been removed (at line "
                 + node.line + ")");
         }
-        // Object-style Thread: task(fn) / start() on new Thread() results (exact type gate so
-        // unrelated classes' task/start methods fall through to the normal instance path).
-        if (node.object != null && (node.method.equals("task") || node.method.equals("start"))) {
+        // Object-style Thread: task(fn) / setDaemon(b) / start() on new Thread() results
+        // (exact type gate so unrelated classes' same-named methods use the normal instance path).
+        if (node.object != null && (node.method.equals("task") || node.method.equals("setDaemon")
+                || node.method.equals("start"))) {
             objCache = generateExpr(node.object);
             if (objCache.type.equals("%CangThreadObj*")) {
                 if (node.method.equals("task")) return generateThreadObjTask(objCache, node);
+                if (node.method.equals("setDaemon")) return generateThreadObjSetDaemon(objCache, node);
                 return generateThreadObjStart(objCache, node);
             }
         }
@@ -6315,6 +6317,38 @@ public class LLVMGen {
         body.append("  ").append(rfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
              .append(", i32 0, i32 1\n");
         body.append("  store i8* ").append(recv).append(", i8** ").append(rfield).append("\n");
+        return receiver;
+    }
+
+    /** Object-style .setDaemon(b): store the daemon flag; only legal before start();
+     *  returns this so the chain new Thread().setDaemon(true).task(fn).start() works. */
+    private LLVMValue generateThreadObjSetDaemon(LLVMValue receiver, MethodCallExpr node) {
+        if (node.args.size() != 1) {
+            throw new RuntimeException("Thread.setDaemon expects one bool argument (at line " + node.line + ")");
+        }
+        LLVMValue flag = generateExpr(node.args.get(0));
+        if (!flag.type.equals("i1")) {
+            throw new RuntimeException("Thread.setDaemon flag must be a bool (at line " + node.line + ")");
+        }
+        // The start-time registry decision (join-at-exit vs not) already ran — reject the change.
+        String hfield = "%thr.setdaemon.hf." + tmpCount++;
+        body.append("  ").append(hfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 2\n");
+        String oldHandle = "%thr.setdaemon.old." + tmpCount++;
+        body.append("  ").append(oldHandle).append(" = load i8*, i8** ").append(hfield).append("\n");
+        int id = labelCount++;
+        String started = "thr.setdaemon.started." + id;
+        String ok = "thr.setdaemon.ok." + id;
+        String cmp = "%thr.setdaemon.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp ne i8* ").append(oldHandle).append(", null\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(started).append(", label %").append(ok).append("\n");
+        body.append(started).append(":\n");
+        emitRuntimeError("Thread already started: setDaemon must be called before start", node.line, ok);
+        body.append(ok).append(":\n");
+        String dptr = "%thr.setdaemon.dp." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i1 ").append(flag.value).append(", i1* ").append(dptr).append("\n");
         return receiver;
     }
 
