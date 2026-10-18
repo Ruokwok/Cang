@@ -4770,8 +4770,11 @@ public class LLVMGen {
             return new LLVMValue(result, "double");
         }
 
-        // String concatenation with +
-        if (op.equals("+") && (left.type.equals("i8*") || right.type.equals("i8*"))) {
+        // String concatenation with + — strings, numbers, and objects (objects via toString(),
+        // user overrides win; null object → "null" like Java).
+        if (op.equals("+") && (left.type.equals("i8*") || right.type.equals("i8*")
+                || (left.type.startsWith("%") && left.type.endsWith("*"))
+                || (right.type.startsWith("%") && right.type.endsWith("*")))) {
             return generateStringConcat(left, right);
         }
 
@@ -4887,6 +4890,11 @@ public class LLVMGen {
      * Convert a non-string value to its string representation using snprintf.
      */
     private LLVMValue convertToString(LLVMValue val) {
+        // Objects: toString() semantics (user overrides win; default ClassName@addr;
+        // null → "null"). Arrays/Thread handles stringify to their type name.
+        if (val.type.startsWith("%") && val.type.endsWith("*")) {
+            return objectToStringForConcat(val);
+        }
         // Java-style: bool concatenates as "true"/"false" — pure constants, no buffer needed.
         // Handled before the snprintf path (which would itoa it to 1/0).
         if (val.type.equals("i1")) {
@@ -4930,6 +4938,131 @@ public class LLVMGen {
              .append(", ").append(val.type).append(" ").append(val.value).append(")\n");
 
         return new LLVMValue(buf, "i8*");
+    }
+
+    /** String-concat stringification of an object pointer: overrides win, null → "null". */
+    private LLVMValue objectToStringForConcat(LLVMValue val) {
+        String sem = val.semanticType;
+        if (sem != null && (sem.equals("String") || sem.equals("str"))) return val;
+        if (sem != null && sem.startsWith("Array<")) return makeStringConstant("Array");
+        if (sem != null && isThreadType(sem)) return makeStringConstant("Thread");
+        ClassInfo ci = classes.get(extractClassName(val.type));
+        int id = labelCount++;
+        String nullL = "catobj.null." + id;
+        String elseL = "catobj.el." + id;
+        String joinL = "catobj.j." + id;
+        // Slot instead of phi: nested dispatch arms all store here and branch to join.
+        String slot = "%catobj.slot." + tmpCount++;
+        body.append("  ").append(slot).append(" = alloca i8*\n");
+        String nullS = "%catobj.np." + tmpCount++;
+        body.append("  ").append(nullS).append(" = getelementptr [5 x i8], [5 x i8]* @.str.null.p, i32 0, i32 0\n");
+        String isN = "%catobj.n." + tmpCount++;
+        body.append("  ").append(isN).append(" = icmp eq ").append(val.type).append(" ")
+             .append(val.value).append(", null\n");
+        body.append("  br i1 ").append(isN).append(", label %").append(nullL)
+             .append(", label %").append(elseL).append("\n");
+        body.append(nullL).append(":\n");
+        body.append("  store i8* ").append(nullS).append(", i8** ").append(slot).append("\n");
+        body.append("  br label %").append(joinL).append("\n");
+        body.append(elseL).append(":\n");
+        if (ci == null) {
+            String fallback = makeStringConstant(extractClassName(val.type)).value;
+            body.append("  store i8* ").append(fallback).append(", i8** ").append(slot).append("\n");
+            body.append("  br label %").append(joinL).append("\n");
+        } else {
+            emitToStringStore(val, ci, slot, joinL);
+        }
+        body.append(joinL).append(":\n");
+        String r = "%catobj.r." + tmpCount++;
+        body.append("  ").append(r).append(" = load i8*, i8** ").append(slot).append("\n");
+        return new LLVMValue(r, "i8*");
+    }
+
+    /**
+     * toString() of a class object WITH override support: concrete classes (the static type
+     * and its subclasses) that declare their own no-arg String toString() get a dispatch arm;
+     * everything else falls to the default ClassName@addr — Object's native marker has no
+     * body to call, so it can't be an arm target (unlike generateDynamicDispatch). Every
+     * arm stores its result into slotPtr and branches to destLabel (no phis).
+     */
+    private void emitToStringStore(LLVMValue val, ClassInfo staticCi, String slotPtr, String destLabel) {
+        java.util.List<ClassInfo> types = new ArrayList<>();
+        if (!staticCi.isAbstract) types.add(staticCi);
+        for (ClassInfo ci : classes.values()) {
+            if (ci != staticCi && !ci.isAbstract && isSubclass(ci.simpleName, staticCi.simpleName)) {
+                types.add(ci);
+            }
+        }
+        java.util.List<ClassInfo> overriders = new ArrayList<>();
+        for (ClassInfo c : types) {
+            if (ownToString(c) != null) overriders.add(c);
+        }
+        if (overriders.isEmpty()) {
+            String d = emitDefaultToString(val).value;
+            body.append("  store i8* ").append(d).append(", i8** ").append(slotPtr).append("\n");
+            body.append("  br label %").append(destLabel).append("\n");
+            return;
+        }
+
+        String base = extractClassName(val.type);
+        String recv = classPtrBaseAndValue(val)[1];
+        String tidPtr = "%ots.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr %").append(base).append(", %").append(base)
+             .append("* ").append(recv).append(", i32 0, i32 0\n");
+        String tid = "%ots.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+
+        int id = labelCount++;
+        String firstCheck = "ots.chk." + id + ".0";
+        String defL = "ots.def." + id;
+        body.append("  br label %").append(firstCheck).append("\n");
+        for (int i = 0; i < overriders.size(); i++) {
+            ClassInfo oc = overriders.get(i);
+            String chk = (i == 0) ? firstCheck : "ots.chk." + id + "." + i;
+            String call = "ots.call." + id + "." + i;
+            String next = (i + 1 < overriders.size()) ? "ots.chk." + id + "." + (i + 1) : defL;
+            body.append(chk).append(":\n");
+            String c = "%ots.c." + tmpCount++;
+            body.append("  ").append(c).append(" = icmp eq i32 ").append(tid).append(", ").append(oc.typeId).append("\n");
+            body.append("  br i1 ").append(c).append(", label %").append(call).append(", label %").append(next).append("\n");
+            body.append(call).append(":\n");
+            String p = "%ots.p." + tmpCount++;
+            body.append("  ").append(p).append(" = bitcast %").append(base).append("* ").append(recv)
+                 .append(" to %").append(oc.fullName).append("*\n");
+            String arm = "%ots.r." + tmpCount++;
+            body.append("  ").append(arm).append(" = call i8* @").append(symOf(ownToString(oc)))
+                 .append("(%").append(oc.fullName).append("* ").append(p).append(")\n");
+            body.append("  store i8* ").append(arm).append(", i8** ").append(slotPtr).append("\n");
+            body.append("  br label %").append(destLabel).append("\n");
+        }
+        body.append(defL).append(":\n");
+        String defVal = emitDefaultToString(val).value;
+        body.append("  store i8* ").append(defVal).append(", i8** ").append(slotPtr).append("\n");
+        body.append("  br label %").append(destLabel).append("\n");
+    }
+
+    /** Default toString: ClassName@addr via the type-id table (same as the intrinsic path). */
+    private LLVMValue emitDefaultToString(LLVMValue val) {
+        LLVMValue name = emitClassNameOf(val);
+        emitObjectToStringHelper();
+        String[] bv = classPtrBaseAndValue(val);
+        String obj = "%otsd.o." + tmpCount++;
+        body.append("  ").append(obj).append(" = bitcast %").append(bv[0]).append("* ").append(bv[1])
+             .append(" to i8*\n");
+        String s = "%otsd.s." + tmpCount++;
+        body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
+             .append(name.value).append(", i8* ").append(obj).append(")\n");
+        return new LLVMValue(s, "i8*", "String");
+    }
+
+    /** This class's OWN no-arg String toString() FuncInfo (not inherited from Object), or null. */
+    private FuncInfo ownToString(ClassInfo ci) {
+        List<FuncInfo> grp = overloadGroups.get(ci.fullName + ".toString");
+        if (grp == null) return null;
+        for (FuncInfo f : grp) {
+            if (f.paramTypes.isEmpty() && "String".equals(f.returnType)) return f;
+        }
+        return null;
     }
 
     private LLVMValue generateComparison(BinaryExpr node) {
@@ -5996,18 +6129,9 @@ public class LLVMGen {
             } else if (receiver.type.startsWith("%") && receiver.type.endsWith("*")) {
                 ClassInfo ci = classes.get(extractClassName(receiver.type));
                 if (ci != null && !hasUserDefinedMethod(ci, node.method)) {
-                    LLVMValue clsName = emitClassNameOf(receiver);
-                    if (node.method.equals("getClassName")) return clsName;
+                    if (node.method.equals("getClassName")) return emitClassNameOf(receiver);
                     // toString = ClassName@addr (lowercase hex, no 0x — Java-style).
-                    emitObjectToStringHelper();
-                    String[] bv = classPtrBaseAndValue(receiver);
-                    String objPtr = "%objts.obj." + tmpCount++;
-                    body.append("  ").append(objPtr).append(" = bitcast %").append(bv[0]).append("* ")
-                         .append(bv[1]).append(" to i8*\n");
-                    String s = "%objts.s." + tmpCount++;
-                    body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
-                         .append(clsName.value).append(", i8* ").append(objPtr).append(")\n");
-                    return new LLVMValue(s, "i8*", "String");
+                    return emitDefaultToString(receiver);
                 }
                 // user-defined toString/getClassName on the chain — normal path (objCache reused)
             }
