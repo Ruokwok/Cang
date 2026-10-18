@@ -6,8 +6,14 @@ namespace cang/lang
 # thread { } 语法糖不受影响（退出前自动 join）。
 # 对象式任务为 void 无参；对象、数组、Function、lambda 不允许跨线程（任务的 receiver 除外）。
 # 与 Boehm GC 兼容：Windows 经 GC_CreateThread 附着，posix 在线程入口注册线程栈。
-# task/setDaemon/start/join/currentThread/getId/getParent/isAlive 均为编译器内建：native 声明仅供 IDE 补全与方法检查，主编译器不生成实现。
+# task/setDaemon/start/join/currentThread/getId/getParent/isAlive 及 init 构造均为编译器内建：native 声明仅供 IDE 补全与方法检查，主编译器不生成实现。
 class Thread
+
+# 构造：无参 = 暂无任务（start 前必须再 task()，否则运行时错误）；Function<void> = 直接设任务，之后仍可 task() 覆盖。
+# daemon 均默认 false；bool 构造等价 new Thread().setDaemon(b)。
+native init()
+native init(bool daemon)
+native init(Function<void> f)
 
 # 休眠当前线程 time 毫秒（long）。阻塞调用线程（main 里 = 主线程，thread{} 里 = 该工作线程）。
 static native func void sleep(long time)

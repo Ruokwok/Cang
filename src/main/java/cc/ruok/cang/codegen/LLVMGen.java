@@ -1337,6 +1337,7 @@ public class LLVMGen {
         info.returnType = "void";
         info.className = fullName;
         info.isConstructor = true;
+        info.isNative = decl.isNative;
         boolean hasDefault = false;
         for (Parameter p : decl.params) {
             info.paramTypes.add(p.type);
@@ -1795,6 +1796,8 @@ public class LLVMGen {
     }
 
     private void generateConstructor(ConstructorDecl decl, String fullName) {
+        // Native ctors are declaration-only (IDE surface; the new-expression is intrinsic).
+        if (decl.isNative) return;
         // Overload-aware symbol: match this decl's param types inside the group.
         String funcName = fullName + ".constructor";
         String llvmSym = funcName;
@@ -6427,30 +6430,40 @@ public class LLVMGen {
         } finally {
             expectedFunctionType = savedTaskExpected;
         }
+        validateThreadTaskFn(fn, node.line, "Thread.task");
+        emitThreadTaskFields(receiver, fn, "thr.task");
+        return receiver;
+    }
+
+    /** Shared task-fn checks for new Thread(f) and .task(f): must be Function<void> code+receiver. */
+    private void validateThreadTaskFn(LLVMValue fn, int line, String via) {
         String sig = fn.semanticType;
         if (sig == null || !isFunctionType(sig)) {
-            throw new RuntimeException("Thread.task requires a no-argument no-return function, e.g. this::run or a lambda (at line " + node.line + ")");
+            throw new RuntimeException(via + " requires a no-argument no-return function, e.g. this::run or a lambda (at line " + line + ")");
         }
         String[] parts = functionTypeParts(sig);
         if (parts.length != 1 || !parts[0].equals("void")) {
-            throw new RuntimeException("Thread.task requires a no-argument no-return function (Function<void>), got " + sig + " (at line " + node.line + ")");
+            throw new RuntimeException(via + " requires a no-argument no-return function (Function<void>), got " + sig + " (at line " + line + ")");
         }
         if (!fn.type.equals("%CangFunction")) {
-            throw new RuntimeException("Thread.task requires a method reference, function name or lambda (at line " + node.line + ")");
+            throw new RuntimeException(via + " requires a method reference, function name or lambda (at line " + line + ")");
         }
-        String code = "%thr.task.code." + tmpCount++;
+    }
+
+    /** Store { code, receiver } from a validated %CangFunction into Thread obj fields 0/1. */
+    private void emitThreadTaskFields(LLVMValue obj, LLVMValue fn, String tag) {
+        String code = "%" + tag + ".code." + tmpCount++;
         body.append("  ").append(code).append(" = extractvalue %CangFunction ").append(fn.value).append(", 0\n");
-        String recv = "%thr.task.recv." + tmpCount++;
+        String recv = "%" + tag + ".recv." + tmpCount++;
         body.append("  ").append(recv).append(" = extractvalue %CangFunction ").append(fn.value).append(", 1\n");
-        String cfield = "%thr.task.cf." + tmpCount++;
-        body.append("  ").append(cfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+        String cfield = "%" + tag + ".cf." + tmpCount++;
+        body.append("  ").append(cfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj.value)
              .append(", i32 0, i32 0\n");
         body.append("  store i8* ").append(code).append(", i8** ").append(cfield).append("\n");
-        String rfield = "%thr.task.rf." + tmpCount++;
-        body.append("  ").append(rfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(receiver.value)
+        String rfield = "%" + tag + ".rf." + tmpCount++;
+        body.append("  ").append(rfield).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj.value)
              .append(", i32 0, i32 1\n");
         body.append("  store i8* ").append(recv).append(", i8** ").append(rfield).append("\n");
-        return receiver;
     }
 
     /** Object-style .setDaemon(b): store the daemon flag; only legal before start();
@@ -8303,24 +8316,36 @@ public class LLVMGen {
             }
             return new LLVMValue(value.value, "i8*", "String");
         }
-        // new Thread() — intrinsic object-style handle; no Cang class body. Fields start null;
-        // .task(fn) stores { code, receiver }, .start() creates the thread and stores the handle.
+        // new Thread() / new Thread(true) / new Thread(f) — intrinsic object-style handle;
+        // no Cang class body. Fields start null; .task(f) stores { code, receiver }; .start()
+        // creates the thread and stores the handle. The Function form seeds the task up front.
         if (node.className.equals("Thread")) {
             if (node.typeArgs != null && !node.typeArgs.isEmpty()) {
                 throw new RuntimeException("new Thread() does not take type parameters (at line " + node.line + ")");
             }
             if (node.args.size() > 1) {
-                throw new RuntimeException("new Thread() takes at most one bool daemon flag (at line " + node.line + ")");
+                throw new RuntimeException("new Thread() takes at most one argument (at line " + node.line + ")");
             }
-            // Daemon flag: new Thread(true) = daemon (main exit does NOT wait);
-            // new Thread() / new Thread(false) = non-daemon (joined at main exit).
+            // Daemon flag default false; a Function<void> arg seeds the task instead.
             String daemonVal = "false";
+            LLVMValue taskFn = null;
             if (node.args.size() == 1) {
-                LLVMValue flag = generateExpr(node.args.get(0));
-                if (!flag.type.equals("i1")) {
-                    throw new RuntimeException("new Thread() daemon flag must be a bool (at line " + node.line + ")");
+                String saved = expectedFunctionType;
+                expectedFunctionType = "Function<void>";
+                LLVMValue arg;
+                try {
+                    arg = generateExpr(node.args.get(0));
+                } finally {
+                    expectedFunctionType = saved;
                 }
-                daemonVal = flag.value;
+                if (arg.type.equals("i1")) {
+                    daemonVal = arg.value;
+                } else if (arg.type.equals("%CangFunction")) {
+                    validateThreadTaskFn(arg, node.line, "new Thread(f)");
+                    taskFn = arg;
+                } else {
+                    throw new RuntimeException("new Thread() takes a bool daemon flag or a Function<void> task (at line " + node.line + ")");
+                }
             }
             String raw = "%thr.obj.raw." + tmpCount++;
             body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 48)\n");
@@ -8331,6 +8356,9 @@ public class LLVMGen {
                 body.append("  ").append(fp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
                      .append(", i32 0, i32 ").append(f).append("\n");
                 body.append("  store i8* null, i8** ").append(fp).append("\n");
+            }
+            if (taskFn != null) {
+                emitThreadTaskFields(new LLVMValue(obj, "%CangThreadObj*"), taskFn, "thr.newtask");
             }
             String dptr = "%thr.obj.daemon." + tmpCount++;
             body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)

@@ -447,6 +447,8 @@ public abstract class AST {
         public String className;
         public List<Parameter> params;
         public AST body;
+        /** native ctor: declaration-only, no body (compiler intrinsic / IDE surface). */
+        public boolean isNative;
         public ConstructorDecl(String className, List<Parameter> params, AST body, int line) {
             super(line); this.className = className; this.params = params; this.body = body;
         }

@@ -167,6 +167,12 @@ public class Parser {
 
         // native modifier for top-level functions
         if (check(TokenType.NATIVE)) {
+            // native init(...) constructor declaration — braceless-class files route members
+            // through this top-level path; parseClassMember consumes the modifier itself.
+            if ((peek(1).value.equals("init") || peek(1).value.equals("_init"))
+                    && peek(1).type == TokenType.IDENT && peek(2).type == TokenType.LPAREN) {
+                return parseClassMember();
+            }
             int line = advance().line;
             if (check(TokenType.FUNC)) {
                 advance();
@@ -407,8 +413,16 @@ public class Parser {
                 error("constructors must be named init or _init");
             }
             List<Parameter> params = parseParams();
-            AST body = parseBlock();
-            return new ConstructorDecl(ctorName, params, body, line);
+            AST body;
+            if (isNative) {
+                body = null;
+                optionalSemicolon();
+            } else {
+                body = parseBlock();
+            }
+            ConstructorDecl cd = new ConstructorDecl(ctorName, params, body, line);
+            cd.isNative = isNative;
+            return cd;
         }
 
         // Field or method (with optional static modifier)

@@ -857,6 +857,7 @@ public final class CangApi {
                 f.owner = c.name;
                 f.memberMethod = true;
                 f.constructor = true;
+                f.nativeMethod = ctor.isNative;
                 f.params = toParams(ctor.params, c.name);
                 c.functions.add(f);
             } else if (m instanceof AST.FieldDecl) {
