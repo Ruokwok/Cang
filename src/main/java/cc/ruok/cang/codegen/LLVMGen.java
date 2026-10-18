@@ -5850,6 +5850,17 @@ public class LLVMGen {
                 if (node.method.equals("setDaemon")) return generateThreadObjSetDaemon(objCache, node);
                 return generateThreadObjStart(objCache, node);
             }
+            // Pre-start-only APIs on a started handle (thread{}/start()/currentThread()/getParent()
+            // returns) — statically decidable, so a clear compile error beats both the leaked
+            // "Unknown method: CangThreadHandle..." and any runtime check.
+            if (objCache.semanticType != null && isThreadType(objCache.semanticType)) {
+                if (node.method.equals("start")) {
+                    throw new RuntimeException("Thread.start cannot be called on an already-started "
+                        + "thread handle (at line " + node.line + ")");
+                }
+                throw new RuntimeException("Thread." + node.method + " must be called before start; "
+                    + "thread{} / start() already return a started handle (at line " + node.line + ")");
+            }
         }
         // Receiver is generated at most once (debug.md #15): the join probe, the array-length
         // probe and the regular instance path share the same value.
