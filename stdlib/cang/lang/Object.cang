@@ -1,5 +1,15 @@
 namespace cang/lang
 
-# Object - 所有类的根父类
-# 编译器内置，无需 import
+# Object - 所有类的根父类（编译器内置，无需 import）。
+# toString()/getClassName() 的默认实现为编译器内建（native 声明仅供 IDE 与覆盖判定）：
+#   getClassName() —— 返回类的全名（含命名空间前缀，如 nspkg_Main；与 println(obj)
+#                     打印的 <类名@地址> 中的类名一致）；String 返回 "String"，
+#                     数组返回 "Array"，Thread 句柄返回 "Thread"。
+#   toString() —— 默认为 "类名@内存地址"（如 Point@1a2b3c；小写十六进制，无 0x 前缀）。
+#                 存活对象地址唯一，可区分不同对象；对象死亡后地址可能复用，身份判断请用 ==。
+#                 子类可覆盖，覆盖后 x.toString() 走动态分发。
+# 注意：println(obj) 直接打印 <类名@地址>，不经过 toString()——需要自定义输出请显式调用。
 class Object
+native func String getClassName()
+native func String toString()
+

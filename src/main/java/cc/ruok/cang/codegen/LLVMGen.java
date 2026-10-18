@@ -5949,6 +5949,58 @@ public class LLVMGen {
                 // not a Thread receiver — fall through to the normal instance path
             }
         }
+        // Object.getClassName()/toString(): intrinsic default when nothing on the receiver's
+        // class chain defines its own (Object.cang only carries native markers — an inherited
+        // body can't work: call sites pass the derived %X* where the define would take %Object*).
+        // The default name is the class's full name — the same string println(obj) prints in
+        // <ClassName@addr>. String/str toString() = itself; arrays → "Array"; Thread → "Thread".
+        if (objCache == null && node.object != null
+                && (node.method.equals("toString") || node.method.equals("getClassName"))) {
+            objCache = generateExpr(node.object);
+            LLVMValue receiver = objCache;
+            if (!node.args.isEmpty()) {
+                throw new RuntimeException("Object." + node.method + " accepts no arguments (at line " + node.line + ")");
+            }
+            if (receiver.semanticType != null
+                    && (receiver.semanticType.equals("String") || receiver.semanticType.equals("str"))) {
+                if (node.method.equals("toString")) return receiver;
+                return makeStringConstant("String");
+            }
+            if (receiver.semanticType != null && receiver.semanticType.startsWith("Array<")) {
+                return makeStringConstant("Array");
+            }
+            if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+                return makeStringConstant("Thread");
+            }
+            if (receiver.type.startsWith("%") && receiver.type.endsWith("*")) {
+                ClassInfo ci = classes.get(extractClassName(receiver.type));
+                if (ci != null) {
+                    boolean userDefined = false;
+                    List<FuncInfo> grp = lookupInstanceMethods(ci, node.method);
+                    if (grp != null) {
+                        for (FuncInfo f : grp) {
+                            if (!"cang_lang_Object".equals(f.className)) { userDefined = true; break; }
+                        }
+                    }
+                    if (!userDefined) {
+                        LLVMValue clsName = emitClassNameOf(receiver);
+                        if (node.method.equals("getClassName")) return clsName;
+                        // toString = ClassName@addr (lowercase hex, no 0x — Java-style).
+                        emitObjectToStringHelper();
+                        String[] bv = classPtrBaseAndValue(receiver);
+                        String objPtr = "%objts.obj." + tmpCount++;
+                        body.append("  ").append(objPtr).append(" = bitcast %").append(bv[0]).append("* ")
+                             .append(bv[1]).append(" to i8*\n");
+                        String s = "%objts.s." + tmpCount++;
+                        body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
+                             .append(clsName.value).append(", i8* ").append(objPtr).append(")\n");
+                        return new LLVMValue(s, "i8*", "String");
+                    }
+                    // user-defined toString/getClassName on the chain — normal path (objCache reused)
+                }
+            }
+            // unrecognized receiver — fall through
+        }
 
         // Handle built-in Stdout.print
         if (node.object instanceof Identifier) {
@@ -8117,6 +8169,104 @@ public class LLVMGen {
             .append(utf8Len(value) + 1).append(" x i8]* ")
             .append(globalName).append(", i32 0, i32 0\n");
         return new LLVMValue(ptr, "i8*");
+    }
+
+    /** Class full name of a class-object pointer, via @cang.classnames[typeId] (getClassName/toString). */
+    private LLVMValue emitClassNameOf(LLVMValue receiver) {
+        emitClassNameTable();
+        int size = classNameTableSize();
+        String[] bv = classPtrBaseAndValue(receiver);
+        String base = bv[0];
+        String recv = bv[1];
+        String tidPtr = "%objcn.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr %").append(base).append(", %").append(base)
+             .append("* ").append(recv).append(", i32 0, i32 0\n");
+        String tid = "%objcn.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+        String idx = "%objcn.idx." + tmpCount++;
+        body.append("  ").append(idx).append(" = zext i32 ").append(tid).append(" to i64\n");
+        String namePtr = "%objcn.np." + tmpCount++;
+        body.append("  ").append(namePtr).append(" = getelementptr [").append(size).append(" x i8*], [")
+             .append(size).append(" x i8*]* @cang.classnames, i64 0, i64 ").append(idx).append("\n");
+        String name = "%objcn.n." + tmpCount++;
+        body.append("  ").append(name).append(" = load i8*, i8** ").append(namePtr).append("\n");
+        return new LLVMValue(name, "i8*", "String");
+    }
+
+    /** Class-object pointer → { base struct name, %X* register } (bitcast from %X** if needed). */
+    private String[] classPtrBaseAndValue(LLVMValue r) {
+        String base = extractClassName(r.type);
+        if (r.type.equals("%" + base + "*")) return new String[]{ base, r.value };
+        String bc = "%objptr.bc." + tmpCount++;
+        body.append("  ").append(bc).append(" = bitcast ").append(r.type).append(" ").append(r.value)
+             .append(" to %").append(base).append("*\n");
+        return new String[]{ base, bc };
+    }
+
+    /** toString runtime formatter: sprintf("%s@%llx") into a heap buffer — ClassName@addr. */
+    private void emitObjectToStringHelper() {
+        if (header.toString().contains("define i8* @cang.f.objtostr(")) return;
+        if (!header.toString().contains("declare i64 @strlen(")) {
+            header.append("declare i64 @strlen(i8*)\n");
+        }
+        if (!header.toString().contains("declare i32 @sprintf(")) {
+            header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
+        }
+        if (!header.toString().contains("@.str.objtostr = ")) {
+            header.append("@.str.objtostr = private constant [8 x i8] c\"%s@%llx\\00\"\n");
+        }
+        header.append("define i8* @cang.f.objtostr(i8* %cls, i8* %obj) {\n");
+        header.append("entry:\n");
+        header.append("  %len = call i64 @strlen(i8* %cls)\n");
+        // '@' + 16 hex digits + NUL, padded.
+        header.append("  %sz = add i64 %len, 24\n");
+        if (gcEnabled) {
+            header.append("  %buf = call i8* @GC_malloc(i64 %sz)\n");
+        } else {
+            header.append("  %buf = call i8* @malloc(i64 %sz)\n");
+        }
+        header.append("  %addr = ptrtoint i8* %obj to i64\n");
+        header.append("  %n = call i32 (i8*, i8*, ...) @sprintf(i8* %buf, i8* @.str.objtostr, i8* %cls, i64 %addr)\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+    }
+
+    /** Table size (typeId 0..max) for @cang.classnames. */
+    private int classNameTableSize() {
+        int maxId = 0;
+        for (ClassInfo ci : classes.values()) maxId = Math.max(maxId, ci.typeId);
+        return maxId + 1;
+    }
+
+    /** Global i8* table indexed by runtime typeId → class full name constant. Built lazily. */
+    private void emitClassNameTable() {
+        if (header.toString().contains("@cang.classnames = ")) return;
+        int size = classNameTableSize();
+        String[] names = new String[size];
+        for (ClassInfo ci : classes.values()) names[ci.typeId] = ci.fullName;
+        StringBuilder inits = new StringBuilder();
+        for (int i = 0; i < size; i++) {
+            String nm = names[i];
+            String constName = ensureClassNameStrConst(nm);
+            int len = utf8Len(nm) + 1;
+            if (i > 0) inits.append(", ");
+            inits.append("i8* getelementptr inbounds ([").append(len).append(" x i8], [")
+                 .append(len).append(" x i8]* ").append(constName).append(", i32 0, i32 0)");
+        }
+        header.append("@cang.classnames = internal global [").append(size)
+              .append(" x i8*] [").append(inits).append("]\n");
+    }
+
+    /** Register a string constant by VALUE (header-side, no body gep); returns its @.str name. */
+    private String ensureClassNameStrConst(String value) {
+        if (!stringLiterals.containsKey(value)) {
+            String name = "@.str.clsname." + stringLiterals.size();
+            int byteCount = utf8Len(value) + 1;
+            header.append(name).append(" = private unnamed_addr constant [").append(byteCount)
+                  .append(" x i8] c\"").append(escapeBytes(value)).append("\\00\"\n");
+            stringLiterals.put(value, name);
+        }
+        return stringLiterals.get(value);
     }
 
     /** Static field of the CURRENT class by bare name (class-internal `instance` etc.), or null. */
