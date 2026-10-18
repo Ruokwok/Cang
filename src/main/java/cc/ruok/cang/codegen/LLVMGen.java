@@ -4437,6 +4437,17 @@ public class LLVMGen {
         return true;
     }
 
+    /** True when the class chain defines `method` itself (beyond Object's native marker). */
+    private boolean hasUserDefinedMethod(ClassInfo ci, String method) {
+        List<FuncInfo> grp = lookupInstanceMethods(ci, method);
+        if (grp != null) {
+            for (FuncInfo f : grp) {
+                if (!"cang_lang_Object".equals(f.className)) return true;
+            }
+        }
+        return false;
+    }
+
     /** Group of same-name methods on ci or the first ancestor declaring the name. */
     private List<FuncInfo> lookupInstanceMethods(ClassInfo ci, String method) {
         int guard = 0;
@@ -5949,55 +5960,56 @@ public class LLVMGen {
                 // not a Thread receiver — fall through to the normal instance path
             }
         }
-        // Object.getClassName()/toString(): intrinsic default when nothing on the receiver's
-        // class chain defines its own (Object.cang only carries native markers — an inherited
-        // body can't work: call sites pass the derived %X* where the define would take %Object*).
-        // The default name is the class's full name — the same string println(obj) prints in
-        // <ClassName@addr>. String/str toString() = itself; arrays → "Array"; Thread → "Thread".
+        // Object.getClassName()/toString()/getAddress(): intrinsic default when nothing on the
+        // receiver's class chain defines its own (Object.cang only carries native markers — an
+        // inherited body can't work: call sites pass the derived %X* where the define would take
+        // %Object*). getAddress() = the pointer itself as long (full 64-bit; int would truncate).
         if (objCache == null && node.object != null
-                && (node.method.equals("toString") || node.method.equals("getClassName"))) {
+                && (node.method.equals("toString") || node.method.equals("getClassName")
+                        || node.method.equals("getAddress"))) {
             objCache = generateExpr(node.object);
             LLVMValue receiver = objCache;
             if (!node.args.isEmpty()) {
                 throw new RuntimeException("Object." + node.method + " accepts no arguments (at line " + node.line + ")");
             }
-            if (receiver.semanticType != null
+            if (node.method.equals("getAddress")) {
+                if (receiver.type.endsWith("*")) {
+                    ClassInfo addrCi = receiver.type.startsWith("%")
+                        ? classes.get(extractClassName(receiver.type)) : null;
+                    if (addrCi == null || !hasUserDefinedMethod(addrCi, "getAddress")) {
+                        String a = "%objaddr." + tmpCount++;
+                        body.append("  ").append(a).append(" = ptrtoint ").append(receiver.type)
+                             .append(" ").append(receiver.value).append(" to i64\n");
+                        return new LLVMValue(a, "i64");
+                    }
+                    // user-defined getAddress — normal path (objCache reused)
+                }
+                // non-reference receiver — fall through to the normal path
+            } else if (receiver.semanticType != null
                     && (receiver.semanticType.equals("String") || receiver.semanticType.equals("str"))) {
                 if (node.method.equals("toString")) return receiver;
                 return makeStringConstant("String");
-            }
-            if (receiver.semanticType != null && receiver.semanticType.startsWith("Array<")) {
+            } else if (receiver.semanticType != null && receiver.semanticType.startsWith("Array<")) {
                 return makeStringConstant("Array");
-            }
-            if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
+            } else if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
                 return makeStringConstant("Thread");
-            }
-            if (receiver.type.startsWith("%") && receiver.type.endsWith("*")) {
+            } else if (receiver.type.startsWith("%") && receiver.type.endsWith("*")) {
                 ClassInfo ci = classes.get(extractClassName(receiver.type));
-                if (ci != null) {
-                    boolean userDefined = false;
-                    List<FuncInfo> grp = lookupInstanceMethods(ci, node.method);
-                    if (grp != null) {
-                        for (FuncInfo f : grp) {
-                            if (!"cang_lang_Object".equals(f.className)) { userDefined = true; break; }
-                        }
-                    }
-                    if (!userDefined) {
-                        LLVMValue clsName = emitClassNameOf(receiver);
-                        if (node.method.equals("getClassName")) return clsName;
-                        // toString = ClassName@addr (lowercase hex, no 0x — Java-style).
-                        emitObjectToStringHelper();
-                        String[] bv = classPtrBaseAndValue(receiver);
-                        String objPtr = "%objts.obj." + tmpCount++;
-                        body.append("  ").append(objPtr).append(" = bitcast %").append(bv[0]).append("* ")
-                             .append(bv[1]).append(" to i8*\n");
-                        String s = "%objts.s." + tmpCount++;
-                        body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
-                             .append(clsName.value).append(", i8* ").append(objPtr).append(")\n");
-                        return new LLVMValue(s, "i8*", "String");
-                    }
-                    // user-defined toString/getClassName on the chain — normal path (objCache reused)
+                if (ci != null && !hasUserDefinedMethod(ci, node.method)) {
+                    LLVMValue clsName = emitClassNameOf(receiver);
+                    if (node.method.equals("getClassName")) return clsName;
+                    // toString = ClassName@addr (lowercase hex, no 0x — Java-style).
+                    emitObjectToStringHelper();
+                    String[] bv = classPtrBaseAndValue(receiver);
+                    String objPtr = "%objts.obj." + tmpCount++;
+                    body.append("  ").append(objPtr).append(" = bitcast %").append(bv[0]).append("* ")
+                         .append(bv[1]).append(" to i8*\n");
+                    String s = "%objts.s." + tmpCount++;
+                    body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
+                         .append(clsName.value).append(", i8* ").append(objPtr).append(")\n");
+                    return new LLVMValue(s, "i8*", "String");
                 }
+                // user-defined toString/getClassName on the chain — normal path (objCache reused)
             }
             // unrecognized receiver — fall through
         }
