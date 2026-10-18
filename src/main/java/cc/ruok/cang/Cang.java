@@ -364,8 +364,9 @@ public class Cang {
         }
 
 
-        // Bare type references resolve as: explicit imports (above) -> stdlib cang/lang/
-        // -> stdlib cang/io/. Anything else stays unresolved and fails later with
+        // Bare type references resolve as: explicit imports (above) -> same-namespace siblings
+        // (main file's namespace first, then other loaded project namespaces) -> stdlib
+        // cang/lang/ -> stdlib cang/io/. Anything else stays unresolved and fails later with
         // "Unknown class". Keywords (int/String/...) are builtin and never looked up.
         java.util.Set<String> autoTried = new java.util.HashSet<>();
         for (int round = 0; round < 32; round++) {
@@ -379,15 +380,36 @@ public class Cang {
             for (AST m : mainProgram.members) {
                 if (m instanceof AST.ClassDecl) known.add(((AST.ClassDecl) m).name);
             }
+            // Same-namespace probe dirs: main file's namespace first ("" = sourceRoot
+            // itself), then each distinct project namespace seen on loaded files in load
+            // order — so siblings within a package resolve each other without imports.
+            // Stdlib namespaces (cang/...) are excluded: they have their own probes below.
+            java.util.List<String> nsDirs = new java.util.ArrayList<>();
+            nsDirs.add(namespace);
+            for (AST m : allMembers) {
+                if (m instanceof AST.ClassDecl) {
+                    String ns = ((AST.ClassDecl) m).namespace;
+                    if (ns != null && !ns.isEmpty() && !ns.startsWith("cang/") && !nsDirs.contains(ns)) {
+                        nsDirs.add(ns);
+                    }
+                }
+            }
             boolean loadedAny = false;
             for (String r : refs) {
                 if (r == null || known.contains(r) || autoTried.contains(r)) continue;
                 autoTried.add(r);
                 if (TokenType.keywords().contains(r)) continue;
                 String pkg = null;
-                if (resolveImportFile(sourceRoot, "cang/lang/" + r) != null) {
+                for (String ns : nsDirs) {
+                    String cand = ns.isEmpty() ? r : ns + "/" + r;
+                    if (resolveImportFile(sourceRoot, cand) != null) {
+                        pkg = cand;
+                        break;
+                    }
+                }
+                if (pkg == null && resolveImportFile(sourceRoot, "cang/lang/" + r) != null) {
                     pkg = "cang/lang/" + r;
-                } else if (resolveImportFile(sourceRoot, "cang/io/" + r) != null) {
+                } else if (pkg == null && resolveImportFile(sourceRoot, "cang/io/" + r) != null) {
                     pkg = "cang/io/" + r;
                 }
                 if (pkg == null) continue;
