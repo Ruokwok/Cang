@@ -1,13 +1,13 @@
 namespace cang/lang
 
-# Thread<T> - compiler intrinsic thread handle.
+# Thread - compiler intrinsic thread handle（无泛型：结果类型由编译器按句柄语义类型解析，T 无消费者）。
 # 对象式（唯一显式写法）：new Thread().task(fn).start() —— fn 收方法引用/顶层函数/无参 lambda；
 # start 返回 Thread<void> 句柄，join 只能调用一次。
 # thread { } 语法糖不受影响（退出前自动 join）。
 # 对象式任务为 void 无参；对象、数组、Function、lambda 不允许跨线程（任务的 receiver 除外）。
 # 与 Boehm GC 兼容：Windows 经 GC_CreateThread 附着，posix 在线程入口注册线程栈。
 # task/setDaemon/start/join/currentThread/getId/getParent/isAlive 均为编译器内建：native 声明仅供 IDE 补全与方法检查，主编译器不生成实现。
-class Thread<T>
+class Thread
 
 # 休眠当前线程 time 毫秒（long）。阻塞调用线程（main 里 = 主线程，thread{} 里 = 该工作线程）。
 static native func void sleep(long time)
@@ -38,5 +38,5 @@ native func Thread<void> setDaemon(bool b)
 # 启动线程，返回 Thread<void> 句柄供 join；只能启动一次，非 daemon 在 main 退出前自动 join。
 native func Thread<void> start()
 
-# 等待线程结束（只能调用一次），返回任务结果类型（Thread<void> 时为 void）。
-native func T join()
+# 等待线程结束（只能调用一次）。用户可达的句柄均为 Thread<void>（spawn 已移除、thread{} 句柄不外露），故返回 void。
+native func void join()
