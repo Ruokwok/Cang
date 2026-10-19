@@ -1,0 +1,37 @@
+namespace cang/lang
+
+# Coroutine - 单线程事件循环协程（libuv 实现）。用法与 Thread 一致：
+#   new Coroutine(f).start().join() / new Coroutine().task(fn).setDaemon(true).start().join()
+# 语义与 Thread 的关键差异（务必阅读）：
+#   - 无并行：任务在泵循环的线程上执行（join()/main 退出时泵 uv_run）；任务体顺序交错于泵点。
+#   - join 其他协程 = 嵌套泵循环（真正的协作交错点）；join 自己 = 运行时错误。
+#   - 任务内阻塞调用（Thread.sleep 等）会卡住整个循环与全部协程——协程体应保持轻量。
+#   - start() 返回自身（不是句柄）：链式 start().join()；join/getId/isAlive 直接在对象上用。
+#   - 非 daemon 协程在 main 退出前自动泵完（与对象式线程的自动 join 对应）；daemon 则直接放掉。
+#   - 协程 API 只能在同一线程上 start/join（通常 main）；跨线程触碰循环未定义。
+# task/setDaemon/start/join/getId/isAlive 与 init 构造均为编译器内建：native 声明仅供 IDE。
+class Coroutine
+
+# 构造：无参 = 暂无任务（start 前须 task()）；Function<void> = 直接设任务；bool = daemon 开关。
+# daemon 均默认 false。
+native init()
+native init(bool daemon)
+native init(Function<void> f)
+
+# 注册任务 fn（方法引用/顶层函数/无参 lambda，须为 Function<void>），返回自身供链式调用。
+native func Coroutine task(Function<void> fn)
+
+# 设置是否为 daemon（daemon 在 main 退出时不再泵等）。只能在 start 之前调用，返回自身。
+native func Coroutine setDaemon(bool b)
+
+# 把任务调度进事件循环（0ms 定时器），返回自身供链式 .join()。只能 start 一次。
+native func Coroutine start()
+
+# 泵循环直到任务完成。未 start 报运行时错误；join 正在运行的自己 = 致命错误。
+native func void join()
+
+# 协程逻辑 id（int，独立计数器从 0 原子自增，与线程 id 空间分开）。
+native func int getId()
+
+# 是否已 start 且尚未完成（未 start 为 false，join 返回后为 false）。
+native func bool isAlive()

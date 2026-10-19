@@ -19,6 +19,8 @@ public class Cang {
 
     private static String sourceCode = "";
     private static String sourceFile = "";
+    /** Set by the compiler when Coroutine/libuv intrinsics are emitted — links libuv on demand. */
+    public static boolean needsLibuv;
     private static String bundledStdlibDir = null;
 
     public static void main(String[] args) throws IOException, InterruptedException {
@@ -264,6 +266,7 @@ public class Cang {
         // 3. Code generation
         log.println("\u001B[1m[3/3] Generating LLVM IR\u001B[0m");
         long genStart = System.currentTimeMillis();
+        needsLibuv = false;
         LLVMGen codegen = new LLVMGen();
         codegen.setSourceFile(filename);
         codegen.setTargetPlatform(target);
@@ -1034,6 +1037,25 @@ public class Cang {
             linkArgs.add(gcLib);
             log.println("      gc:     " + gcLib);
         }
+        if (needsLibuv) {
+            String uvLib = findLibuvLib("windows", libRoot);
+            if (uvLib == null) {
+                throw new LinkFailed("libuv static library not found for windows target (lib/libuv_window_amd64.a)");
+            }
+            linkArgs.add(uvLib);
+            // libuv's Windows backend needs these system libs when linked statically.
+            linkArgs.add("-lws2_32");
+            linkArgs.add("-luserenv");
+            linkArgs.add("-lpsapi");
+            linkArgs.add("-liphlpapi");
+            linkArgs.add("-ldbghelp");
+            linkArgs.add("-lole32");
+            linkArgs.add("-lmincore");
+            log.println("      libuv:  " + uvLib);
+        }
+        if (gui) {
+            linkArgs.add("-mwindows");
+        }
 
         long t1 = System.currentTimeMillis();
         log.print("      Compiling .ll -> .o ... ");
@@ -1115,6 +1137,45 @@ public class Cang {
         return null;
     }
 
+    /**
+     * Locate the libuv static library for the Coroutine stdlib (needsLibuv):
+     * lib/libuv_<os>_<arch>.a under cwd and its parent (same layout as libgc).
+     */
+    private static String findLibuvLib(String target, String override) {
+        String osKey = target.equals("windows") ? "window" : target.equals("macos") ? "mac" : target;
+        String altKey = target.equals("windows") ? "windows" : osKey;
+        String[] libNames = { "libuv_" + osKey + "_amd64.a", "libuv_" + altKey + "_amd64.a" };
+        if (override != null) {
+            File f = new File(override);
+            if (f.isFile()) return f.getAbsolutePath();
+            for (String name : libNames) {
+                File inLibDir = new File(f, "lib" + File.separator + name);
+                if (inLibDir.isFile()) {
+                    try {
+                        return inLibDir.getCanonicalPath();
+                    } catch (IOException e) {
+                        return inLibDir.getAbsolutePath();
+                    }
+                }
+            }
+        }
+        String cwd = System.getProperty("user.dir");
+        String[] bases = { cwd, cwd + File.separator + ".." };
+        for (String base : bases) {
+            for (String name : libNames) {
+                File f = new File(base, "lib" + File.separator + name);
+                if (f.isFile()) {
+                    try {
+                        return f.getCanonicalPath();
+                    } catch (IOException e) {
+                        return f.getAbsolutePath();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     private static String findTool(String toolName, String[] candidates) {
         for (String path : candidates) {
             if (new java.io.File(path).exists()) return path;
@@ -1156,6 +1217,15 @@ public class Cang {
                 throw new LinkFailed("Boehm GC static library not found for linux target");
             }
             args.add(gcLib);
+        }
+        if (needsLibuv) {
+            String uvLib = findLibuvLib("linux", libRoot);
+            if (uvLib == null) {
+                throw new LinkFailed("libuv static library not found for linux target (lib/libuv_linux_amd64.a)");
+            }
+            args.add(uvLib);
+            args.add("-lpthread");
+            args.add("-ldl");
         }
         args.add("-o");
         args.add(exeFile);

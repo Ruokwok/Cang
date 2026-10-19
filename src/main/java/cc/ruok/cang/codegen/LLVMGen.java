@@ -498,6 +498,7 @@ public class LLVMGen {
         }
 
         emitGcFramePop();
+        emitCoroutineRegistryJoin();
         emitThreadBlockJoins();
         emitRegisteredThreadJoins();
         body.append("  ret i32 0\n");
@@ -1515,6 +1516,8 @@ public class LLVMGen {
         header.append("@cang.thread.self = thread_local global i8* null\n");
         // Birth parent (creator's self handle) written by thread entries; null on main.
         header.append("@cang.thread.parent = thread_local global i8* null\n");
+        // Coroutine (libuv single-thread event loop): { code, receiver, done, daemon, id, block }.
+        header.append("%CangCo = type { i8*, i8*, i32, i1, i32, i8* }\n");
         header.append("%CangList = type { i8*, i64, i64 }\n\n");
 
         // Object constructor (no-op)
@@ -5986,11 +5989,28 @@ public class LLVMGen {
             throw new RuntimeException("Thread.spawn has been removed (at line "
                 + node.line + ")");
         }
+        // Coroutine (libuv single-thread event loop): one object carries task/setDaemon/start/
+        // join/getId/isAlive — dispatched before the Thread gates (method names overlap).
+        if (objCache == null && node.object != null
+                && (node.method.equals("task") || node.method.equals("setDaemon")
+                        || node.method.equals("start") || node.method.equals("join")
+                        || node.method.equals("getId") || node.method.equals("isAlive"))) {
+            objCache = generateExpr(node.object);
+            if (objCache.type.equals("%CangCo*")) {
+                if (node.method.equals("task")) return generateCoroutineTask(objCache, node);
+                if (node.method.equals("setDaemon")) return generateCoroutineSetDaemon(objCache, node);
+                if (node.method.equals("start")) return generateCoroutineStart(objCache, node);
+                if (node.method.equals("join")) return generateCoroutineJoin(objCache, node);
+                if (node.method.equals("getId")) return generateCoroutineGetId(objCache, node);
+                return generateCoroutineIsAlive(objCache, node);
+            }
+            // non-Coroutine receiver with a clashing name — reuse the generated value below
+        }
         // Object-style Thread: task/setDaemon/start (plus run on a subclass receiver) — exact
         // type gate so unrelated classes' same-named methods use the normal instance path.
         if (node.object != null && (node.method.equals("task") || node.method.equals("setDaemon")
                 || node.method.equals("start") || node.method.equals("run"))) {
-            objCache = generateExpr(node.object);
+            if (objCache == null) objCache = generateExpr(node.object);
             if (objCache.type.equals("%CangThreadObj*")) {
                 if (node.method.equals("task")) return generateThreadObjTask(objCache, node);
                 if (node.method.equals("setDaemon")) return generateThreadObjSetDaemon(objCache, node);
@@ -6033,8 +6053,8 @@ public class LLVMGen {
         }
         // Receiver is generated at most once (debug.md #15): the join probe, the array-length
         // probe and the regular instance path share the same value.
-        if (objCache == null && node.object != null && node.method.equals("join")) {
-            objCache = generateExpr(node.object);
+        if (node.object != null && node.method.equals("join")) {
+            if (objCache == null) objCache = generateExpr(node.object);
             LLVMValue receiver = objCache;
             if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
                 if (!node.args.isEmpty()) throw new RuntimeException("Thread.join accepts no arguments (at line " + node.line + ")");
@@ -6051,10 +6071,10 @@ public class LLVMGen {
         // getId / getParent / isAlive: logical id on the object (assigned at new Thread()) or
         // on any Thread handle; parent = creator's self handle (null for main); isAlive probes
         // the OS thread (unstarted object is never alive).
-        if (objCache == null && node.object != null
+        if (node.object != null
                 && (node.method.equals("getId") || node.method.equals("getParent")
                         || node.method.equals("isAlive"))) {
-            objCache = generateExpr(node.object);
+            if (objCache == null) objCache = generateExpr(node.object);
             LLVMValue receiver = objCache;
             if (!node.args.isEmpty()) {
                 throw new RuntimeException("Thread." + node.method + " accepts no arguments (at line " + node.line + ")");
@@ -6162,6 +6182,17 @@ public class LLVMGen {
                 return makeStringConstant("String");
             } else if (receiver.semanticType != null && receiver.semanticType.startsWith("Array<")) {
                 return makeStringConstant("Array");
+            } else if (receiver.semanticType != null && receiver.semanticType.equals("Coroutine")) {
+                if (node.method.equals("getClassName")) return makeStringConstant("Coroutine");
+                emitObjectToStringHelper();
+                LLVMValue coName = makeStringConstant("Coroutine");
+                String coObj = "%co.ts.o." + tmpCount++;
+                body.append("  ").append(coObj).append(" = bitcast ").append(receiver.type).append(" ")
+                     .append(receiver.value).append(" to i8*\n");
+                String s = "%co.ts.s." + tmpCount++;
+                body.append("  ").append(s).append(" = call i8* @cang.f.objtostr(i8* ")
+                     .append(coName.value).append(", i8* ").append(coObj).append(")\n");
+                return new LLVMValue(s, "i8*", "String");
             } else if (receiver.semanticType != null && isThreadType(receiver.semanticType)) {
                 return makeStringConstant("Thread");
             } else if (receiver.type.startsWith("%") && receiver.type.endsWith("*")) {
@@ -8750,6 +8781,375 @@ public class LLVMGen {
         return false;
     }
 
+    // ==================== Coroutine (libuv single-thread event loop) ====================
+
+    /**
+     * libuv runtime for cang/lang/Coroutine — emitted lazily on first Coroutine use.
+     * A coroutine body runs on whichever thread pumps the loop (join()/main-exit drain),
+     * on the uv_loop via a 0ms one-shot timer. The timer block is [i8* co | 8 pad |
+     * over-sized uv_timer_t] so the shared callback recovers the co from timer-8 —
+     * no uv struct field offsets are assumed. The block is plain malloc (uv_close frees).
+     */
+    private void emitCoroutineRuntime() {
+        if (header.toString().contains("@cang.co.loop = ")) return;
+        cc.ruok.cang.Cang.needsLibuv = true;
+        header.append("@cang.co.loop = internal global i8* null\n");
+        header.append("@cang.co.seq = internal global i32 0\n");
+        header.append("@cang.co.current = internal global i8* null\n");
+        header.append("@cang.co.regs = internal global [256 x i8*] zeroinitializer\n");
+        header.append("@cang.co.regc = internal global i64 0\n");
+        header.append("declare i8* @uv_default_loop()\n");
+        header.append("declare i32 @uv_timer_init(i8*, i8*)\n");
+        header.append("declare i32 @uv_timer_start(i8*, void (i8*)*, i64, i64)\n");
+        header.append("declare void @uv_close(i8*, void (i8*)*)\n");
+        header.append("declare i32 @uv_run(i8*, i32)\n");
+        // Shared timer callback: recover co from timer-8, run the task, mark done, close.
+        header.append("define void @cang.co.entry(i8* %timer) {\n");
+        header.append("entry:\n");
+        header.append("  %base = getelementptr i8, i8* %timer, i64 -8\n");
+        header.append("  %coRawp = bitcast i8* %base to i8**\n");
+        header.append("  %coRaw = load i8*, i8** %coRawp\n");
+        header.append("  %prev = load i8*, i8** @cang.co.current\n");
+        header.append("  store i8* %coRaw, i8** @cang.co.current\n");
+        header.append("  %co = bitcast i8* %coRaw to %CangCo*\n");
+        header.append("  %cf = getelementptr %CangCo, %CangCo* %co, i32 0, i32 0\n");
+        header.append("  %code = load i8*, i8** %cf\n");
+        header.append("  %rf = getelementptr %CangCo, %CangCo* %co, i32 0, i32 1\n");
+        header.append("  %recv = load i8*, i8** %rf\n");
+        header.append("  %fp = bitcast i8* %code to void (i8*)*\n");
+        header.append("  call void %fp(i8* %recv)\n");
+        header.append("  %dp = getelementptr %CangCo, %CangCo* %co, i32 0, i32 2\n");
+        header.append("  store i32 1, i32* %dp\n");
+        header.append("  store i8* %prev, i8** @cang.co.current\n");
+        header.append("  call void @uv_close(i8* %timer, void (i8*)* @cang.co.close)\n");
+        header.append("  ret void\n");
+        header.append("}\n\n");
+        header.append("define void @cang.co.close(i8* %h) {\n");
+        header.append("entry:\n");
+        header.append("  %base = getelementptr i8, i8* %h, i64 -8\n");
+        header.append("  call void @free(i8* %base)\n");
+        header.append("  ret void\n");
+        header.append("}\n\n");
+    }
+
+    /** The uv_loop, created on first use (stored in @cang.co.loop). */
+    private String ensureCoroutineLoop() {
+        emitCoroutineRuntime();
+        int id = labelCount++;
+        String create = "coloop.create." + id;
+        String done = "coloop.done." + id;
+        String cur = "%coloop.cur." + tmpCount++;
+        body.append("  ").append(cur).append(" = load i8*, i8** @cang.co.loop\n");
+        String isN = "%coloop.isn." + tmpCount++;
+        body.append("  ").append(isN).append(" = icmp eq i8* ").append(cur).append(", null\n");
+        body.append("  br i1 ").append(isN).append(", label %").append(create).append(", label %").append(done).append("\n");
+        body.append(create).append(":\n");
+        String lp = "%coloop.lp." + tmpCount++;
+        body.append("  ").append(lp).append(" = call i8* @uv_default_loop()\n");
+        body.append("  store i8* ").append(lp).append(", i8** @cang.co.loop\n");
+        body.append("  br label %").append(done).append("\n");
+        body.append(done).append(":\n");
+        String res = "%coloop.res." + tmpCount++;
+        body.append("  ").append(res).append(" = load i8*, i8** @cang.co.loop\n");
+        return res;
+    }
+
+    /** Pump uv_run(UV_RUN_ONCE) until the co's done flag is 1 (no self-join check). */
+    private void emitCoroutinePumpUntilDone(String coValue, int labelBase) {
+        String condL = "copump.cond." + labelBase;
+        String bodyL = "copump.run." + labelBase;
+        String doneL = "copump.done." + labelBase;
+        String dp = "%copump.dp." + tmpCount++;
+        body.append("  ").append(dp).append(" = getelementptr %CangCo, %CangCo* ").append(coValue)
+             .append(", i32 0, i32 2\n");
+        body.append("  br label %").append(condL).append("\n");
+        body.append(condL).append(":\n");
+        String dv = "%copump.dv." + tmpCount++;
+        body.append("  ").append(dv).append(" = load i32, i32* ").append(dp).append("\n");
+        String isDone = "%copump.isd." + tmpCount++;
+        body.append("  ").append(isDone).append(" = icmp eq i32 ").append(dv).append(", 1\n");
+        body.append("  br i1 ").append(isDone).append(", label %").append(doneL).append(", label %").append(bodyL).append("\n");
+        body.append(bodyL).append(":\n");
+        String lp = "%copump.lp." + tmpCount++;
+        body.append("  ").append(lp).append(" = load i8*, i8** @cang.co.loop\n");
+        // UV_RUN_ONCE = 1
+        body.append("  call i32 @uv_run(i8* ").append(lp).append(", i32 1)\n");
+        body.append("  br label %").append(condL).append("\n");
+        body.append(doneL).append(":\n");
+    }
+
+    /** Non-daemon started coroutines: drain at main exit (mirrors the thread registry join). */
+    private void emitCoroutineRegistryJoin() {
+        if (!header.toString().contains("@cang.co.loop = ")) return;
+        String cnt = "%coreg.cnt." + tmpCount++;
+        body.append("  ").append(cnt).append(" = load i64, i64* @cang.co.regc\n");
+        int id = labelCount++;
+        String condL = "coreg.cond." + id;
+        String bodyL = "coreg.body." + id;
+        String doneL = "coreg.done." + id;
+        String iPtr = "%coreg.ip." + tmpCount++;
+        body.append("  ").append(iPtr).append(" = alloca i64\n  store i64 0, i64* ").append(iPtr).append("\n");
+        body.append("  br label %").append(condL).append("\n");
+        body.append(condL).append(":\n");
+        String i = "%coreg.i." + tmpCount++;
+        body.append("  ").append(i).append(" = load i64, i64* ").append(iPtr).append("\n");
+        String has = "%coreg.has." + tmpCount++;
+        body.append("  ").append(has).append(" = icmp ult i64 ").append(i).append(", ").append(cnt).append("\n");
+        body.append("  br i1 ").append(has).append(", label %").append(bodyL).append(", label %").append(doneL).append("\n");
+        body.append(bodyL).append(":\n");
+        String slot = "%coreg.slot." + tmpCount++;
+        body.append("  ").append(slot).append(" = getelementptr [256 x i8*], [256 x i8*]* @cang.co.regs, i64 0, i64 ").append(i).append("\n");
+        String raw = "%coreg.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = load i8*, i8** ").append(slot).append("\n");
+        String co = "%coreg.co." + tmpCount++;
+        body.append("  ").append(co).append(" = bitcast i8* ").append(raw).append(" to %CangCo*\n");
+        int sub = labelCount++;
+        emitCoroutinePumpUntilDone(co, sub);
+        String next = "%coreg.next." + tmpCount++;
+        body.append("  ").append(next).append(" = add i64 ").append(i).append(", 1\n");
+        body.append("  store i64 ").append(next).append(", i64* ").append(iPtr).append("\n");
+        body.append("  br label %").append(condL).append("\n");
+        body.append(doneL).append(":\n");
+    }
+
+    /** Task field store for a %CangCo receiver (code/recv at fields 0/1). */
+    private void emitCoroutineTaskFields(LLVMValue co, LLVMValue fn) {
+        String code = "%cotask.code." + tmpCount++;
+        body.append("  ").append(code).append(" = extractvalue %CangFunction ").append(fn.value).append(", 0\n");
+        String recv = "%cotask.recv." + tmpCount++;
+        body.append("  ").append(recv).append(" = extractvalue %CangFunction ").append(fn.value).append(", 1\n");
+        String cfield = "%cotask.cf." + tmpCount++;
+        body.append("  ").append(cfield).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 0\n");
+        body.append("  store i8* ").append(code).append(", i8** ").append(cfield).append("\n");
+        String rfield = "%cotask.rf." + tmpCount++;
+        body.append("  ").append(rfield).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 1\n");
+        body.append("  store i8* ").append(recv).append(", i8** ").append(rfield).append("\n");
+    }
+
+    /** new Coroutine(...) — mirrors new Thread(): optional daemon bool or seeded Function<void>. */
+    private LLVMValue newCoroutineObject(String daemonVal, LLVMValue taskFn) {
+        emitCoroutineRuntime();
+        String raw = "%co.obj.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 48)\n");
+        String co = "%co.obj." + tmpCount++;
+        body.append("  ").append(co).append(" = bitcast i8* ").append(raw).append(" to %CangCo*\n");
+        for (int f = 0; f < 2; f++) {
+            String fp = "%co.obj.f." + tmpCount++;
+            body.append("  ").append(fp).append(" = getelementptr %CangCo, %CangCo* ").append(co)
+                 .append(", i32 0, i32 ").append(f).append("\n");
+            body.append("  store i8* null, i8** ").append(fp).append("\n");
+        }
+        String donePtr = "%co.obj.done." + tmpCount++;
+        body.append("  ").append(donePtr).append(" = getelementptr %CangCo, %CangCo* ").append(co)
+             .append(", i32 0, i32 2\n");
+        body.append("  store i32 0, i32* ").append(donePtr).append("\n");
+        String dptr = "%co.obj.daemon." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangCo, %CangCo* ").append(co)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i1 ").append(daemonVal).append(", i1* ").append(dptr).append("\n");
+        String idPtr = "%co.obj.idp." + tmpCount++;
+        body.append("  ").append(idPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co)
+             .append(", i32 0, i32 4\n");
+        String threadId = "%co.seq.id." + tmpCount++;
+        body.append("  ").append(threadId).append(" = atomicrmw add i32* @cang.co.seq, i32 1 seq_cst\n");
+        body.append("  store i32 ").append(threadId).append(", i32* ").append(idPtr).append("\n");
+        String blockPtr = "%co.obj.bp." + tmpCount++;
+        body.append("  ").append(blockPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co)
+             .append(", i32 0, i32 5\n");
+        body.append("  store i8* null, i8** ").append(blockPtr).append("\n");
+        if (taskFn != null) {
+            emitCoroutineTaskFields(new LLVMValue(co, "%CangCo*"), taskFn);
+        }
+        return new LLVMValue(co, "%CangCo*", "Coroutine");
+    }
+
+    /** Coroutine.task(fn): validate Function<void>, store { code, receiver }; returns this. */
+    private LLVMValue generateCoroutineTask(LLVMValue co, MethodCallExpr node) {
+        if (node.args.size() != 1) {
+            throw new RuntimeException("Coroutine.task accepts exactly one function argument (at line " + node.line + ")");
+        }
+        String saved = expectedFunctionType;
+        expectedFunctionType = "Function<void>";
+        LLVMValue fn;
+        try {
+            fn = generateExpr(node.args.get(0));
+        } finally {
+            expectedFunctionType = saved;
+        }
+        validateThreadTaskFn(fn, node.line, "Coroutine.task");
+        emitCoroutineTaskFields(co, fn);
+        return co;
+    }
+
+    /** Coroutine.setDaemon(b): only legal before start(); returns this. */
+    private LLVMValue generateCoroutineSetDaemon(LLVMValue co, MethodCallExpr node) {
+        if (node.args.size() != 1) {
+            throw new RuntimeException("Coroutine.setDaemon expects one bool argument (at line " + node.line + ")");
+        }
+        LLVMValue flag = generateExpr(node.args.get(0));
+        if (!flag.type.equals("i1")) {
+            throw new RuntimeException("Coroutine.setDaemon flag must be a bool (at line " + node.line + ")");
+        }
+        String blockPtr = "%co.setd.bp." + tmpCount++;
+        body.append("  ").append(blockPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 5\n");
+        String block = "%co.setd.b." + tmpCount++;
+        body.append("  ").append(block).append(" = load i8*, i8** ").append(blockPtr).append("\n");
+        String started = "%co.setd.st." + tmpCount++;
+        body.append("  ").append(started).append(" = icmp ne i8* ").append(block).append(", null\n");
+        int id = labelCount++;
+        String badL = "co.setdaemon.started." + id;
+        String okL = "co.setdaemon.ok." + id;
+        body.append("  br i1 ").append(started).append(", label %").append(badL).append(", label %").append(okL).append("\n");
+        body.append(badL).append(":\n");
+        emitRuntimeError("Coroutine already started: setDaemon must be called before start", node.line, okL);
+        body.append(okL).append(":\n");
+        String dptr = "%co.setd.dp." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i1 ").append(flag.value).append(", i1* ").append(dptr).append("\n");
+        return co;
+    }
+
+    /** Coroutine.start(): schedule the task as a 0ms one-shot uv timer; returns this (for .join()). */
+    private LLVMValue generateCoroutineStart(LLVMValue co, MethodCallExpr node) {
+        if (!node.args.isEmpty()) {
+            throw new RuntimeException("Coroutine.start accepts no arguments (at line " + node.line + ")");
+        }
+        String blockPtr = "%co.start.bp." + tmpCount++;
+        body.append("  ").append(blockPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 5\n");
+        String oldBlock = "%co.start.ob." + tmpCount++;
+        body.append("  ").append(oldBlock).append(" = load i8*, i8** ").append(blockPtr).append("\n");
+        int id = labelCount++;
+        String already = "co.start.already." + id;
+        String okL = "co.start.ok." + id;
+        String cmp = "%co.start.cmp." + tmpCount++;
+        body.append("  ").append(cmp).append(" = icmp ne i8* ").append(oldBlock).append(", null\n");
+        body.append("  br i1 ").append(cmp).append(", label %").append(already).append(", label %").append(okL).append("\n");
+        body.append(already).append(":\n");
+        emitRuntimeError("Coroutine already started", node.line, okL);
+        body.append(okL).append(":\n");
+        String loop = ensureCoroutineLoop();
+        // Timer block: [i8* co | pad to 8 | uv_timer_t (over-sized)] — malloc, freed by uv_close.
+        String raw = "%co.start.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @malloc(i64 264)\n");
+        String coSlot = "%co.start.slot." + tmpCount++;
+        body.append("  ").append(coSlot).append(" = bitcast i8* ").append(raw).append(" to i8**\n");
+        String coRaw = "%co.start.coraw." + tmpCount++;
+        body.append("  ").append(coRaw).append(" = bitcast %CangCo* ").append(co.value).append(" to i8*\n");
+        body.append("  store i8* ").append(coRaw).append(", i8** ").append(coSlot).append("\n");
+        String timer = "%co.start.timer." + tmpCount++;
+        body.append("  ").append(timer).append(" = getelementptr i8, i8* ").append(raw).append(", i64 8\n");
+        String r1 = "%co.start.r1." + tmpCount++;
+        body.append("  ").append(r1).append(" = call i32 @uv_timer_init(i8* ").append(loop).append(", i8* ").append(timer).append(")\n");
+        String r2 = "%co.start.r2." + tmpCount++;
+        body.append("  ").append(r2).append(" = call i32 @uv_timer_start(i8* ")
+             .append(timer).append(", void (i8*)* @cang.co.entry, i64 0, i64 0)\n");
+        body.append("  store i8* ").append(raw).append(", i8** ").append(blockPtr).append("\n");
+        // Registry (non-daemon): drained at main exit like object-style threads.
+        String dptr = "%co.start.dp." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 3\n");
+        String daemon = "%co.start.daemon." + tmpCount++;
+        body.append("  ").append(daemon).append(" = load i1, i1* ").append(dptr).append("\n");
+        int regId = labelCount++;
+        String doReg = "coreg.enter." + regId;
+        String skipReg = "coreg.skip." + regId;
+        body.append("  br i1 ").append(daemon).append(", label %").append(skipReg).append(", label %").append(doReg).append("\n");
+        body.append(doReg).append(":\n");
+        String regCnt = "%coreg.cnt." + tmpCount++;
+        body.append("  ").append(regCnt).append(" = load i64, i64* @cang.co.regc\n");
+        String regFull = "%coreg.full." + tmpCount++;
+        String regOk = "coreg.ok." + regId;
+        String regBad = "coreg.bad." + regId;
+        body.append("  ").append(regFull).append(" = icmp uge i64 ").append(regCnt).append(", 256\n");
+        body.append("  br i1 ").append(regFull).append(", label %").append(regBad).append(", label %").append(regOk).append("\n");
+        body.append(regBad).append(":\n");
+        emitFatalError("Too many live coroutines (registry full)", node.line, regOk);
+        body.append(regOk).append(":\n");
+        String regSlot = "%coreg.slot." + tmpCount++;
+        body.append("  ").append(regSlot).append(" = getelementptr [256 x i8*], [256 x i8*]* @cang.co.regs, i64 0, i64 ")
+             .append(regCnt).append("\n");
+        body.append("  store i8* ").append(coRaw).append(", i8** ").append(regSlot).append("\n");
+        String regCnt2 = "%coreg.cnt2." + tmpCount++;
+        body.append("  ").append(regCnt2).append(" = add i64 ").append(regCnt).append(", 1\n");
+        body.append("  store i64 ").append(regCnt2).append(", i64* @cang.co.regc\n");
+        body.append("  br label %").append(skipReg).append("\n");
+        body.append(skipReg).append(":\n");
+        return co;
+    }
+
+    /** Coroutine.join(): pump uv_run until done. Not-started and self-join are errors. */
+    private LLVMValue generateCoroutineJoin(LLVMValue co, MethodCallExpr node) {
+        if (!node.args.isEmpty()) {
+            throw new RuntimeException("Coroutine.join accepts no arguments (at line " + node.line + ")");
+        }
+        String blockPtr = "%co.join.bp." + tmpCount++;
+        body.append("  ").append(blockPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 5\n");
+        String block = "%co.join.b." + tmpCount++;
+        body.append("  ").append(block).append(" = load i8*, i8** ").append(blockPtr).append("\n");
+        String notStarted = "%co.join.ns." + tmpCount++;
+        body.append("  ").append(notStarted).append(" = icmp eq i8* ").append(block).append(", null\n");
+        int id = labelCount++;
+        String badL = "co.join.notstarted." + id;
+        String okL = "co.join.ok." + id;
+        body.append("  br i1 ").append(notStarted).append(", label %").append(badL).append(", label %").append(okL).append("\n");
+        body.append(badL).append(":\n");
+        emitRuntimeError("Coroutine not started: call start() before join", node.line, okL);
+        body.append(okL).append(":\n");
+        // Self-join: joining the coroutine whose body is currently executing deadlocks.
+        String coRaw = "%co.join.coraw." + tmpCount++;
+        body.append("  ").append(coRaw).append(" = bitcast %CangCo* ").append(co.value).append(" to i8*\n");
+        String cur = "%co.join.cur." + tmpCount++;
+        body.append("  ").append(cur).append(" = load i8*, i8** @cang.co.current\n");
+        String isSelf = "%co.join.self." + tmpCount++;
+        body.append("  ").append(isSelf).append(" = icmp eq i8* ").append(cur).append(", ").append(coRaw).append("\n");
+        String selfL = "co.join.selfjoin." + id;
+        String pumpL = "co.join.pump." + id;
+        body.append("  br i1 ").append(isSelf).append(", label %").append(selfL).append(", label %").append(pumpL).append("\n");
+        body.append(selfL).append(":\n");
+        emitFatalError("Cannot join the running coroutine", node.line, pumpL);
+        body.append(pumpL).append(":\n");
+        ensureCoroutineLoop();
+        emitCoroutinePumpUntilDone(co.value, labelCount++);
+        return new LLVMValue("void", "void");
+    }
+
+    /** Coroutine.getId(): logical id from the shared atomic counter (independent of Thread ids). */
+    private LLVMValue generateCoroutineGetId(LLVMValue co, MethodCallExpr node) {
+        String idPtr = "%co.getid.ip." + tmpCount++;
+        body.append("  ").append(idPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 4\n");
+        String v = "%co.getid.v." + tmpCount++;
+        body.append("  ").append(v).append(" = load i32, i32* ").append(idPtr).append("\n");
+        return new LLVMValue(v, "i32");
+    }
+
+    /** Coroutine.isAlive(): started (block non-null) and not yet done. */
+    private LLVMValue generateCoroutineIsAlive(LLVMValue co, MethodCallExpr node) {
+        String blockPtr = "%co.alive.bp." + tmpCount++;
+        body.append("  ").append(blockPtr).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 5\n");
+        String block = "%co.alive.b." + tmpCount++;
+        body.append("  ").append(block).append(" = load i8*, i8** ").append(blockPtr).append("\n");
+        String started = "%co.alive.st." + tmpCount++;
+        body.append("  ").append(started).append(" = icmp ne i8* ").append(block).append(", null\n");
+        String dp = "%co.alive.dp." + tmpCount++;
+        body.append("  ").append(dp).append(" = getelementptr %CangCo, %CangCo* ").append(co.value)
+             .append(", i32 0, i32 2\n");
+        String dv = "%co.alive.dv." + tmpCount++;
+        body.append("  ").append(dv).append(" = load i32, i32* ").append(dp).append("\n");
+        String notDone = "%co.alive.nd." + tmpCount++;
+        body.append("  ").append(notDone).append(" = icmp eq i32 ").append(dv).append(", 0\n");
+        String a = "%co.alive.a." + tmpCount++;
+        body.append("  ").append(a).append(" = and i1 ").append(started).append(", ").append(notDone).append("\n");
+        return new LLVMValue(a, "i1");
+    }
+
     private LLVMValue generateNew(NewExpr node) {
         // Boxing a primitive str into the immutable String reference wrapper.
         if (node.className.equals("String") && node.args.size() == 1) {
@@ -8759,6 +9159,38 @@ public class LLVMGen {
             }
             return new LLVMValue(value.value, "i8*", "String");
         }
+        // new Coroutine() / new Coroutine(true) / new Coroutine(f) — libuv event-loop object;
+        // same shape as new Thread() but a single object (no separate handle: start() returns this).
+        if (node.className.equals("Coroutine")) {
+            if (node.typeArgs != null && !node.typeArgs.isEmpty()) {
+                throw new RuntimeException("new Coroutine() does not take type parameters (at line " + node.line + ")");
+            }
+            if (node.args.size() > 1) {
+                throw new RuntimeException("new Coroutine() takes at most one argument (at line " + node.line + ")");
+            }
+            String daemonVal = "false";
+            LLVMValue taskFn = null;
+            if (node.args.size() == 1) {
+                String saved = expectedFunctionType;
+                expectedFunctionType = "Function<void>";
+                LLVMValue arg;
+                try {
+                    arg = generateExpr(node.args.get(0));
+                } finally {
+                    expectedFunctionType = saved;
+                }
+                if (arg.type.equals("i1")) {
+                    daemonVal = arg.value;
+                } else if (arg.type.equals("%CangFunction")) {
+                    validateThreadTaskFn(arg, node.line, "new Coroutine(f)");
+                    taskFn = arg;
+                } else {
+                    throw new RuntimeException("new Coroutine() takes a bool daemon flag or a Function<void> task (at line " + node.line + ")");
+                }
+            }
+            return newCoroutineObject(daemonVal, taskFn);
+        }
+
         // new Thread() / new Thread(true) / new Thread(f) — intrinsic object-style handle;
         // no Cang class body. Fields start null; .task(f) stores { code, receiver }; .start()
         // creates the thread and stores the handle. The Function form seeds the task up front.
@@ -9342,6 +9774,7 @@ public class LLVMGen {
         }
 
         emitGcFramePop();
+        emitCoroutineRegistryJoin();
         emitThreadBlockJoins();
         emitRegisteredThreadJoins();
         body.append("  ret i32 0\n");
@@ -11925,6 +12358,10 @@ pb.append("prl.finish.").append(id).append(":\n");
         // Function values are uniform { code, receiver } structs.
         if (isFunctionType(cangType)) {
             return "%CangFunction";
+        }
+        // Coroutine objects are the compiler's %CangCo intrinsic struct.
+        if (cangType != null && cangType.equals("Coroutine")) {
+            return "%CangCo*";
         }
         if (isThreadType(cangType)) {
             return "%CangThreadHandle*";
