@@ -18,6 +18,12 @@ native init(Function<void> f)
 # 休眠当前线程 time 毫秒（long）。阻塞调用线程（main 里 = 主线程，thread{} 里 = 该工作线程）。
 static native func void sleep(long time)
 
+# 继承式用法：class My : Thread { func void run() { ... } }，new My().start() 在新线程执行 run()。
+# 子类实例上只有 start()（和直接在当前线程调用 run()）可用；join/getId/isAlive 等请用
+# start() 返回的句柄（var h = t.start(); h.join()）。未覆盖 run() 即调 start() 为编译错误。
+# 注：通过基类类型引用调用 start() 时 run 按静态类型解析（暂无跨层虚分发）。
+native func void run()
+
 # 返回当前执行所在线程的句柄（每线程缓存：同一线程多次调用返回同一实例，可 == 比较身份）。
 # 句柄仅供识别与传递：不可 join（已标记为已 join，join 会报运行时错误），也不能再 task/start/setDaemon。
 static native func Thread<void> currentThread()

@@ -1733,12 +1733,14 @@ public class LLVMGen {
             }
         }
 
-        // Call parent constructor if inheriting (this sets parent's type ID first)
+        // Call parent constructor if inheriting (this sets parent's type ID first).
+        // Native parent ctors (Thread's marker inits) have no body to call — skip them.
         if (ci.parentName != null) {
             ClassInfo parentInfo = classes.get(ci.parentName);
             if (parentInfo != null) {
                 String parentCtor = parentInfo.fullName + ".constructor";
-                if (functions.containsKey(parentCtor)) {
+                FuncInfo parentFi = functions.get(parentCtor);
+                if (parentFi != null && !parentFi.isNative) {
                     // Bitcast this to parent type
                     String parentThis = "%parent.this." + tmpCount++;
                     body.append("  ").append(parentThis).append(" = bitcast %")
@@ -1869,7 +1871,7 @@ public class LLVMGen {
                 } else if (functions.containsKey(parentCtor)) {
                     pfi = functions.get(parentCtor);
                 }
-                if (pfi != null) {
+                if (pfi != null && !pfi.isNative) {
                     // Bitcast this to parent type
                     String parentThis = "%parent.this." + tmpCount++;
                     body.append("  ").append(parentThis).append(" = bitcast %")
@@ -5984,15 +5986,17 @@ public class LLVMGen {
             throw new RuntimeException("Thread.spawn has been removed (at line "
                 + node.line + ")");
         }
-        // Object-style Thread: task(fn) / setDaemon(b) / start() on new Thread() results
-        // (exact type gate so unrelated classes' same-named methods use the normal instance path).
+        // Object-style Thread: task/setDaemon/start (plus run on a subclass receiver) — exact
+        // type gate so unrelated classes' same-named methods use the normal instance path.
         if (node.object != null && (node.method.equals("task") || node.method.equals("setDaemon")
-                || node.method.equals("start"))) {
+                || node.method.equals("start") || node.method.equals("run"))) {
             objCache = generateExpr(node.object);
             if (objCache.type.equals("%CangThreadObj*")) {
                 if (node.method.equals("task")) return generateThreadObjTask(objCache, node);
                 if (node.method.equals("setDaemon")) return generateThreadObjSetDaemon(objCache, node);
-                return generateThreadObjStart(objCache, node);
+                if (node.method.equals("start")) return generateThreadObjStart(objCache, node);
+                throw new RuntimeException("Thread object has no run(); use task(fn), or subclass "
+                    + "Thread and override run() (at line " + node.line + ")");
             }
             // Pre-start-only APIs on a started handle (thread{}/start()/currentThread()/getParent()
             // returns) — statically decidable, so a clear compile error beats both the leaked
@@ -6002,8 +6006,29 @@ public class LLVMGen {
                     throw new RuntimeException("Thread.start cannot be called on an already-started "
                         + "thread handle (at line " + node.line + ")");
                 }
+                if (node.method.equals("run")) {
+                    throw new RuntimeException("run() executes automatically on start(); it cannot be "
+                        + "called on a started handle (at line " + node.line + ")");
+                }
                 throw new RuntimeException("Thread." + node.method + " must be called before start; "
                     + "thread{} / start() already return a started handle (at line " + node.line + ")");
+            }
+            // Thread subclass instance (class My : Thread): start() runs the overridden run()
+            // on a new thread via an internal adapter; task/setDaemon have no storage here.
+            ClassInfo subCi = threadSubclassInfo(objCache);
+            if (subCi != null) {
+                if (node.method.equals("start")) return generateSubclassStart(objCache, subCi, node);
+                if (node.method.equals("run")) {
+                    if (!chainHasUserRun(subCi)) {
+                        throw new RuntimeException("Thread subclass '" + subCi.simpleName
+                            + "' must override run() (at line " + node.line + ")");
+                    }
+                    // user-defined run — direct t.run() on the current thread (normal path)
+                } else {
+                    throw new RuntimeException("Thread subclass '" + subCi.simpleName + "': override "
+                        + "run() and call start(); " + node.method + "() is only for new Thread() "
+                        + "objects (at line " + node.line + ")");
+                }
             }
         }
         // Receiver is generated at most once (debug.md #15): the join probe, the array-length
@@ -6017,6 +6042,10 @@ public class LLVMGen {
                     receiver = threadObjHandle(receiver, node.line);
                 }
                 return generateThreadJoin(receiver, node.line);
+            }
+            if (threadSubclassInfo(receiver) != null) {
+                throw new RuntimeException("Thread subclass: join the handle from start() — "
+                    + "var h = t.start(); h.join() (at line " + node.line + ")");
             }
         }
         // getId / getParent / isAlive: logical id on the object (assigned at new Thread()) or
@@ -6066,6 +6095,10 @@ public class LLVMGen {
                     body.append("  ").append(r).append(" = call i1 @cang.thread.isalive(i8* ").append(cast).append(")\n");
                     return new LLVMValue(r, "i1");
                 }
+                if (threadSubclassInfo(receiver) != null) {
+                    throw new RuntimeException("Thread subclass: isAlive() is available on the handle "
+                        + "from start() — var h = t.start(); h.isAlive() (at line " + node.line + ")");
+                }
                 // not a Thread receiver — fall through
             } else {
                 String gep = null;
@@ -6089,6 +6122,11 @@ public class LLVMGen {
                     }
                     body.append("  ").append(val).append(" = load i32, i32* ").append(gep).append("\n");
                     return new LLVMValue(val, "i32");
+                }
+                if (threadSubclassInfo(receiver) != null) {
+                    throw new RuntimeException("Thread subclass: " + node.method + "() is available on "
+                        + "the handle from start() — var h = t.start(); h." + node.method
+                        + "() (at line " + node.line + ")");
                 }
                 // not a Thread receiver — fall through to the normal instance path
             }
@@ -8604,6 +8642,114 @@ public class LLVMGen {
         return new LLVMValue(ptr, "i8*", "Array<" + node.type + ">");
     }
 
+    /**
+     * Allocate + initialize an intrinsic object-style Thread object (daemon flag, optional
+     * seeded task, birth parent/id). Shared by new Thread(...) and Thread-subclass start().
+     */
+    private LLVMValue newThreadObject(String daemonVal, LLVMValue taskFn) {
+        String raw = "%thr.obj.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 48)\n");
+        String obj = "%thr.obj." + tmpCount++;
+        body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangThreadObj*\n");
+        for (int f = 0; f < 3; f++) {
+            String fp = "%thr.obj.f." + tmpCount++;
+            body.append("  ").append(fp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+                 .append(", i32 0, i32 ").append(f).append("\n");
+            body.append("  store i8* null, i8** ").append(fp).append("\n");
+        }
+        if (taskFn != null) {
+            emitThreadTaskFields(new LLVMValue(obj, "%CangThreadObj*"), taskFn, "thr.newtask");
+        }
+        String dptr = "%thr.obj.daemon." + tmpCount++;
+        body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+             .append(", i32 0, i32 3\n");
+        body.append("  store i1 ").append(daemonVal).append(", i1* ").append(dptr).append("\n");
+        // Parent = this (creating) thread's self handle — materialized BEFORE the child id
+        // so a parent's id is always lower than its children's (and main's first child
+        // gives main id 0). Also makes parent identity match the creator's currentThread().
+        LLVMValue parentSelf = ensureThreadSelf();
+        String parentCast = "%thr.obj.pcast." + tmpCount++;
+        body.append("  ").append(parentCast).append(" = bitcast %CangThreadHandle* ").append(parentSelf.value)
+             .append(" to i8*\n");
+        String pptr = "%thr.obj.pp." + tmpCount++;
+        body.append("  ").append(pptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+             .append(", i32 0, i32 5\n");
+        body.append("  store i8* ").append(parentCast).append(", i8** ").append(pptr).append("\n");
+        String threadId = emitThreadIdAlloc();
+        String iptr = "%thr.obj.idp." + tmpCount++;
+        body.append("  ").append(iptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
+             .append(", i32 0, i32 4\n");
+        body.append("  store i32 ").append(threadId).append(", i32* ").append(iptr).append("\n");
+        return new LLVMValue(obj, "%CangThreadObj*", "Thread<void>");
+    }
+
+    /**
+     * Thread-subclass start(): build an internal adapter Thread object whose task is a thunk
+     * calling the receiver's run() (resolved on its static class chain), then run the normal
+     * object-style start. Returns the Thread<void> handle.
+     */
+    private LLVMValue generateSubclassStart(LLVMValue receiver, ClassInfo subCi, MethodCallExpr node) {
+        if (!node.args.isEmpty()) {
+            throw new RuntimeException("Thread.start accepts no arguments (at line " + node.line + ")");
+        }
+        FuncInfo runFi = null;
+        List<FuncInfo> cands = lookupInstanceMethods(subCi, "run");
+        if (cands != null) {
+            for (FuncInfo f : cands) {
+                if (f.paramTypes.isEmpty()) { runFi = f; break; }
+            }
+        }
+        if (runFi == null || "cang_lang_Thread".equals(runFi.className)) {
+            throw new RuntimeException("Thread subclass '" + subCi.simpleName
+                + "' must override run() before start() (at line " + node.line + ")");
+        }
+        if (!"void".equals(runFi.returnType)) {
+            throw new RuntimeException("Thread subclass '" + subCi.simpleName
+                + "': run() must return void (at line " + node.line + ")");
+        }
+        String[] bv = classPtrBaseAndValue(receiver);
+        LLVMValue adapter = newThreadObject("false", null);
+        String thunk = emitThunk(runFi, "%" + bv[0] + "*");
+        String codePtr = "%subt.code." + tmpCount++;
+        body.append("  ").append(codePtr).append(" = bitcast void (i8*)* ").append(thunk).append(" to i8*\n");
+        String cfp = "%subt.cf." + tmpCount++;
+        body.append("  ").append(cfp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(adapter.value)
+             .append(", i32 0, i32 0\n");
+        body.append("  store i8* ").append(codePtr).append(", i8** ").append(cfp).append("\n");
+        String recvCast = "%subt.rc." + tmpCount++;
+        body.append("  ").append(recvCast).append(" = bitcast %").append(bv[0]).append("* ").append(bv[1]).append(" to i8*\n");
+        String rfp = "%subt.rf." + tmpCount++;
+        body.append("  ").append(rfp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(adapter.value)
+             .append(", i32 0, i32 1\n");
+        body.append("  store i8* ").append(recvCast).append(", i8** ").append(rfp).append("\n");
+        return generateThreadObjStart(adapter, node);
+    }
+
+    /** Receiver's class if its inheritance chain reaches Thread (the receiver class included). */
+    private ClassInfo threadSubclassInfo(LLVMValue r) {
+        if (r.type == null || !r.type.startsWith("%") || !r.type.endsWith("*")) return null;
+        ClassInfo own = classes.get(extractClassName(r.type));
+        if (own == null) return null;
+        ClassInfo ci = own;
+        int guard = 0;
+        while (ci != null && guard++ < 64) {
+            if ("cang_lang_Thread".equals(ci.fullName)) return own;
+            ci = ci.parentName != null ? classes.get(ci.parentName) : null;
+        }
+        return null;
+    }
+
+    /** True when the chain defines a run() body of its own (Thread.run is a native marker). */
+    private boolean chainHasUserRun(ClassInfo ci) {
+        List<FuncInfo> grp = lookupInstanceMethods(ci, "run");
+        if (grp != null) {
+            for (FuncInfo f : grp) {
+                if (!"cang_lang_Thread".equals(f.className)) return true;
+            }
+        }
+        return false;
+    }
+
     private LLVMValue generateNew(NewExpr node) {
         // Boxing a primitive str into the immutable String reference wrapper.
         if (node.className.equals("String") && node.args.size() == 1) {
@@ -8644,40 +8790,7 @@ public class LLVMGen {
                     throw new RuntimeException("new Thread() takes a bool daemon flag or a Function<void> task (at line " + node.line + ")");
                 }
             }
-            String raw = "%thr.obj.raw." + tmpCount++;
-            body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 48)\n");
-            String obj = "%thr.obj." + tmpCount++;
-            body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %CangThreadObj*\n");
-            for (int f = 0; f < 3; f++) {
-                String fp = "%thr.obj.f." + tmpCount++;
-                body.append("  ").append(fp).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
-                     .append(", i32 0, i32 ").append(f).append("\n");
-                body.append("  store i8* null, i8** ").append(fp).append("\n");
-            }
-            if (taskFn != null) {
-                emitThreadTaskFields(new LLVMValue(obj, "%CangThreadObj*"), taskFn, "thr.newtask");
-            }
-            String dptr = "%thr.obj.daemon." + tmpCount++;
-            body.append("  ").append(dptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
-                 .append(", i32 0, i32 3\n");
-            body.append("  store i1 ").append(daemonVal).append(", i1* ").append(dptr).append("\n");
-            // Parent = this (creating) thread's self handle — materialized BEFORE the child id
-            // so a parent's id is always lower than its children's (and main's first child
-            // gives main id 0). Also makes parent identity match the creator's currentThread().
-            LLVMValue parentSelf = ensureThreadSelf();
-            String parentCast = "%thr.obj.pcast." + tmpCount++;
-            body.append("  ").append(parentCast).append(" = bitcast %CangThreadHandle* ").append(parentSelf.value)
-                 .append(" to i8*\n");
-            String pptr = "%thr.obj.pp." + tmpCount++;
-            body.append("  ").append(pptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
-                 .append(", i32 0, i32 5\n");
-            body.append("  store i8* ").append(parentCast).append(", i8** ").append(pptr).append("\n");
-            String threadId = emitThreadIdAlloc();
-            String iptr = "%thr.obj.idp." + tmpCount++;
-            body.append("  ").append(iptr).append(" = getelementptr %CangThreadObj, %CangThreadObj* ").append(obj)
-                 .append(", i32 0, i32 4\n");
-            body.append("  store i32 ").append(threadId).append(", i32* ").append(iptr).append("\n");
-            return new LLVMValue(obj, "%CangThreadObj*", "Thread<void>");
+            return newThreadObject(daemonVal, taskFn);
         }
 
         ClassInfo ci = classes.get(node.className);
