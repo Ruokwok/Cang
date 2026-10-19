@@ -36,6 +36,16 @@ native func String toLower()
 # 去除首尾空白
 native func String trim()
 
+# 截取 index 处的单字节字符（UTF-8 字节粒度；结构扫描按 ASCII 比较即可），越界运行时错误
+native func String charAt(int index)
+
+# 字面全量替换：from 出现处全部换成 to；from 为空运行时错误；插入内容不重扫描（to 含 from 不死循环）
+native func String replace(String from, String to)
+
+# 按字面分隔符切分（Java 语义：丢弃尾部空段；中间空段保留；空串 → 空数组）。
+# 分隔符为空运行时错误。返回 String[]（字节粒度，同 charAt）
+native func String[] split(String sep)
+
 # 查找第一次出现的位置（忽略大小写）
 native func int indexOfIgnoreCase(String substring)
 
