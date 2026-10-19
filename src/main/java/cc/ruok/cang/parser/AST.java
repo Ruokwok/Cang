@@ -226,6 +226,13 @@ public abstract class AST {
         public ThreadBlockExpr(AST body, int line) { super(line); this.body = body; }
     }
 
+    /** coroutine { ... } — sugar for
+     *  new Coroutine(false).task(() -> { ... }).start() (returns the Coroutine object). */
+    public static class CoroutineBlockExpr extends AST {
+        public AST body;
+        public CoroutineBlockExpr(AST body, int line) { super(line); this.body = body; }
+    }
+
     public static class IfStmt extends AST {
         public AST condition;
         public AST thenBlock;
@@ -369,6 +376,10 @@ public abstract class AST {
                 setSourceFileRecursive(lambda.body, file);
             } else if (node instanceof ThreadBlockStmt) {
                 setSourceFileRecursive(((ThreadBlockStmt) node).body, file);
+            } else if (node instanceof ThreadBlockExpr) {
+                setSourceFileRecursive(((ThreadBlockExpr) node).body, file);
+            } else if (node instanceof CoroutineBlockExpr) {
+                setSourceFileRecursive(((CoroutineBlockExpr) node).body, file);
             } else if (node instanceof ConstructorDecl) {
                 ConstructorDecl cd = (ConstructorDecl) node;
                 if (cd.body instanceof Block) {

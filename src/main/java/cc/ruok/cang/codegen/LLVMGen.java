@@ -2367,6 +2367,12 @@ public class LLVMGen {
             frames.pop();
             return;
         }
+        if (node instanceof CoroutineBlockExpr) {
+            frames.push(new java.util.LinkedHashSet<>());
+            validateCaptures(((CoroutineBlockExpr) node).body, frames);
+            frames.pop();
+            return;
+        }
         if (node instanceof FuncDecl) {
             validateInFunction((FuncDecl) node, frames);
             return;
@@ -2760,6 +2766,17 @@ public class LLVMGen {
         NewExpr thrNew = new NewExpr("Thread", java.util.Collections.singletonList(falseFlag), node.line);
         LambdaExpr lam = new LambdaExpr(new ArrayList<>(), node.body, "void", node.line);
         MethodCallExpr taskCall = new MethodCallExpr(thrNew, "task",
+            java.util.Collections.singletonList(lam), node.line);
+        MethodCallExpr startCall = new MethodCallExpr(taskCall, "start", new ArrayList<>(), node.line);
+        return generateExpr(startCall);
+    }
+
+    /** coroutine { ... } sugar: new Coroutine(false).task(() -> { body }).start(). */
+    private LLVMValue generateCoroutineBlockExpr(CoroutineBlockExpr node) {
+        AST falseFlag = new BoolLit(false, node.line);
+        NewExpr coNew = new NewExpr("Coroutine", java.util.Collections.singletonList(falseFlag), node.line);
+        LambdaExpr lam = new LambdaExpr(new ArrayList<>(), node.body, "void", node.line);
+        MethodCallExpr taskCall = new MethodCallExpr(coNew, "task",
             java.util.Collections.singletonList(lam), node.line);
         MethodCallExpr startCall = new MethodCallExpr(taskCall, "start", new ArrayList<>(), node.line);
         return generateExpr(startCall);
@@ -3897,6 +3914,9 @@ public class LLVMGen {
         }
         if (node instanceof ThreadBlockExpr) {
             return generateThreadBlockExpr((ThreadBlockExpr) node);
+        }
+        if (node instanceof CoroutineBlockExpr) {
+            return generateCoroutineBlockExpr((CoroutineBlockExpr) node);
         }
         if (node instanceof BinaryExpr) {
             return generateBinary((BinaryExpr) node);

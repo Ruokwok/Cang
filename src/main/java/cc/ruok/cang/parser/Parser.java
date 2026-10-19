@@ -644,6 +644,7 @@ public class Parser {
         if (check(TokenType.CONTINUE)) { int line = advance().line; optionalSemicolon(); return new ContinueStmt(line); }
         if (check(TokenType.FREE)) return parseFreeStmt();
         if (check(TokenType.THREAD)) return parseThreadBlockStmt();
+        if (check(TokenType.COROUTINE)) return parseCoroutineBlockStmt();
         if (check(TokenType.LBRACE)) return parseBlock();
         // final var/type declaration
         if (check(TokenType.FINAL)) {
@@ -725,6 +726,14 @@ public class Parser {
         // thread { } is sugar for new Thread(false).task(() -> { ... }).start() — parse as an
         // expression statement so `var th = thread { ... }` captures the handle too.
         return new ExprStmt(new ThreadBlockExpr(body, line), line);
+    }
+
+    private AST parseCoroutineBlockStmt() {
+        int line = advance().line; // 'coroutine'
+        AST body = parseBlock();
+        // coroutine { } is sugar for new Coroutine(false).task(() -> { ... }).start() —
+        // expression statement so `var c = coroutine { ... }` captures the Coroutine too.
+        return new ExprStmt(new CoroutineBlockExpr(body, line), line);
     }
 
     private AST parseVarDecl() {
@@ -1093,6 +1102,12 @@ public class Parser {
             int thLine = advance().line;
             AST body = parseBlock();
             return new ThreadBlockExpr(body, thLine);
+        }
+        // coroutine { ... } in expression position: `var c = coroutine { ... }`
+        if (check(TokenType.COROUTINE)) {
+            int coLine = advance().line;
+            AST body = parseBlock();
+            return new CoroutineBlockExpr(body, coLine);
         }
 
         if (check(TokenType.LPAREN) && looksLikeLambda()) {

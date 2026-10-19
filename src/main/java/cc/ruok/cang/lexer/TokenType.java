@@ -14,7 +14,7 @@ public enum TokenType {
     // Keywords
     CLASS, IF, ELSE, WHILE, FOR, RETURN, BREAK, CONTINUE,
     NEW, THIS, STATIC, VOID, TRUE, FALSE, VAR, FUNC, DEF,
-    NAMESPACE, IMPORT, NULL, SWITCH, CASE, DEFAULT, LIKE, FINAL, NATIVE, ABSTRACT, FREE, THREAD, TRY, CATCH, FINALLY, THROW, SUPER,
+    NAMESPACE, IMPORT, NULL, SWITCH, CASE, DEFAULT, LIKE, FINAL, NATIVE, ABSTRACT, FREE, THREAD, COROUTINE, TRY, CATCH, FINALLY, THROW, SUPER,
 
     // Type keywords
     T_BYTE, T_INT, T_LONG, T_FLOAT, T_DOUBLE, T_BOOL, T_STRING, T_STR,
@@ -75,6 +75,7 @@ public enum TokenType {
         KEYWORDS.put("native", NATIVE);
         KEYWORDS.put("free", FREE);
         KEYWORDS.put("thread", THREAD);
+        KEYWORDS.put("coroutine", COROUTINE);
         KEYWORDS.put("try", TRY);
         KEYWORDS.put("catch", CATCH);
         KEYWORDS.put("finally", FINALLY);
