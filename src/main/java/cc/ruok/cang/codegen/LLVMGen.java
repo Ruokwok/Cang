@@ -5660,6 +5660,77 @@ public class LLVMGen {
         return new LLVMValue(current, "i1");
     }
 
+    /**
+     * Class downcast Apple(fruitRef): runtime type check (target or a concrete subclass —
+     * same id set as `like`), then bitcast. Null casts to null (Java semantics); a
+     * mismatch raises a catchable runtime error with the source line.
+     */
+    private LLVMValue generateClassCast(LLVMValue val, String className, int line) {
+        if (!val.type.startsWith("%") || !val.type.endsWith("*")) {
+            throw new RuntimeException("Cannot cast a non-object value to '" + className
+                + "' (at line " + line + ")");
+        }
+        ClassInfo targetInfo = classes.get(className);
+        if (targetInfo == null) throw unknownClassError(className, line);
+        java.util.List<Integer> validIds = new ArrayList<>();
+        for (ClassInfo ci : classes.values()) {
+            if (isSubclass(ci.simpleName, targetInfo.simpleName) && !ci.isAbstract) {
+                validIds.add(ci.typeId);
+            }
+        }
+        if (validIds.isEmpty()) validIds.add(targetInfo.typeId);
+
+        String[] bv = classPtrBaseAndValue(val);
+        String base = bv[0];
+        String recv = bv[1];
+        int id = labelCount++;
+        String nullL = "cast.null." + id;
+        String checkL = "cast.check." + id;
+        String hitL = "cast.hit." + id;
+        String missL = "cast.miss." + id;
+        String resumeL = "cast.resume." + id;
+        String endL = "cast.end." + id;
+        String isn = "%cast.isn." + tmpCount++;
+        body.append("  ").append(isn).append(" = icmp eq %").append(base).append("* ").append(recv).append(", null\n");
+        body.append("  br i1 ").append(isn).append(", label %").append(nullL).append(", label %").append(checkL).append("\n");
+        body.append(nullL).append(":\n");
+        body.append("  br label %").append(endL).append("\n");
+        body.append(checkL).append(":\n");
+        // Type-id check only on the non-null path (a null receiver must not be dereferenced).
+        String tidPtr = "%cast.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr %").append(base).append(", %").append(base)
+             .append("* ").append(recv).append(", i32 0, i32 0\n");
+        String tid = "%cast.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+        String match = "%cast.m." + tmpCount++;
+        body.append("  ").append(match).append(" = icmp eq i32 ").append(tid)
+             .append(", ").append(validIds.get(0)).append("\n");
+        for (int i = 1; i < validIds.size(); i++) {
+            String cmp = "%cast.c." + tmpCount++;
+            body.append("  ").append(cmp).append(" = icmp eq i32 ").append(tid)
+                 .append(", ").append(validIds.get(i)).append("\n");
+            String next = "%cast.n." + tmpCount++;
+            body.append("  ").append(next).append(" = or i1 ").append(match).append(", ").append(cmp).append("\n");
+            match = next;
+        }
+        body.append("  br i1 ").append(match).append(", label %").append(hitL).append(", label %").append(missL).append("\n");
+        body.append(missL).append(":\n");
+        emitRuntimeError("Cannot cast to " + className + ": incompatible object type", line, resumeL);
+        body.append(resumeL).append(":\n");
+        body.append("  br label %").append(endL).append("\n");
+        body.append(hitL).append(":\n");
+        String c = "%cast.v." + tmpCount++;
+        body.append("  ").append(c).append(" = bitcast %").append(base).append("* ").append(recv)
+             .append(" to ").append(targetInfo.llvmName).append("*\n");
+        body.append("  br label %").append(endL).append("\n");
+        body.append(endL).append(":\n");
+        String r = "%cast.r." + tmpCount++;
+        body.append("  ").append(r).append(" = phi ").append(targetInfo.llvmName).append("* [ null, %")
+             .append(nullL).append(" ], [ null, %").append(resumeL).append(" ], [ ").append(c)
+             .append(", %").append(hitL).append(" ]\n");
+        return new LLVMValue(r, targetInfo.llvmName + "*", className);
+    }
+
     private LLVMValue generateTypeCast(TypeCastExpr node) {
         LLVMValue val = generateExpr(node.expr);
         String targetType = toLLVMType(node.targetType);
@@ -6380,7 +6451,14 @@ public class LLVMGen {
                 return generateIndirectCall(callable, node.args, node.line);
             }
             FuncInfo fi = resolveOverload(overloadGroups.get(node.method), node.args, node.line);
-            if (fi == null) throw new RuntimeException("Unknown function: " + node.method);
+            if (fi == null) {
+                // Class-name callee with one argument: downcast `Apple(fruitRef)` — parsed as a
+                // call (parser has no symbol table); a global function of that name wins when present.
+                if (node.args.size() == 1 && classes.containsKey(node.method)) {
+                    return generateClassCast(generateExpr(node.args.get(0)), node.method, node.line);
+                }
+                throw new RuntimeException("Unknown function: " + node.method);
+            }
 
             StringBuilder args = new StringBuilder();
             int argCount = node.args.size();
