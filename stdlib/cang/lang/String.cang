@@ -46,6 +46,14 @@ native func String replace(String from, String to)
 # 分隔符为空运行时错误。返回 String[]（字节粒度，同 charAt）
 native func String[] split(String sep)
 
+# 由 Unicode 码点构造字符串（UTF-8 编码；JSON \uXXXX 反解：代理对先合成标量再传入）。
+# 范围 [0, 0x10FFFF]，越界运行时错误。
+static native func String fromCodePoint(int codePoint)
+
+# double 的最短往返十进制表示（%.15g→%.17g 逐档 + strtod 回验，首个回验通过即输出）。
+# NaN/±Infinity 返回 "null"（JSON 语义）；JSON 数字序列化用它（+ 拼接的 %g 只有 6 位精度）。
+static native func String fromDouble(double d)
+
 # 查找第一次出现的位置（忽略大小写）
 native func int indexOfIgnoreCase(String substring)
 

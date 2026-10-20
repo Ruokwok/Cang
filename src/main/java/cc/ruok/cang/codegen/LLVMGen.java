@@ -6265,6 +6265,58 @@ public class LLVMGen {
                 }
                 return generateThreadCurrent();
             }
+            // String.fromCodePoint(int): UTF-8 encode a scalar (JSON uXXXX escape reverse;
+            // combine surrogate pairs before calling). Range [0, 0x10FFFF].
+            if (objName.equals("String") && node.method.equals("fromCodePoint")) {
+                if (node.args.size() != 1) {
+                    throw new RuntimeException("String.fromCodePoint expects one int argument (at line " + node.line + ")");
+                }
+                LLVMValue cp = generateExpr(node.args.get(0));
+                if (!cp.type.equals("i32")) {
+                    throw new RuntimeException("String.fromCodePoint expects an int argument (at line " + node.line + ")");
+                }
+                String cp64 = "%fcp.v." + tmpCount++;
+                body.append("  ").append(cp64).append(" = sext i32 ").append(cp.value).append(" to i64\n");
+                String neg = "%fcp.neg." + tmpCount++;
+                body.append("  ").append(neg).append(" = icmp slt i64 ").append(cp64).append(", 0\n");
+                String hi = "%fcp.hi." + tmpCount++;
+                body.append("  ").append(hi).append(" = icmp sgt i64 ").append(cp64).append(", 1114111\n");
+                String bad = "str.fcp.bad." + labelCount, ok = "str.fcp.ok." + labelCount;
+                labelCount++;
+                String any = "%fcp.any." + tmpCount++;
+                body.append("  ").append(any).append(" = or i1 ").append(neg).append(", ").append(hi).append("\n");
+                body.append("  br i1 ").append(any).append(", label %").append(bad).append(", label %").append(ok).append("\n");
+                body.append(bad).append(":\n");
+                emitRuntimeError("String.fromCodePoint: code point out of range", node.line, ok);
+                body.append(ok).append(":\n");
+                emitStringFromCodePointHelper();
+                String r = "%fcp.r." + tmpCount++;
+                body.append("  ").append(r).append(" = call i8* @cang.str.fromcp(i64 ").append(cp64).append(")\n");
+                return new LLVMValue(r, "i8*", "String");
+            }
+            // String.fromDouble(double): shortest round-trip formatting (%.15g..%.17g with
+            // strtod verification); NaN/±Infinity -> "null" (JSON semantics).
+            if (objName.equals("String") && node.method.equals("fromDouble")) {
+                if (node.args.size() != 1) {
+                    throw new RuntimeException("String.fromDouble expects one argument (at line " + node.line + ")");
+                }
+                LLVMValue d = generateExpr(node.args.get(0));
+                if (d.type.equals("float")) {
+                    String ext = "%fd.ext." + tmpCount++;
+                    body.append("  ").append(ext).append(" = fpext float ").append(d.value).append(" to double\n");
+                    d = new LLVMValue(ext, "double");
+                } else if (!d.type.equals("double")) {
+                    throw new RuntimeException("String.fromDouble expects a double or float (at line " + node.line + ")");
+                }
+                emitStringFromDoubleHelper();
+                String buf = "%fd.buf." + tmpCount++;
+                body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 64)\n");
+                registerRegionAllocation(buf);
+                String r = "%fd.r." + tmpCount++;
+                body.append("  ").append(r).append(" = call i8* @cang.str.dtoa(i8* ").append(buf)
+                     .append(", double ").append(d.value).append(")\n");
+                return new LLVMValue(r, "i8*", "String");
+            }
         }
 
         // Arrays expose length() as a built-in method. The length is stored in the i64 header.
@@ -8204,6 +8256,138 @@ public class LLVMGen {
         body.append("  ").append(np).append(" = getelementptr i8, i8* ").append(buf).append(", i64 ").append(len).append("\n");
         body.append("  store i8 0, i8* ").append(np).append("\n");
         return buf;
+    }
+
+    /**
+     * String.fromCodePoint runtime: scalar → UTF-8 (1–4 bytes + NUL).
+     * Range is validated at the call site (it has the source line for the error).
+     */
+    private void emitStringFromCodePointHelper() {
+        if (header.toString().contains("define i8* @cang.str.fromcp(")) return;
+        String alloc = allocFn();
+        header.append("define i8* @cang.str.fromcp(i64 %cp) {\n");
+        header.append("entry:\n");
+        header.append("  %buf = call i8* @").append(alloc).append("(i64 5)\n");
+        header.append("  %lt80 = icmp ult i64 %cp, 128\n");
+        header.append("  br i1 %lt80, label %b1, label %chk2\n");
+        header.append("b1:\n");
+        header.append("  %c1 = trunc i64 %cp to i8\n");
+        header.append("  store i8 %c1, i8* %buf\n");
+        header.append("  %z1 = getelementptr i8, i8* %buf, i64 1\n");
+        header.append("  store i8 0, i8* %z1\n");
+        header.append("  br label %exit\n");
+        header.append("chk2:\n");
+        header.append("  %lt800 = icmp ult i64 %cp, 2048\n");
+        header.append("  br i1 %lt800, label %b2, label %chk3\n");
+        header.append("b2:\n");
+        // 110xxxxx 10xxxxxx
+        header.append("  %r2s = lshr i64 %cp, 6\n");
+        header.append("  %b02 = or i64 %r2s, 192\n");
+        header.append("  %b02t = trunc i64 %b02 to i8\n");
+        header.append("  store i8 %b02t, i8* %buf\n");
+        header.append("  %lo2 = and i64 %cp, 63\n");
+        header.append("  %lo2o = or i64 %lo2, 128\n");
+        header.append("  %lo2c = trunc i64 %lo2o to i8\n");
+        header.append("  %p2 = getelementptr i8, i8* %buf, i64 1\n");
+        header.append("  store i8 %lo2c, i8* %p2\n");
+        header.append("  %z2 = getelementptr i8, i8* %buf, i64 2\n");
+        header.append("  store i8 0, i8* %z2\n");
+        header.append("  br label %exit\n");
+        header.append("chk3:\n");
+        header.append("  %lt10000 = icmp ult i64 %cp, 65536\n");
+        header.append("  br i1 %lt10000, label %b3, label %b4\n");
+        header.append("b3:\n");
+        // 1110xxxx 10xxxxxx 10xxxxxx
+        header.append("  %s1 = lshr i64 %cp, 12\n");
+        header.append("  %e1 = or i64 %s1, 224\n");
+        header.append("  %e1t = trunc i64 %e1 to i8\n");
+        header.append("  store i8 %e1t, i8* %buf\n");
+        header.append("  %m2s = lshr i64 %cp, 6\n");
+        header.append("  %m2a = and i64 %m2s, 63\n");
+        header.append("  %m2o = or i64 %m2a, 128\n");
+        header.append("  %m2t = trunc i64 %m2o to i8\n");
+        header.append("  %p31 = getelementptr i8, i8* %buf, i64 1\n");
+        header.append("  store i8 %m2t, i8* %p31\n");
+        header.append("  %m3a = and i64 %cp, 63\n");
+        header.append("  %m3o = or i64 %m3a, 128\n");
+        header.append("  %m3t = trunc i64 %m3o to i8\n");
+        header.append("  %p32 = getelementptr i8, i8* %buf, i64 2\n");
+        header.append("  store i8 %m3t, i8* %p32\n");
+        header.append("  %z3 = getelementptr i8, i8* %buf, i64 3\n");
+        header.append("  store i8 0, i8* %z3\n");
+        header.append("  br label %exit\n");
+        header.append("b4:\n");
+        // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        header.append("  %s41 = lshr i64 %cp, 18\n");
+        header.append("  %e41 = or i64 %s41, 240\n");
+        header.append("  %e41t = trunc i64 %e41 to i8\n");
+        header.append("  store i8 %e41t, i8* %buf\n");
+        header.append("  %s42 = lshr i64 %cp, 12\n");
+        header.append("  %a42 = and i64 %s42, 63\n");
+        header.append("  %o42 = or i64 %a42, 128\n");
+        header.append("  %t42 = trunc i64 %o42 to i8\n");
+        header.append("  %p41 = getelementptr i8, i8* %buf, i64 1\n");
+        header.append("  store i8 %t42, i8* %p41\n");
+        header.append("  %s43 = lshr i64 %cp, 6\n");
+        header.append("  %a43 = and i64 %s43, 63\n");
+        header.append("  %o43 = or i64 %a43, 128\n");
+        header.append("  %t43 = trunc i64 %o43 to i8\n");
+        header.append("  %p42 = getelementptr i8, i8* %buf, i64 2\n");
+        header.append("  store i8 %t43, i8* %p42\n");
+        header.append("  %a44 = and i64 %cp, 63\n");
+        header.append("  %o44 = or i64 %a44, 128\n");
+        header.append("  %t44 = trunc i64 %o44 to i8\n");
+        header.append("  %p43 = getelementptr i8, i8* %buf, i64 3\n");
+        header.append("  store i8 %t44, i8* %p43\n");
+        header.append("  %z4 = getelementptr i8, i8* %buf, i64 4\n");
+        header.append("  store i8 0, i8* %z4\n");
+        header.append("  br label %exit\n");
+        header.append("exit:\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
+    }
+
+    /**
+     * String.fromDouble runtime: shortest round-trip decimal — try %.15g, %.16g, %.17g
+     * and keep the first whose strtod parse equals the original bit pattern.
+     * NaN/±Infinity return the JSON null literal.
+     */
+    private void emitStringFromDoubleHelper() {
+        if (header.toString().contains("define i8* @cang.str.dtoa(")) return;
+        if (!header.toString().contains("declare double @strtod(")) {
+            header.append("declare double @strtod(i8*, i8**)\n");
+        }
+        if (!header.toString().contains("@.str.dtoa.fmt = ")) {
+            header.append("@.str.dtoa.fmt = private constant [5 x i8] c\"%.*g\\00\"\n");
+        }
+        header.append("define i8* @cang.str.dtoa(i8* %buf, double %d) {\n");
+        header.append("entry:\n");
+        header.append("  %isnan = fcmp une double %d, %d\n");
+        header.append("  br i1 %isnan, label %jsonnull, label %chkinf\n");
+        header.append("chkinf:\n");
+        header.append("  %pinf = fcmp oeq double %d, 0x7FF0000000000000\n");
+        header.append("  %ninf = fcmp oeq double %d, 0xFFF0000000000000\n");
+        header.append("  %isinf = or i1 %pinf, %ninf\n");
+        header.append("  br i1 %isinf, label %jsonnull, label %init\n");
+        header.append("jsonnull:\n");
+        header.append("  ret i8* @.str.null.p\n");
+        header.append("init:\n");
+        header.append("  %prec = alloca i32\n  store i32 15, i32* %prec\n");
+        header.append("  br label %loop\n");
+        header.append("loop:\n");
+        header.append("  %p = load i32, i32* %prec\n");
+        header.append("  %r = call i32 (i8*, i8*, ...) @sprintf(i8* %buf, i8* @.str.dtoa.fmt, i32 %p, double %d)\n");
+        header.append("  %rt = call double @strtod(i8* %buf, i8** null)\n");
+        header.append("  %eq = fcmp oeq double %rt, %d\n");
+        header.append("  br i1 %eq, label %done, label %next\n");
+        header.append("next:\n");
+        header.append("  %p2 = add i32 %p, 1\n");
+        header.append("  store i32 %p2, i32* %prec\n");
+        header.append("  %more = icmp sle i32 %p2, 17\n");
+        header.append("  br i1 %more, label %loop, label %done\n");
+        header.append("done:\n");
+        header.append("  ret i8* %buf\n");
+        header.append("}\n\n");
     }
 
     /**

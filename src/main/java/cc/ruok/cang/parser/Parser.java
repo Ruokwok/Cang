@@ -1203,6 +1203,12 @@ public class Parser {
         if (check(TokenType.IDENT)) {
             return new Identifier(advance().value, line);
         }
+        // String.fromCodePoint(...) — 'String' lexes as the T_STRING type keyword; treat it as
+        // a static-call receiver when a '.' follows (the postfix chain builds the rest).
+        if (check(TokenType.T_STRING) && peek(1).type == TokenType.DOT) {
+            advance();
+            return new Identifier("String", line);
+        }
 
         // Array literal: [1, 2, 3]
         if (check(TokenType.LBRACKET)) {
