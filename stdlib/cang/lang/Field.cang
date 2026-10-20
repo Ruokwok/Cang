@@ -1,0 +1,24 @@
+namespace cang/lang
+
+# Field<T> - 按名字读写对象字段的泛型反射访问器。
+# Cang 没有泛型方法，返回泛型 T 由泛型类单态化实现（同 List<T>.get()）：
+#   var fx = new Field<int>("x")
+#   int v = fx.get(point)
+#   fx.set(point, 42)
+# 也支持菱形写法：Field<int> fx = new Field<>()
+# 类型安全：字段实际类型与 T 不符 → 运行时错误（编译期元数据表校验）；
+# 字段不存在 / 目标为 null → 运行时错误（错误行号即调用点）。
+# T 限基本类型、String 与普通类名（不支持嵌套泛型参数）。
+class Field<T>
+    String name = ""
+
+# 构造：绑定字段名
+init(String name) {
+    this.name = name
+}
+
+# 从 obj 读取字段值；类型与 T 不符、字段不存在、obj 为 null 均为运行时错误
+native func T get(Object obj)
+
+# 将 value 写入 obj 的字段；校验同 get，value 按 T 做数值转换
+native func void set(Object obj, T value)
