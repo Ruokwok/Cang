@@ -5723,7 +5723,10 @@ public class LLVMGen {
         int toBits = llvmTypeBits(targetType);
         if (fromBits > 0 && toBits > 0) {
             if (toBits > fromBits) {
-                body.append("  ").append(result).append(" = zext ").append(val.type)
+                // i1 (bool) zero-extends so true stays 1; signed integers must sign-extend
+                // or int(-5) would widen to 4294967291.
+                String widen = val.type.equals("i1") ? "zext" : "sext";
+                body.append("  ").append(result).append(" = ").append(widen).append(" ").append(val.type)
                      .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
             } else if (toBits < fromBits) {
                 body.append("  ").append(result).append(" = trunc ").append(val.type)
