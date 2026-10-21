@@ -16,7 +16,7 @@ public class LLVMGen {
     static class LLVMValue {
         String value;
         String type;
-        String semanticType; // Cang type when LLVM types are shared, e.g. str/String -> i8*
+        String semanticType; // Cang type when LLVM types are shared, e.g. String -> i8*
         LLVMValue(String value, String type) {
             this(value, type, null);
         }
@@ -2985,7 +2985,7 @@ public class LLVMGen {
                         // String fields (e.g. File.path): free ONLY under GC mode — GC_free on a
                         // constant-pool pointer is a safe no-op, while --no-gc's libc free cannot
                         // distinguish constants from heap strings and would crash (debug.md #33).
-                        boolean freeString = gcEnabled && (ft.equals("String") || ft.equals("str"));
+                        boolean freeString = gcEnabled && ft.equals("String");
                         if (!freeArray && !freeString) continue;
                         String fllvm = toLLVMType(ft);
                         String fptr = "%free.fptr." + tmpCount++;
@@ -3221,7 +3221,7 @@ public class LLVMGen {
             } finally {
                 expectedFunctionType = savedExpected;
             }
-            if ((cangType.equals("str") || cangType.equals("String")) &&
+            if (cangType.equals("String") &&
                 val.semanticType != null && !cangType.equals(val.semanticType)) {
                 throw new RuntimeException("Cannot assign " + val.semanticType + " to " + cangType + " without an explicit conversion (at line " + decl.line + ")");
             }
@@ -3286,12 +3286,12 @@ public class LLVMGen {
     /** May `val` be stored into a slot of LLVM type `target`? (debug.md #7/#9)
      *  Same rules as call-argument checks plus loose pointer-to-pointer assignment and
      *  the null literal for pointer/Function slots; rejects kind mismatches like
-     *  int <- string or str <- int that previously produced invalid IR. */
+     *  int <- String that previously produced invalid IR. */
     private boolean assignableTo(String target, LLVMValue val) {
         if (val.type.equals(target)) return true;
         if (typesCompatible(val.type, target)) return true;
         if (isNumericLLVM(val.type) && isNumericLLVM(target)) return true;
-        if (val.type.endsWith("*") && target.endsWith("*")) return true; // String/str/class refs
+        if (val.type.endsWith("*") && target.endsWith("*")) return true; // String/class refs
         if (val.value != null && val.value.equals("null")) {
             return target.endsWith("*") || target.equals("%CangFunction");
         }
@@ -3301,7 +3301,7 @@ public class LLVMGen {
     /** Return semantic types that must travel with call results (chaining/assign checks). */
     private boolean callResultCarriesSemantic(String cangType) {
         return isArraySemanticType(cangType) || isFunctionType(cangType)
-            || cangType.equals("String") || cangType.equals("str");
+            || cangType.equals("String");
     }
 
     private void generateIf(IfStmt stmt) {
@@ -3352,7 +3352,6 @@ public class LLVMGen {
         if (v instanceof DoubleLit) return "d:" + ((DoubleLit) v).text;
         if (v instanceof BoolLit) return "b:" + ((BoolLit) v).value;
         if (v instanceof StringLit) return "s:" + ((StringLit) v).value;
-        if (v instanceof StrLit) return "t:" + ((StrLit) v).value;
         return null;
     }
 
@@ -3891,11 +3890,6 @@ public class LLVMGen {
             value.semanticType = "String";
             return value;
         }
-        if (node instanceof StrLit) {
-            LLVMValue value = generateStringLit(new StringLit(((StrLit) node).value, node.line));
-            value.semanticType = "str";
-            return value;
-        }
         if (node instanceof NullLit) {
             return new LLVMValue("null", "i8*");
         }
@@ -4351,7 +4345,7 @@ public class LLVMGen {
         if (arg instanceof FloatLit) return "float";
         if (arg instanceof DoubleLit) return "double";
         if (arg instanceof BoolLit) return "i1";
-        if (arg instanceof StringLit || arg instanceof StrLit) return "i8*";
+        if (arg instanceof StringLit) return "i8*";
         if (arg instanceof NullLit) return "null";
         if (arg instanceof Identifier && scope != null) {
             LLVMValue v = scope.lookup(((Identifier) arg).name);
@@ -4968,7 +4962,7 @@ public class LLVMGen {
     /** String-concat stringification of an object pointer: overrides win, null → "null". */
     private LLVMValue objectToStringForConcat(LLVMValue val) {
         String sem = val.semanticType;
-        if (sem != null && (sem.equals("String") || sem.equals("str"))) return val;
+        if (sem != null && sem.equals("String")) return val;
         if (sem != null && sem.startsWith("Array<")) return makeStringConstant("Array");
         if (sem != null && isThreadType(sem)) return makeStringConstant("Thread");
         ClassInfo ci = classes.get(extractClassName(val.type));
@@ -5106,7 +5100,7 @@ public class LLVMGen {
             if (op.equals("==") || op.equals("!=")) {
                 return generateStringCompare(left, op, right);
             }
-            throw new RuntimeException("Only == and != are supported for str/String (at line " + line + ")");
+            throw new RuntimeException("Only == and != are supported for String (at line " + line + ")");
         }
 
         // Reference == null / != null (pointer identity) — the singleton/optional idiom:
@@ -5735,15 +5729,7 @@ public class LLVMGen {
         LLVMValue val = generateExpr(node.expr);
         String targetType = toLLVMType(node.targetType);
 
-        // String/str semantic conversion while sharing the same LLVM pointer type.
-        if (targetType.equals("i8*") && node.targetType.equals("str")) {
-            if (val.type.equals("i8*")) {
-                return new LLVMValue(val.value, val.type, "str");
-            }
-            LLVMValue converted = convertToString(val);
-            converted.semanticType = "str";
-            return converted;
-        }
+        // String semantic conversion while sharing the same LLVM pointer type.
         if (targetType.equals("i8*") && node.targetType.equals("String")) {
             if (val.type.equals("i8*")) {
                 return new LLVMValue(val.value, val.type, "String");
@@ -6284,7 +6270,7 @@ public class LLVMGen {
                 }
                 // non-reference receiver — fall through to the normal path
             } else if (receiver.semanticType != null
-                    && (receiver.semanticType.equals("String") || receiver.semanticType.equals("str"))) {
+                    && receiver.semanticType.equals("String")) {
                 if (node.method.equals("toString")) return receiver;
                 return makeStringConstant("String");
             } else if (receiver.semanticType != null && receiver.semanticType.startsWith("Array<")) {
@@ -6502,13 +6488,6 @@ public class LLVMGen {
         // Regular method call
         if (objCache == null) objCache = generateExpr(node.object);
         LLVMValue objVal = objCache;
-        if ("str".equals(objVal.semanticType)) {
-            // str shares the intrinsic String surface (they are both i8* at runtime).
-            if (STRING_METHODS.contains(node.method)) {
-                return generateStringMethod(objVal, node);
-            }
-            throw new RuntimeException("str is a primitive type and has no methods (at line " + node.line + ")");
-        }
         // String methods (length/substring/...) — compiler intrinsics like Stdout dispatch.
         if ("String".equals(objVal.semanticType) && STRING_METHODS.contains(node.method)) {
             return generateStringMethod(objVal, node);
@@ -6616,7 +6595,7 @@ public class LLVMGen {
     private static boolean isThreadValueType(String t) {
         return t.equals("void") || t.equals("int") || t.equals("long") || t.equals("float")
             || t.equals("double") || t.equals("bool") || t.equals("byte")
-            || t.equals("String") || t.equals("str");
+            || t.equals("String");
     }
 
     /** Next logical thread id: atomic increment of @cang.thr.seq (0-based, thread-safe). */
@@ -7447,7 +7426,7 @@ public class LLVMGen {
         body.append("  ").append(value).append(" = load ").append(resultLLVM).append(", ").append(resultLLVM).append("* ").append(typed).append("\n");
         body.append("  call void @").append(freeFn()).append("(i8* ").append(result).append(")\n");
         String resultSemantic = null;
-        if (resultCang.equals("String") || resultCang.equals("str")) resultSemantic = resultCang;
+        if (resultCang.equals("String")) resultSemantic = resultCang;
         return new LLVMValue(value, resultLLVM, resultSemantic);
     }
 
@@ -10094,7 +10073,7 @@ public class LLVMGen {
     }
 
     private LLVMValue generateNew(NewExpr node) {
-        // Boxing a primitive str into the immutable String reference wrapper.
+        // String(...) / new String(...) — re-tag a string value as the String object type.
         if (node.className.equals("String") && node.args.size() == 1) {
             LLVMValue value = generateExpr(node.args.get(0));
             if (!value.type.equals("i8*")) {
@@ -10372,7 +10351,6 @@ public class LLVMGen {
         if (node instanceof DoubleLit) return "double";
         if (node instanceof BoolLit) return "bool";
         if (node instanceof StringLit) return "String";
-        if (node instanceof StrLit) return "str";
         if (node instanceof ArrayLit) {
             return lastArrayElemCangType != null ? "Array<" + lastArrayElemCangType + ">" : null;
         }
@@ -13184,7 +13162,7 @@ pb.append("prl.finish.").append(id).append(":\n");
     }
 
     private String semanticKindOf(String cangType) {
-        return cangType != null && (cangType.equals("str") || cangType.equals("String") || isFunctionType(cangType) || isListType(cangType) || isThreadType(cangType))
+        return cangType != null && (cangType.equals("String") || isFunctionType(cangType) || isListType(cangType) || isThreadType(cangType))
             ? cangType : null;
     }
 
@@ -13321,7 +13299,6 @@ pb.append("prl.finish.").append(id).append(":\n");
             case "double": return "double";
             case "bool": return "i1";
             case "String": return "i8*";
-            case "str": return "i8*";
             case "void": return "void";
             case "Void": return "void"; // Void wrapper class is the Function return-type spelling
             case "var": return "auto";
@@ -13369,7 +13346,6 @@ pb.append("prl.finish.").append(id).append(":\n");
             case "double": return "0.0";
             case "bool": return "0";
             case "String": return "null";
-            case "str": return "null";
             default: return "null";
         }
     }

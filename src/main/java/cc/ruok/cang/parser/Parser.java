@@ -460,7 +460,7 @@ public class Parser {
     private boolean isTypeStart() {
         if (check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG,
                   TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL,
-                  TokenType.T_STRING, TokenType.T_STR, TokenType.VOID, TokenType.VAR, TokenType.FUNC)) {
+                  TokenType.T_STRING, TokenType.VOID, TokenType.VAR, TokenType.FUNC)) {
             return true;
         }
         // Reject the removed legacy Array<T> spelling with a focused diagnostic.
@@ -501,7 +501,7 @@ public class Parser {
             advance();
             List<String> genArgs = new ArrayList<>();
             while (true) {
-                if (!check(TokenType.IDENT, TokenType.VOID, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                if (!check(TokenType.IDENT, TokenType.VOID, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING)) {
                     error("Generic type argument must be a concrete type");
                 }
                 genArgs.add(parseBaseType());
@@ -563,7 +563,6 @@ public class Parser {
         if (check(TokenType.T_DOUBLE)) { advance(); return "double"; }
         if (check(TokenType.T_BOOL)) { advance(); return "bool"; }
         if (check(TokenType.T_STRING)) { advance(); return "String"; }
-        if (check(TokenType.T_STR)) { advance(); return "str"; }
         if (check(TokenType.VOID)) { advance(); return "void"; }
         if (check(TokenType.VAR)) { advance(); return "var"; }
         if (check(TokenType.IDENT) && current().value.equals("Array") && peek(1).type == TokenType.LT) {
@@ -583,7 +582,14 @@ public class Parser {
             expect(TokenType.GT);
             return "Function<" + String.join(",", parts) + ">";
         }
-        if (check(TokenType.IDENT)) { return advance().value; }
+        if (check(TokenType.IDENT)) {
+            // str/string literal types were removed in favor of the String object type.
+            String id = current().value;
+            if (id.equals("str") || id.equals("string")) {
+                error("'" + id + "' type has been removed, use 'String' instead");
+            }
+            return advance().value;
+        }
         error("Expected type name");
         return null;
     }
@@ -1080,7 +1086,6 @@ public class Parser {
         if (check(TokenType.FLOAT_LIT)) return new FloatLit(advance().value, line);
         if (check(TokenType.DOUBLE_LIT)) return new DoubleLit(advance().value, line);
         if (check(TokenType.STRING_LIT)) return new StringLit(advance().value, line);
-        if (check(TokenType.STR_LIT)) return new StrLit(advance().value, line);
         if (check(TokenType.TRUE)) { advance(); return new BoolLit(true, line); }
         if (check(TokenType.FALSE)) { advance(); return new BoolLit(false, line); }
         if (check(TokenType.NULL)) { advance(); return new NullLit(line); }
@@ -1143,7 +1148,7 @@ public class Parser {
             // parseBaseType covers IDENT class names and all primitive keywords.
             String elemOrClass;
             if (check(TokenType.IDENT, TokenType.T_STRING, TokenType.T_BYTE, TokenType.T_INT,
-                    TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STR)) {
+                    TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL)) {
                 elemOrClass = parseBaseType();
             } else {
                 error("Expected class name after 'new'");
@@ -1166,7 +1171,7 @@ public class Parser {
                     advance(); // diamond
                 } else {
                     while (true) {
-                        if (!check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.T_STR)) {
+                        if (!check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING)) {
                             error("Generic type argument must be a concrete type");
                         }
                         typeArgs.add(parseBaseType());
@@ -1190,9 +1195,9 @@ public class Parser {
             return new NewExpr(className, typeArgs, args, line);
         }
 
-        // Type cast: byte(expr), int(expr), long(expr), float(expr), double(expr), string(expr)
+        // Type cast: byte(expr), int(expr), long(expr), float(expr), double(expr), String(expr)
         if (check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG,
-                  TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_STR) && peek(1).type == TokenType.LPAREN) {
+                  TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_STRING) && peek(1).type == TokenType.LPAREN) {
             String targetType = parseType();
             expect(TokenType.LPAREN);
             AST expr = parseExpression();
@@ -1201,6 +1206,10 @@ public class Parser {
         }
 
         if (check(TokenType.IDENT)) {
+            // `string(expr)` used to be the str cast; now it would parse as a plain call.
+            if (current().value.equals("string") && peek(1).type == TokenType.LPAREN) {
+                error("'string' cast has been removed, use String(...) instead");
+            }
             return new Identifier(advance().value, line);
         }
         // String.fromCodePoint(...) — 'String' lexes as the T_STRING type keyword; treat it as

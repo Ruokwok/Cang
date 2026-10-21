@@ -6,7 +6,7 @@ import java.util.HashMap;
 public enum TokenType {
 
     // Literals
-    INT_LIT, LONG_LIT, FLOAT_LIT, DOUBLE_LIT, STRING_LIT, STR_LIT,
+    INT_LIT, LONG_LIT, FLOAT_LIT, DOUBLE_LIT, STRING_LIT,
 
     // Identifier
     IDENT,
@@ -17,7 +17,7 @@ public enum TokenType {
     NAMESPACE, IMPORT, NULL, SWITCH, CASE, DEFAULT, LIKE, FINAL, NATIVE, ABSTRACT, FREE, THREAD, COROUTINE, TRY, CATCH, FINALLY, THROW, SUPER,
 
     // Type keywords
-    T_BYTE, T_INT, T_LONG, T_FLOAT, T_DOUBLE, T_BOOL, T_STRING, T_STR,
+    T_BYTE, T_INT, T_LONG, T_FLOAT, T_DOUBLE, T_BOOL, T_STRING,
 
     // Operators
     PLUS, MINUS, STAR, SLASH, PERCENT, DOUBLE_SLASH,
@@ -59,7 +59,6 @@ public enum TokenType {
         KEYWORDS.put("double", T_DOUBLE);
         KEYWORDS.put("bool", T_BOOL);
         KEYWORDS.put("String", T_STRING);
-        KEYWORDS.put("string", T_STR);
         KEYWORDS.put("var", VAR);
         KEYWORDS.put("func", FUNC);
         KEYWORDS.put("def", DEF);
@@ -95,6 +94,6 @@ public enum TokenType {
     public static boolean isTypeKeyword(TokenType type) {
         return type == T_BYTE || type == T_INT || type == T_LONG ||
                type == T_FLOAT || type == T_DOUBLE || type == T_BOOL ||
-               type == T_STRING || type == T_STR || type == VOID || type == VAR;
+               type == T_STRING || type == VOID || type == VAR;
     }
 }

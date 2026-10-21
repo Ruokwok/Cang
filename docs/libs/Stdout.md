@@ -46,5 +46,4 @@ Stdout.println(true)
 - `double`
 - `bool`
 - `String`
-- `str`
 

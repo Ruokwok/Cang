@@ -80,7 +80,7 @@ public class Lexer {
         int startCol = column;
         char c = code.charAt(pos);
 
-        // Single quotes produce primitive str; double quotes produce String.
+        // Both quote styles produce String literals: "..." / '...' / `...` (multi-line).
         if (c == '"' || c == '\'') return readQuotedString(c, startLine, startCol);
 
         // Multi-line string literal (backticks)
@@ -147,8 +147,7 @@ public class Lexer {
                 + ": Unterminated string");
         }
         advance(); // skip closing quote
-        TokenType type = quote == '\'' ? TokenType.STR_LIT : TokenType.STRING_LIT;
-        return new Token(type, sb.toString(), startLine, startCol);
+        return new Token(TokenType.STRING_LIT, sb.toString(), startLine, startCol);
     }
 
     private Token readMultiLineString(int startLine, int startCol) {

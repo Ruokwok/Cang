@@ -684,8 +684,7 @@ public final class CangApi {
         }
         if (e.equals("null")) return null;
         if (e.equals("true") || e.equals("false")) return "bool";
-        if (e.startsWith("\"") || e.startsWith("`")) return "String";
-        if (e.startsWith("'")) return "str";
+        if (e.startsWith("\"") || e.startsWith("`") || e.startsWith("'")) return "String";
         if (e.matches("^[+-]?\\d+$")) return "int";
         if (e.matches("^[+-]?\\d+[lL]$")) return "long";
         if (e.matches("^[+-]?(\\d+\\.\\d*|\\d*\\.\\d+)([eE][+-]?\\d+)?[fFdD]?")) return "double";
@@ -916,7 +915,6 @@ public final class CangApi {
         if (node instanceof AST.FloatLit) return str(node, "value");
         if (node instanceof AST.DoubleLit) return str(node, "value");
         if (node instanceof AST.StringLit) return "\"" + str(node, "value") + "\"";
-        if (node instanceof AST.StrLit) return "'" + str(node, "value") + "'";
         if (node instanceof AST.Identifier) return str(node, "name");
         return null;
     }

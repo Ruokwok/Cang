@@ -5,7 +5,7 @@ namespace cang/lang
 # cap 为预留字节容量；data/size 是内部状态，请勿直接修改。
 class StringBuilder
     long cap = 0;
-    string data = null;
+    String data = null;
     long size = 0;
 
     init() {
@@ -15,7 +15,7 @@ class StringBuilder
         this.cap = cap;
     }
 
-    init(long cap, string data, long size) {
+    init(long cap, String data, long size) {
         this.cap = cap;
         this.data = data;
         this.size = size;

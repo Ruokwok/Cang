@@ -45,11 +45,6 @@ public abstract class AST {
         public StringLit(String value, int line) { super(line); this.value = value; }
     }
 
-    public static class StrLit extends AST {
-        public String value;
-        public StrLit(String value, int line) { super(line); this.value = value; }
-    }
-
     public static class NullLit extends AST {
         public NullLit(int line) { super(line); }
     }
