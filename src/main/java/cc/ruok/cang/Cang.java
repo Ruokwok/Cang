@@ -47,6 +47,7 @@ public class Cang {
         String clangPath = "clang";
         String gccPath = "gcc";
         boolean gc = true;          // Boehm GC is on by default
+        boolean gui = false;        // --gui: PE subsystem GUI (windows only)
         String libRoot = null;   // --gc-lib: 库根目录（其下 lib/ 存库文件）
         String outputName = null;   // -o / --output: executable name (.exe optional)
 
@@ -59,6 +60,7 @@ public class Cang {
                 case "--gcc": gccPath = requireValue(args, ++i, "--gcc", "<path>"); break;
                 case "--gc": gc = true; break;
                 case "--no-gc": gc = false; break;
+                case "--gui": gui = true; break;
                 case "--gc-lib": libRoot = requireValue(args, ++i, "--gc-lib", "<dir>"); break;
                 case "-o":
                 case "--output": outputName = requireValue(args, ++i, "-o", "<name>"); break;
@@ -89,8 +91,8 @@ public class Cang {
                 return;
             }
             switch (target) {
-                case "windows": compileWindows(llFile, baseName, clangPath, gccPath, gc, libRoot); break;
-                case "linux":   compileLinux(llFile, baseName, gc, libRoot); break;
+                case "windows": compileWindows(llFile, baseName, clangPath, gccPath, gc, gui, libRoot); break;
+                case "linux":   compileLinux(llFile, baseName, gc, libRoot, null, architecture); break;
                 case "macos":   compileMacOS(llFile, baseName, gc, libRoot); break;
                 default:
                     System.err.println("error: unknown target '" + target + "'; expected windows|linux|macos");
@@ -218,6 +220,7 @@ public class Cang {
         System.err.println("  --clang <path>     clang executable");
         System.err.println("  --gcc <path>       gcc executable");
         System.err.println("  --gc / --no-gc     Boehm GC on (default) / manual malloc-free");
+        System.err.println("  --gui              GUI subsystem, no console (default: console; windows only)");
         System.err.println("  --gc-lib <dir>     override libgc lookup directory");
         System.err.println("  -o, --output <name>  output executable name (default: source name; .exe optional)");
     }
@@ -998,7 +1001,7 @@ public class Cang {
     }
 
     public static void compileWindows(String llFile, String baseName,
-                                        String clangPath, String gccPath, boolean gc, String libRoot) throws IOException, InterruptedException {
+                                        String clangPath, String gccPath, boolean gc, boolean gui, String libRoot) throws IOException, InterruptedException {
         String objFile = baseName + ".o";
         String exeFile = baseName + ".exe";
 
@@ -1023,6 +1026,7 @@ public class Cang {
         log.println("[4/4] Native compilation");
         log.println("      clang: " + clangPath);
         log.println("      gcc:   " + gccPath);
+        log.println("      subsystem: " + (gui ? "gui" : "console"));
 
         List<String> linkArgs = new ArrayList<>();
         linkArgs.add(gccPath);
@@ -1191,21 +1195,39 @@ public class Cang {
         return toolName;
     }
 
-    public static void compileLinux(String llFile, String baseName, boolean gc, String libRoot) throws IOException, InterruptedException {
+    public static void compileLinux(String llFile, String baseName, boolean gc, String libRoot,
+                                    String sysrootOverride, String arch) throws IOException, InterruptedException {
         String exeFile = baseName;
 
         String clangPath = findTool("clang.exe", new String[]{
             "D:\\Program Files\\LLVM\\bin\\clang.exe",
             "C:\\Program Files\\LLVM\\bin\\clang.exe"
         });
-        String sysroot = findLinuxSysroot();
-        if (sysroot == null) {
-            throw new LinkFailed("linux sysroot not found");
+        String triple = linuxTriple(arch);
+        if (triple == null) {
+            throw new LinkFailed("unsupported linux arch: " + arch);
+        }
+        String sysroot;
+        if (sysrootOverride != null && !sysrootOverride.isBlank()) {
+            File dir = new File(sysrootOverride);
+            if (!dir.isDirectory()) {
+                throw new LinkFailed("linux sysroot not found: " + sysrootOverride);
+            }
+            try {
+                sysroot = dir.getCanonicalPath();
+            } catch (IOException e) {
+                sysroot = dir.getAbsolutePath();
+            }
+        } else {
+            sysroot = findLinuxSysroot(arch);
+            if (sysroot == null) {
+                throw new LinkFailed("linux sysroot not found");
+            }
         }
 
         List<String> args = new ArrayList<>();
         args.add(clangPath);
-        args.add("--target=x86_64-unknown-linux-gnu");
+        args.add("--target=" + triple);
         args.add("--sysroot=" + sysroot);
         args.add("--gcc-toolchain=" + sysroot + File.separator + "usr");
         args.add("-fuse-ld=lld");
@@ -1247,19 +1269,30 @@ public class Cang {
     }
 
     /**
-     * Locate pkg/sysroot-linux-amd64 (glibc sysroot for local cross-linking)
-     * under cwd and its parent. Must contain crt1.o.
+     * Locate the Linux sysroot for local cross-linking:
+     * default {@code <jar 所在目录>/../lib/sysroot_linux_<arch>}（amd64/aarch64）,
+     * then cwd's lib/ and its parent. Must contain usr/include/stdio.h.
      */
-    private static String findLinuxSysroot() {
+    private static String findLinuxSysroot(String arch) {
+        String name = "sysroot_linux_" + (arch == null || arch.isBlank() ? "amd64" : arch.toLowerCase());
         String cwd = System.getProperty("user.dir");
-        String[] candidates = {
-            cwd + File.separator + "pkg" + File.separator + "sysroot-linux-amd64",
-            cwd + File.separator + ".." + File.separator + "pkg" + File.separator + "sysroot-linux-amd64",
-            cwd + File.separator + "sysroot-linux-amd64"
-        };
+        List<String> candidates = new ArrayList<>();
+        // <code location>/../lib/<name>: jar -> 所在目录；classes -> 所在目录（即 target）
+        try {
+            java.net.URI uri = Cang.class.getProtectionDomain().getCodeSource().getLocation().toURI();
+            Path loc = Path.of(uri).toAbsolutePath();
+            Path codeDir = loc.getParent();
+            if (codeDir != null) {
+                candidates.add(codeDir.resolve("..").resolve("lib").resolve(name).toString());
+            }
+        } catch (Exception ignored) {
+        }
+        candidates.add(cwd + File.separator + "lib" + File.separator + name);
+        candidates.add(cwd + File.separator + "pkg" + File.separator + "lib" + File.separator + name);
+        candidates.add(cwd + File.separator + ".." + File.separator + "lib" + File.separator + name);
         for (String c : candidates) {
             File f = new File(c);
-            if (new File(f, "usr" + File.separator + "lib" + File.separator + "x86_64-linux-gnu" + File.separator + "crt1.o").isFile()) {
+            if (new File(f, "usr" + File.separator + "include" + File.separator + "stdio.h").isFile()) {
                 try {
                     return f.getCanonicalPath();
                 } catch (IOException e) {
@@ -1268,6 +1301,24 @@ public class Cang {
             }
         }
         return null;
+    }
+
+    /** --arch -> linux target triple; null = unsupported. */
+    private static String linuxTriple(String arch) {
+        String a = (arch == null || arch.isBlank()) ? "amd64" : arch.toLowerCase();
+        switch (a) {
+            case "amd64":
+            case "x86_64":
+                return "x86_64-unknown-linux-gnu";
+            case "i386":
+            case "x86":
+                return "x86-unknown-linux-gnu";
+            case "aarch64":
+            case "arm64":
+                return "aarch64-unknown-linux-gnu";
+            default:
+                return null;
+        }
     }
 
     /**

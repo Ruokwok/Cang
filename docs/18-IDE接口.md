@@ -80,12 +80,18 @@ h.getActive();           // 激活的重载（按参数个数推断，多义时 
 h.getActiveParameter();  // 光标在第几个参数（0 起）
 ```
 
-### 语法诊断（波浪线）
+### 诊断（波浪线）
 
 ```java
-List<Diagnostic> ds = CangApi.check(buffer);   // 空 = 语法正确
-// 消息为编译器原文（短错误风格），如 "statements are not allowed in the class body"
+List<Diagnostic> ds = CangApi.check(buffer);           // 空 = 语义正确（含语法）
+ds = CangApi.check(buffer, "src/Main.cang");           // 按真实文件目录解析工程内 import
+// 词法/语法错误 + 语义错误（未定义变量/方法、未知类、重载冲突等），与编译管线同源
+// 一次报告首个错误（与编译一致）；消息为编译器原文（短错误风格），
+// 如 "Undefined variable: undefinedVar"、"statements are not allowed in the class body"
 ```
+
+- `check` 跑完整前端（词法 + 语法 + import 解析 + 语义）到 IR 生成为止，**不链接、不写产物**到工程目录；
+- 不带路径的 `check(buffer)` 用临时文件作文件上下文（依赖 cwd 的 stdlib/ 解析，与 compile 相同）；工程内相对 import 请传第二参数。
 
 ## 编译 API（in-process）
 
@@ -99,7 +105,9 @@ CompileResult r = CangApi.compile("src/Main.cang",
             .noLink(false)           // true = 只生成 .ll
             .target("windows")       // windows | linux | macos
             .gc(true)                // Boehm GC（默认开）
+            .gui(true)                // GUI 子系统（仅 windows 生效；默认 false=console）
             .libRoot("D:/toolchain") // 库根：其 lib/ 下查 .a
+            .sysroot("D:/sysroot")   // Linux sysroot；null = 默认 <jar 所在目录>/../lib/sysroot_linux_<arch>
             .quiet(true));           // 默认静默：过程输出不进 stdout
 
 if (r.isSuccess()) {

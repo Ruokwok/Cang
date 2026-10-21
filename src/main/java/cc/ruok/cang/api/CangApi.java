@@ -36,7 +36,8 @@ import java.util.regex.Pattern;
  *
  *   List&lt;Completion&gt; cs = CangApi.complete(buffer, caretOffset);
  *   SignatureHelp sh = CangApi.getSignatureHelp(buffer, caretOffset);
- *   List&lt;Diagnostic&gt; ds = CangApi.check(buffer);      // 空 = 语法正确
+ *   List&lt;Diagnostic&gt; ds = CangApi.check(buffer);      // 空 = 语义正确（含语法）
+ *   ds = CangApi.check(buffer, "src/Main.cang");      // 按真实文件目录解析工程内 import
  * </pre>
  *
  * <p>Cang 是玩具/教学级语言，本接口同样定位为实验性。
@@ -105,11 +106,12 @@ public final class CangApi {
                     switch (opt.getTarget()) {
                         case "windows":
                             Cang.compileWindows(ll, base, opt.getClangPath(), opt.getGccPath(),
-                                    opt.isGc(), opt.getLibRoot());
+                                    opt.isGc(), opt.isGui(), opt.getLibRoot());
                             r.exeFile = base + ".exe";
                             break;
                         case "linux":
-                            Cang.compileLinux(ll, base, opt.isGc(), opt.getLibRoot());
+                            Cang.compileLinux(ll, base, opt.isGc(), opt.getLibRoot(),
+                                    opt.getSysroot(), opt.getArch());
                             r.exeFile = base;
                             break;
                         case "macos":
@@ -279,30 +281,64 @@ public final class CangApi {
     }
 
     // ------------------------------------------------------------------
-    // 语法诊断
+    // 语义诊断
     // ------------------------------------------------------------------
 
     /**
-     * 对一段缓冲做词法 + 语法检查，返回诊断列表（空 = 正确）。
-     * 消息为编译器原文（短错误风格）。
+     * 对一段缓冲做完整检查（词法 + 语法 + import 解析 + 语义），返回诊断列表（空 = 正确）。
+     * 语义错误（未定义变量/方法、未知类、重载冲突等）与编译管线同源（codegen 捕获）。
+     * 一次报告首个错误（与编译一致）；文件上下文为临时文件，工程内相对 import 见
+     * {@link #check(String, String)}。
      */
     public static List<Diagnostic> check(String source) {
+        return check(source, null);
+    }
+
+    /**
+     * 同 {@link #check(String)}，但以 {@code sourcePath} 作为文件上下文：
+     * import 按其所在目录解析（可解析工程内兄弟文件），诊断文件名也是真实路径；
+     * 正文以 {@code source} 为准（IDE 未保存的编辑也能查）。不写任何产物到工程目录。
+     */
+    public static List<Diagnostic> check(String source, String sourcePath) {
         List<Diagnostic> out = new ArrayList<>();
         if (source == null || source.isEmpty()) return out;
-        try {
-            List<?> tokens = new Lexer(source).tokenize();
-            new Parser(castTokens(tokens)).parse();
-        } catch (RuntimeException e) {
-            out.add(toDiagnostic(e.getMessage()));
-        } catch (StackOverflowError e) {
-            out.add(new Diagnostic("Expression nesting too deep", 1, 1));
+        synchronized (COMPILE_LOCK) {
+            Cang.setLogStream(null);
+            Path tmpDir = null;
+            try {
+                tmpDir = Files.createTempDirectory("cang-check");
+                String filename;
+                if (sourcePath != null && !sourcePath.isBlank()) {
+                    filename = sourcePath;
+                } else {
+                    Path tmpSrc = tmpDir.resolve("check.cang");
+                    Files.writeString(tmpSrc, source);
+                    filename = tmpSrc.toString();
+                }
+                String baseName = tmpDir.resolve("check").toString();
+                Cang.compile(filename, source, true, "windows", "amd64", true, baseName);
+            } catch (CompileError e) {
+                out.add(new Diagnostic(e.getMessage(), e.line, e.column));
+            } catch (StackOverflowError e) {
+                out.add(new Diagnostic("Expression nesting too deep", 1, 1));
+            } catch (RuntimeException e) {
+                out.add(toDiagnostic(e.getMessage()));
+            } catch (IOException e) {
+                out.add(new Diagnostic(e.getMessage() != null ? e.getMessage() : "io error", 0, 0));
+            } finally {
+                if (tmpDir != null) deleteRecursive(tmpDir);
+            }
         }
         return out;
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<cc.ruok.cang.lexer.Token> castTokens(List<?> tokens) {
-        return (List<cc.ruok.cang.lexer.Token>) tokens;
+    private static void deleteRecursive(Path dir) {
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            });
+        } catch (IOException ignored) {
+        }
     }
 
     private static Diagnostic toDiagnostic(String raw) {

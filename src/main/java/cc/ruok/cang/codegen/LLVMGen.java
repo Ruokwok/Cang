@@ -8870,6 +8870,14 @@ public class LLVMGen {
                      .append(argVal.value).append(" to i8*\n");
                 body.append("  ").append(callPre).append(fmtObj)
                      .append(", i8* ").append(clsStr).append(", i8* ").append(objp).append(")\n");
+            } else if (targetPlatform.equals("windows")) {
+                // Console-safe string print: WriteConsoleW (UTF-8 -> UTF-16) when attached
+                // to a console so rendering is correct under ANY chcp (936/65001);
+                // redirected stdout/stderr keeps raw UTF-8 bytes like printf("%s").
+                ensurePrintStrHelper();
+                body.append("  call void @cang.f.printstr(i8* ").append(argVal.value)
+                     .append(", i1 ").append(newline ? "true" : "false")
+                     .append(", i1 ").append(toStderr ? "true" : "false").append(")\n");
             } else {
                 body.append("  ").append(callPre).append(fmtName)
                      .append(", i8* ").append(argVal.value).append(")\n");
@@ -8913,6 +8921,80 @@ public class LLVMGen {
              .append(", ").append(argType).append(" ").append(argStr).append(")\n");
 
         return new LLVMValue("void", "void");
+    }
+
+    /**
+     * Windows-only runtime helper: console-safe string printing.
+     * GetConsoleMode decides the path: a real console gets MultiByteToWideChar(CP_UTF8)
+     * + WriteConsoleW (renders correctly whatever the console codepage is — fixes the
+     * UTF-8-bytes-read-as-GBK mojibake, e.g. 你好世界 printed as 浣犲ソ涓栫界);
+     * a redirected pipe/file falls back to fwrite of the raw UTF-8 bytes (same bytes
+     * printf would write). Newline: console writes CRLF directly, file relies on CRT
+     * text-mode \n translation exactly as printf does today.
+     */
+    private void ensurePrintStrHelper() {
+        if (header.toString().contains("define void @cang.f.printstr(")) return;
+        if (!header.toString().contains("declare i8* @GetStdHandle(")) {
+            header.append("declare i8* @GetStdHandle(i32)\n");
+        }
+        if (!header.toString().contains("declare i32 @GetConsoleMode(")) {
+            header.append("declare i32 @GetConsoleMode(i8*, i32*)\n");
+        }
+        if (!header.toString().contains("declare i32 @WriteConsoleW(")) {
+            header.append("declare i32 @WriteConsoleW(i8*, i8*, i32, i32*, i8*)\n");
+        }
+        if (!header.toString().contains("declare i32 @MultiByteToWideChar(")) {
+            header.append("declare i32 @MultiByteToWideChar(i32, i32, i8*, i32, i8*, i32)\n");
+        }
+        if (!header.toString().contains("declare i64 @fwrite(")) {
+            header.append("declare i64 @fwrite(i8*, i64, i64, i8*)\n");
+        }
+        if (!header.toString().contains("declare i32 @fputc(")) {
+            header.append("declare i32 @fputc(i32, i8*)\n");
+        }
+        if (!header.toString().contains("declare i8* @__acrt_iob_func(")) {
+            header.append("declare i8* @__acrt_iob_func(i32)\n");
+        }
+        if (!header.toString().contains("@.str.crlf16")) {
+            // UTF-16LE CRLF: 0D 00 0A 00
+            header.append("@.str.crlf16 = private constant [4 x i8] c\"\\0D\\00\\0A\\00\"\n");
+        }
+        header.append("define void @cang.f.printstr(i8* %s, i1 %nl, i1 %err) {\n");
+        header.append("entry:\n");
+        header.append("  %mode = alloca i32\n");
+        header.append("  %len64 = call i64 @strlen(i8* %s)\n");
+        header.append("  %len = trunc i64 %len64 to i32\n");
+        header.append("  %hsel = select i1 %err, i32 -12, i32 -11\n"); // STD_ERROR/STD_OUTPUT_HANDLE
+        header.append("  %handle = call i8* @GetStdHandle(i32 %hsel)\n");
+        header.append("  %gm = call i32 @GetConsoleMode(i8* %handle, i32* %mode)\n");
+        header.append("  %iscon = icmp ne i32 %gm, 0\n");
+        header.append("  br i1 %iscon, label %console, label %file\n");
+        header.append("console:\n");
+        header.append("  %wn = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* %s, i32 %len, i8* null, i32 0)\n");
+        header.append("  %wn1 = add i32 %wn, 1\n");
+        header.append("  %wn64 = zext i32 %wn1 to i64\n");
+        header.append("  %bufsz = mul i64 %wn64, 2\n");
+        header.append("  %buf = call i8* @malloc(i64 %bufsz)\n");
+        header.append("  %cv = call i32 @MultiByteToWideChar(i32 65001, i32 0, i8* %s, i32 %len, i8* %buf, i32 %wn)\n");
+        header.append("  %wc = call i32 @WriteConsoleW(i8* %handle, i8* %buf, i32 %wn, i32* %mode, i8* null)\n");
+        header.append("  call void @free(i8* %buf)\n");
+        header.append("  br i1 %nl, label %cnl, label %done\n");
+        header.append("cnl:\n");
+        header.append("  %cr = getelementptr [4 x i8], [4 x i8]* @.str.crlf16, i32 0, i32 0\n");
+        header.append("  %wc2 = call i32 @WriteConsoleW(i8* %handle, i8* %cr, i32 2, i32* %mode, i8* null)\n");
+        header.append("  br label %done\n");
+        header.append("file:\n");
+        header.append("  %fo = call i8* @__acrt_iob_func(i32 1)\n");
+        header.append("  %fe = call i8* @__acrt_iob_func(i32 2)\n");
+        header.append("  %stream = select i1 %err, i8* %fe, i8* %fo\n");
+        header.append("  %fw = call i64 @fwrite(i8* %s, i64 1, i64 %len64, i8* %stream)\n");
+        header.append("  br i1 %nl, label %fnl, label %done\n");
+        header.append("fnl:\n");
+        header.append("  %pc = call i32 @fputc(i32 10, i8* %stream)\n");
+        header.append("  br label %done\n");
+        header.append("done:\n");
+        header.append("  ret void\n");
+        header.append("}\n\n");
     }
 
     /**
