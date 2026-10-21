@@ -1,24 +1,34 @@
 namespace cang/lang
 
-# Field<T> - 按名字读写对象字段的泛型反射访问器。
-# Cang 没有泛型方法，返回泛型 T 由泛型类单态化实现（同 List<T>.get()）：
-#   var fx = new Field<int>("x")
-#   int v = fx.get(point)
-#   fx.set(point, 42)
-# 也支持菱形写法：Field<int> fx = new Field<>()
-# 类型安全：字段实际类型与 T 不符 → 运行时错误（编译期元数据表校验）；
-# 字段不存在 / 目标为 null → 运行时错误（错误行号即调用点）。
-# T 限基本类型、String 与普通类名（不支持嵌套泛型参数）。
-class Field<T>
-    String name = ""
+# Field - 对象字段反射访问器。构造时绑定目标对象，随后按字段名读写：
+#   var f = new Field(point)
+#   int v = f.getInt("x")            —— 按名字读基本类型字段
+#   Object o = f.getObject("parent") —— 按名字读引用字段
+#   String t = f.getType("x")        —— 字段类型名：基本类型返回 int/long/bool 等，
+#                                       引用类型返回全限定名（同 Object.getClassName()）；
+#                                       String 字段返回 "String"，数组字段返回 "Array"
+# 基本类型字段经 getObject 返回装箱对象（cang_lang_Boxed）。
+# 类型安全：getInt 等要求字段实际类型匹配，不符 → 运行时错误；
+# 字段不存在 / 目标对象为 null → 运行时错误（错误行号即调用点）。
+class Field
+    Object target
 
-# 构造：绑定字段名
-init(String name) {
-    this.name = name
+init(Object obj) {
+    this.target = obj
 }
 
-# 从 obj 读取字段值；类型与 T 不符、字段不存在、obj 为 null 均为运行时错误
-native func T get(Object obj)
+native func Object getObject(String name)
 
-# 将 value 写入 obj 的字段；校验同 get，value 按 T 做数值转换
-native func void set(Object obj, T value)
+# String 字段直接按原类型读取
+native func String getString(String name)
+
+# 基本类型读取：字段实际类型必须匹配方法对应的基本类型，否则运行时错误
+native func int getInt(String name)
+native func long getLong(String name)
+native func byte getByte(String name)
+native func bool getBool(String name)
+native func float getFloat(String name)
+native func double getDouble(String name)
+
+# 字段类型名：int/long/byte/bool/float/double；引用类型返回类的全限定名
+native func String getType(String name)

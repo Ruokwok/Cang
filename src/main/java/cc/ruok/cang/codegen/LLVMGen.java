@@ -263,6 +263,18 @@ public class LLVMGen {
         classes.put("Stdout", stdoutInfo);
 
         // Stdout.print is handled specially in generateMethodCall
+        // Boxed: hidden builtin wrapper for Field.getObject() boxing of primitive fields.
+        // Not constructible from Cang source (no constructor); layout { i32 typeId, i64 raw }.
+        ClassInfo boxedInfo = new ClassInfo();
+        boxedInfo.llvmName = "%cang_lang_Boxed";
+        boxedInfo.fullName = "cang_lang_Boxed";
+        boxedInfo.simpleName = "Boxed";
+        boxedInfo.parentName = null;
+        boxedInfo.fieldNames.add("raw");
+        boxedInfo.fieldTypes.add("long");
+        boxedInfo.fieldIndices.put("raw", 0);
+        classes.put("Boxed", boxedInfo);
+        classes.put("cang_lang_Boxed", boxedInfo);
     }
 
     public String generate(Program program) {
@@ -6368,16 +6380,13 @@ public class LLVMGen {
                 // not a Thread receiver — fall through to the normal instance path
             }
         }
-        // Field<T> generic reflection: get/set by field name on a monomorphized Field_* object.
-        // Detection: the receiver's class came from the generic spec table with owner "Field".
-        if (node.object != null && (node.method.equals("get") || node.method.equals("set"))) {
+        // Field reflection: getObject/getInt/.../getType by field name on the bound target.
+        // Detection: the receiver's class is the builtin Field class (cang_lang_Field).
+        if (node.object != null && FIELD_ACCESSOR_METHODS.contains(node.method)) {
             if (objCache == null) objCache = generateExpr(node.object);
             ClassInfo fieldCi = classes.get(extractClassName(objCache.type));
-            String tArg = (fieldCi != null && objCache.type.startsWith("%") && objCache.type.endsWith("*"))
-                ? fieldSpecArg(fieldCi.fullName) : null;
-            if (tArg != null) {
-                if (node.method.equals("get")) return generateFieldGet(objCache, fieldCi, tArg, node);
-                return generateFieldSet(objCache, fieldCi, tArg, node);
+            if (fieldCi != null && "cang_lang_Field".equals(fieldCi.fullName)) {
+                return generateFieldAccessor(fieldCi, objCache, node);
             }
             // not a Field receiver — fall through (objCache reused below)
         }
@@ -9210,13 +9219,25 @@ public class LLVMGen {
              .append("* ").append(recv).append(", i32 0, i32 0\n");
         String tid = "%objcn.tid." + tmpCount++;
         body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+        // Bounds-guarded lookup: values that are not real objects (e.g. a String pointer
+        // reached through an Object-typed variable) have garbage typeIds — index clamping
+        // maps them to a null name instead of an out-of-bounds load.
+        String inRange = "%objcn.inrange." + tmpCount++;
+        body.append("  ").append(inRange).append(" = icmp ult i32 ").append(tid).append(", ")
+             .append(size).append("\n");
+        String safeTid = "%objcn.safetid." + tmpCount++;
+        body.append("  ").append(safeTid).append(" = select i1 ").append(inRange).append(", i32 ")
+             .append(tid).append(", i32 0\n");
         String idx = "%objcn.idx." + tmpCount++;
-        body.append("  ").append(idx).append(" = zext i32 ").append(tid).append(" to i64\n");
+        body.append("  ").append(idx).append(" = zext i32 ").append(safeTid).append(" to i64\n");
         String namePtr = "%objcn.np." + tmpCount++;
         body.append("  ").append(namePtr).append(" = getelementptr [").append(size).append(" x i8*], [")
              .append(size).append(" x i8*]* @cang.classnames, i64 0, i64 ").append(idx).append("\n");
+        String nameRaw = "%objcn.nraw." + tmpCount++;
+        body.append("  ").append(nameRaw).append(" = load i8*, i8** ").append(namePtr).append("\n");
         String name = "%objcn.n." + tmpCount++;
-        body.append("  ").append(name).append(" = load i8*, i8** ").append(namePtr).append("\n");
+        body.append("  ").append(name).append(" = select i1 ").append(inRange).append(", i8* ")
+             .append(nameRaw).append(", i8* null\n");
         return new LLVMValue(name, "i8*", "String");
     }
 
@@ -9496,24 +9517,10 @@ public class LLVMGen {
     }
 
     /**
-     * If fullName is a monomorphized Field specialization ("cang_lang_Field_int"), return its
-     * generic argument T ("int"); null for everything else (List_int etc. fall through).
-     */
-    private String fieldSpecArg(String fullName) {
-        for (java.util.Map.Entry<String, String> e : genericTypeOwners.entrySet()) {
-            String key = e.getKey();
-            if (!key.startsWith("Field<")) continue;
-            String spec = e.getValue();
-            if (fullName.equals(spec) || fullName.endsWith("_" + spec)) {
-                return key.substring(key.indexOf('<') + 1, key.length() - 1);
-            }
-        }
-        return null;
-    }
-
-    /**
      * Field metadata (lazily emitted): per-typeId {start,count} ranges over a flat table of
-     * {name, typeName, fieldIndex}. plus the shared name-lookup helper @cang.field.find.
+     * {name, displayName, fieldIndex}. plus the shared name-lookup helper @cang.field.find.
+     * displayName is what Field.getType/getObject work with: the primitive name for primitive
+     * fields, "String"/"Array" for those builtins, otherwise the class's full name.
      */
     private void emitFieldMeta() {
         if (header.toString().contains("@cang.fieldmeta.range = ")) return;
@@ -9550,7 +9557,7 @@ public class LLVMGen {
             for (int f = 0; f < ci.fieldNames.size(); f++) {
                 String fname = ci.fieldNames.get(f);
                 if (fname.equals("_dummy")) continue; // compiler placeholder, not a user field
-                String ftype = ci.fieldTypes.get(f);
+                String ftype = fieldDisplayType(ci.fieldTypes.get(f));
                 Integer off = ci.fieldIndices.get(fname);
                 if (off == null) continue;
                 int byteOff = byteOffsetOfField(ci, f);
@@ -9571,7 +9578,7 @@ public class LLVMGen {
         if (!header.toString().contains("declare i32 @memcmp(")) {
             header.append("declare i32 @memcmp(i8*, i8*, i64)\n");
         }
-        // Find a field: type name (or null) + offset through *%offOut.
+        // Find a field: display type name (or null) + offset through *%offOut.
         header.append("define i8* @cang.field.find(i32 %tid, i8* %name, i32* %offOut) {\n");
         header.append("entry:\n");
         header.append("  %n = zext i32 %tid to i64\n");
@@ -9619,201 +9626,415 @@ public class LLVMGen {
         header.append("}\n\n");
     }
 
-    /** Field.get(obj): null/name/type checks then a typed load at the runtime field offset. */
-    private LLVMValue generateFieldGet(LLVMValue recv, ClassInfo fieldCi, String tArg, MethodCallExpr node) {
+    // ==================== Field reflection (builtin Field class) ====================
+
+    /** Methods on the builtin Field class (stdlib/cang/lang/Field.cang) generated intrinsically. */
+    private static final java.util.Set<String> FIELD_ACCESSOR_METHODS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "getObject", "getString", "getInt", "getLong", "getByte", "getBool", "getFloat", "getDouble", "getType"));
+
+    /** Accessor method -> expected primitive field type (getObject/getType are absent). */
+    private static final Map<String, String> FIELD_PRIM_METHODS = new java.util.LinkedHashMap<>();
+    static {
+        FIELD_PRIM_METHODS.put("getInt", "int");
+        FIELD_PRIM_METHODS.put("getLong", "long");
+        FIELD_PRIM_METHODS.put("getByte", "byte");
+        FIELD_PRIM_METHODS.put("getBool", "bool");
+        FIELD_PRIM_METHODS.put("getFloat", "float");
+        FIELD_PRIM_METHODS.put("getDouble", "double");
+    }
+    /** Primitive field display names, matching stdlib Field accessor declaration order. */
+    private static final String[] FIELD_PRIMS = {"int", "long", "byte", "bool", "float", "double"};
+
+    private boolean isFieldPrimType(String cangType) {
+        for (String p : FIELD_PRIMS) if (cangType.equals(p)) return true;
+        return false;
+    }
+
+    /**
+     * Metadata display name for @cang.field.find / Field.getType: primitives keep their Cang
+     * name; Array<T> collapses to "Array" (matching Object.getClassName); String stays
+     * "String"; other class types resolve to the registered full name — a subclass value
+     * stored in the field still reports the declared class of that field.
+     */
+    private String fieldDisplayType(String cangType) {
+        if (isFieldPrimType(cangType)) return cangType;
+        if (cangType.startsWith("Array<") && cangType.endsWith(">")) return "Array";
+        String base = cangType;
+        int lt = cangType.indexOf('<');
+        if (lt > 0) base = cangType.substring(0, lt);
+        ClassInfo ci = classes.get(cangType);
+        if (ci == null) ci = classes.get(base);
+        return ci != null ? ci.fullName : cangType;
+    }
+
+    /**
+     * Field.<accessor>(name) intrinsics: read the bound target object from the Field
+     * receiver, resolve the field through @cang.field.find on the target's runtime typeId,
+     * then load and return the value:
+     *   getObject  — String field loads the pointer as String; other reference fields load
+     *                it as %cang_lang_Object* (Object intrinsics like getClassName keep
+     *                dispatching through the runtime typeId); primitive fields are boxed
+     *                bit-exact into a hidden cang_lang_Boxed {i32, i64} wrapper (raw bits
+     *                only — read the value back through getInt/getLong/...).
+     *   getInt/... — the display name must equal the accessor's primitive, else a runtime
+     *                error; the value loads at the metadata byte offset.
+     *   getType    — hands back the metadata display-name pointer (allocation-free).
+     * Runtime errors (field name/target null, field missing, wrong primitive kind) are
+     * reported with the call site line.
+     */
+    private LLVMValue generateFieldAccessor(ClassInfo fieldCi, LLVMValue recv, MethodCallExpr node) {
+        String m = node.method;
+        String expectedPrim = FIELD_PRIM_METHODS.get(m); // null for getObject/getType
         if (node.args.size() != 1) {
-            throw new RuntimeException("Field.get expects the target object (at line " + node.line + ")");
+            throw new RuntimeException("Field." + m + " expects exactly one field-name argument (at line " + node.line + ")");
         }
-        LLVMValue target = generateExpr(node.args.get(0));
-        if (!target.type.startsWith("%") || !target.type.endsWith("*")) {
-            throw new RuntimeException("Field.get target must be an object instance (at line " + node.line + ")");
+        LLVMValue nameV = generateExpr(node.args.get(0));
+        if (!"i8*".equals(nameV.type)) {
+            throw new RuntimeException("Field." + m + " field name must be a String (at line " + node.line + ")");
         }
-        String[] tgtBv = classPtrBaseAndValue(target);
-        String tgtBase = tgtBv[0];
-        String tgt = tgtBv[1];
-        emitFieldMeta();
-        int nameOff = fieldCi.fieldIndices.get("name");
-        String namePtr = "%fg.np." + tmpCount++;
-        body.append("  ").append(namePtr).append(" = getelementptr %").append(fieldCi.llvmName.substring(1))
-             .append(", %").append(fieldCi.llvmName.substring(1)).append("* ").append(recv.value)
-             .append(", i32 0, i32 ").append(nameOff).append("\n");
-        String name = "%fg.n." + tmpCount++;
-        body.append("  ").append(name).append(" = load i8*, i8** ").append(namePtr).append("\n");
+
         int id = labelCount++;
-        // Defensive: a null name (e.g. constructor argument defaulted away) must not reach strcmp.
-        String nn = "%fg.nn." + tmpCount++;
-        body.append("  ").append(nn).append(" = icmp eq i8* ").append(name).append(", null\n");
-        String errN = "field.get.noname." + id, okN = "field.get.name." + id;
-        body.append("  br i1 ").append(nn).append(", label %").append(errN).append(", label %").append(okN).append("\n");
-        body.append(errN).append(":\n");
-        emitRuntimeError("Field.get: field name not set", node.line, okN);
-        body.append(okN).append(":\n");
-        // null target
-        String tNull = "%fg.tn." + tmpCount++;
-        body.append("  ").append(tNull).append(" = icmp eq %").append(tgtBase).append("* ").append(tgt).append(", null\n");
-        String errT = "field.get.nulltgt." + id, okT = "field.get.tgt." + id;
+        String nx = "fa." + m + "." + id;
+
+        // Load the bound target object from the receiver's `target` field (declared Object).
+        String recvBase = fieldCi.llvmName.substring(1);
+        int tgtOff = fieldCi.fieldIndices.get("target");
+        String tgtPtr = "%fa.tp." + tmpCount++;
+        body.append("  ").append(tgtPtr).append(" = getelementptr %").append(recvBase)
+             .append(", %").append(recvBase).append("* ").append(recv.value)
+             .append(", i32 0, i32 ").append(tgtOff).append("\n");
+        String tgt = "%fa.tgt." + tmpCount++;
+        body.append("  ").append(tgt).append(" = load %cang_lang_Object*, %cang_lang_Object** ").append(tgtPtr).append("\n");
+        // null target → runtime error
+        String tNull = "%fa.tn." + tmpCount++;
+        body.append("  ").append(tNull).append(" = icmp eq %cang_lang_Object* ").append(tgt).append(", null\n");
+        String errT = nx + ".nulltgt", okT = nx + ".tgt";
         body.append("  br i1 ").append(tNull).append(", label %").append(errT).append(", label %").append(okT).append("\n");
         body.append(errT).append(":\n");
-        emitRuntimeError("Field.get: target is null", node.line, okT);
+        emitRuntimeError("Field." + m + ": target object is null", node.line, okT);
         body.append(okT).append(":\n");
-        // field lookup by runtime typeId
-        String tidPtr = "%fg.tidp." + tmpCount++;
-        body.append("  ").append(tidPtr).append(" = getelementptr %").append(tgtBase).append(", %").append(tgtBase)
-             .append("* ").append(tgt).append(", i32 0, i32 0\n");
-        String tid = "%fg.tid." + tmpCount++;
-        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
-        String off = "%fg.off." + tmpCount++;
-        body.append("  ").append(off).append(" = alloca i32\n");
-        String ftype = "%fg.ft." + tmpCount++;
-        body.append("  ").append(ftype).append(" = call i8* @cang.field.find(i32 ").append(tid)
-             .append(", i8* ").append(name).append(", i32* ").append(off).append(")\n");
-        String missing = "%fg.miss." + tmpCount++;
-        body.append("  ").append(missing).append(" = icmp eq i8* ").append(ftype).append(", null\n");
-        String errF = "field.get.missing." + id, okF = "field.get.found." + id;
-        body.append("  br i1 ").append(missing).append(", label %").append(errF).append(", label %").append(okF).append("\n");
-        body.append(errF).append(":\n");
-        emitRuntimeError("Field.get: no such field on target", node.line, okF);
-        body.append(okF).append(":\n");
-        // type check against T (exact: same length AND equal bytes)
-        LLVMValue expected = makeStringConstant(tArg);
-        String eln1 = "%fg.eln1." + tmpCount++;
-        body.append("  ").append(eln1).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
-        String eln2 = "%fg.eln2." + tmpCount++;
-        body.append("  ").append(eln2).append(" = call i64 @strlen(i8* ").append(expected.value).append(")\n");
-        String eld = "%fg.eld." + tmpCount++;
-        body.append("  ").append(eld).append(" = icmp eq i64 ").append(eln1).append(", ").append(eln2).append("\n");
-        String emem = "%fg.emem." + tmpCount++;
-        body.append("  ").append(emem).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
-             .append(expected.value).append(", i64 ").append(eln1).append(")\n");
-        String emok = "%fg.emok." + tmpCount++;
-        body.append("  ").append(emok).append(" = icmp eq i32 ").append(emem).append(", 0\n");
-        String same = "%fg.esame." + tmpCount++;
-        body.append("  ").append(same).append(" = and i1 ").append(eld).append(", ").append(emok).append("\n");
-        String tBad = "%fg.tb." + tmpCount++;
-        body.append("  ").append(tBad).append(" = icmp eq i1 ").append(same).append(", 0\n");
-        String errY = "field.get.typemismatch." + id, okY = "field.get.typeok." + id;
-        body.append("  br i1 ").append(tBad).append(", label %").append(errY).append(", label %").append(okY).append("\n");
-        body.append(errY).append(":\n");
-        emitRuntimeError("Field.get: field type does not match T=" + tArg, node.line, okY);
-        body.append(okY).append(":\n");
-        // typed load: byte-offset addressing works for primitives, strings and struct pointers alike
-        String llvmT = toLLVMType(tArg);
-        String t8 = "%fg.t8." + tmpCount++;
-        body.append("  ").append(t8).append(" = bitcast %").append(tgtBase).append("* ").append(tgt)
-             .append(" to i8*\n");
-        String offv = "%fg.offv." + tmpCount++;
-        body.append("  ").append(offv).append(" = load i32, i32* ").append(off).append("\n");
-        String off64 = "%fg.off64." + tmpCount++;
-        body.append("  ").append(off64).append(" = sext i32 ").append(offv).append(" to i64\n");
-        String bp = "%fg.bp." + tmpCount++;
-        body.append("  ").append(bp).append(" = getelementptr i8, i8* ").append(t8).append(", i64 ").append(off64).append("\n");
-        String fp = "%fg.fp." + tmpCount++;
-        body.append("  ").append(fp).append(" = bitcast i8* ").append(bp).append(" to ").append(llvmT).append("*\n");
-        String v = "%fg.v." + tmpCount++;
-        body.append("  ").append(v).append(" = load ").append(llvmT).append(", ").append(llvmT).append("* ").append(fp).append("\n");
-        String sem = tArg.equals("String") ? "String"
-            : (llvmT.startsWith("%") && llvmT.endsWith("*") ? tArg : null);
-        return new LLVMValue(v, llvmT, sem);
-    }
-
-    /** Field.set(obj, value): same checks as get, then a typed store (numeric values cast). */
-    private LLVMValue generateFieldSet(LLVMValue recv, ClassInfo fieldCi, String tArg, MethodCallExpr node) {
-        if (node.args.size() != 2) {
-            throw new RuntimeException("Field.set expects the target object and a value (at line " + node.line + ")");
-        }
-        LLVMValue target = generateExpr(node.args.get(0));
-        if (!target.type.startsWith("%") || !target.type.endsWith("*")) {
-            throw new RuntimeException("Field.set target must be an object instance (at line " + node.line + ")");
-        }
-        String[] tgtBv = classPtrBaseAndValue(target);
-        String tgtBase = tgtBv[0];
-        String tgt = tgtBv[1];
-        LLVMValue value = generateExpr(node.args.get(1));
-        String llvmT = toLLVMType(tArg);
-        boolean compatible = value.type.equals(llvmT)
-            || (isNumericLLVM(value.type) && isNumericLLVM(llvmT))
-            || (value.value.equals("null") && value.type.endsWith("*") && llvmT.endsWith("*"));
-        if (!compatible) {
-            throw new RuntimeException("Field.set: value type mismatch (expected T=" + tArg
-                + ", got " + cangTypeFromLLVM(value.type) + ") (at line " + node.line + ")");
-        }
-        emitFieldMeta();
-        int nameOff = fieldCi.fieldIndices.get("name");
-        String namePtr = "%fs.np." + tmpCount++;
-        body.append("  ").append(namePtr).append(" = getelementptr %").append(fieldCi.llvmName.substring(1))
-             .append(", %").append(fieldCi.llvmName.substring(1)).append("* ").append(recv.value)
-             .append(", i32 0, i32 ").append(nameOff).append("\n");
-        String name = "%fs.n." + tmpCount++;
-        body.append("  ").append(name).append(" = load i8*, i8** ").append(namePtr).append("\n");
-        int id = labelCount++;
-        String nn = "%fs.nn." + tmpCount++;
-        body.append("  ").append(nn).append(" = icmp eq i8* ").append(name).append(", null\n");
-        String errN = "field.set.noname." + id, okN = "field.set.name." + id;
-        body.append("  br i1 ").append(nn).append(", label %").append(errN).append(", label %").append(okN).append("\n");
+        // null field name must not reach strlen/memcmp
+        String nNull = "%fa.nn." + tmpCount++;
+        body.append("  ").append(nNull).append(" = icmp eq i8* ").append(nameV.value).append(", null\n");
+        String errN = nx + ".noname", okN = nx + ".name";
+        body.append("  br i1 ").append(nNull).append(", label %").append(errN).append(", label %").append(okN).append("\n");
         body.append(errN).append(":\n");
-        emitRuntimeError("Field.set: field name not set", node.line, okN);
+        emitRuntimeError("Field." + m + ": field name is null", node.line, okN);
         body.append(okN).append(":\n");
-        String tNull = "%fs.tn." + tmpCount++;
-        body.append("  ").append(tNull).append(" = icmp eq %").append(tgtBase).append("* ").append(tgt).append(", null\n");
-        String errT = "field.set.nulltgt." + id, okT = "field.set.tgt." + id;
-        body.append("  br i1 ").append(tNull).append(", label %").append(errT).append(", label %").append(okT).append("\n");
-        body.append(errT).append(":\n");
-        emitRuntimeError("Field.set: target is null", node.line, okT);
-        body.append(okT).append(":\n");
-        String tidPtr = "%fs.tidp." + tmpCount++;
-        body.append("  ").append(tidPtr).append(" = getelementptr %").append(tgtBase).append(", %").append(tgtBase)
-             .append("* ").append(tgt).append(", i32 0, i32 0\n");
-        String tid = "%fs.tid." + tmpCount++;
+
+        // Field lookup by the target's runtime typeId.
+        String tidPtr = "%fa.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr %cang_lang_Object, %cang_lang_Object* ")
+             .append(tgt).append(", i32 0, i32 0\n");
+        String tid = "%fa.tid." + tmpCount++;
         body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
-        String off = "%fs.off." + tmpCount++;
+        emitFieldMeta();
+        emitBoxPrimHelper();
+        String off = "%fa.off." + tmpCount++;
         body.append("  ").append(off).append(" = alloca i32\n");
-        String ftype = "%fs.ft." + tmpCount++;
+        String ftype = "%fa.ft." + tmpCount++;
         body.append("  ").append(ftype).append(" = call i8* @cang.field.find(i32 ").append(tid)
-             .append(", i8* ").append(name).append(", i32* ").append(off).append(")\n");
-        String missing = "%fs.miss." + tmpCount++;
+             .append(", i8* ").append(nameV.value).append(", i32* ").append(off).append(")\n");
+        String missing = "%fa.miss." + tmpCount++;
         body.append("  ").append(missing).append(" = icmp eq i8* ").append(ftype).append(", null\n");
-        String errF = "field.set.missing." + id, okF = "field.set.found." + id;
+        String errF = nx + ".missing", okF = nx + ".found";
         body.append("  br i1 ").append(missing).append(", label %").append(errF).append(", label %").append(okF).append("\n");
         body.append(errF).append(":\n");
-        emitRuntimeError("Field.set: no such field on target", node.line, okF);
+        emitRuntimeErrorDynamic(buildFieldErrorMsg(m, "target object has no field \"%s\"", nameV), node.line, okF);
         body.append(okF).append(":\n");
-        LLVMValue expected = makeStringConstant(tArg);
-        String eln1 = "%fs.eln1." + tmpCount++;
-        body.append("  ").append(eln1).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
-        String eln2 = "%fs.eln2." + tmpCount++;
-        body.append("  ").append(eln2).append(" = call i64 @strlen(i8* ").append(expected.value).append(")\n");
-        String eld = "%fs.eld." + tmpCount++;
-        body.append("  ").append(eld).append(" = icmp eq i64 ").append(eln1).append(", ").append(eln2).append("\n");
-        String emem = "%fs.emem." + tmpCount++;
-        body.append("  ").append(emem).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
-             .append(expected.value).append(", i64 ").append(eln1).append(")\n");
-        String emok = "%fs.emok." + tmpCount++;
-        body.append("  ").append(emok).append(" = icmp eq i32 ").append(emem).append(", 0\n");
-        String same = "%fs.esame." + tmpCount++;
-        body.append("  ").append(same).append(" = and i1 ").append(eld).append(", ").append(emok).append("\n");
-        String tBad = "%fs.tb." + tmpCount++;
-        body.append("  ").append(tBad).append(" = icmp eq i1 ").append(same).append(", 0\n");
-        String errY = "field.set.typemismatch." + id, okY = "field.set.typeok." + id;
-        body.append("  br i1 ").append(tBad).append(", label %").append(errY).append(", label %").append(okY).append("\n");
-        body.append(errY).append(":\n");
-        emitRuntimeError("Field.set: field type does not match T=" + tArg, node.line, okY);
-        body.append(okY).append(":\n");
-        String casted = castValue(value, llvmT);
-        String t8 = "%fs.t8." + tmpCount++;
-        body.append("  ").append(t8).append(" = bitcast %").append(tgtBase).append("* ").append(tgt)
-             .append(" to i8*\n");
-        String offv = "%fs.offv." + tmpCount++;
+
+        // Byte address of the field inside the target struct.
+        String t8 = "%fa.t8." + tmpCount++;
+        body.append("  ").append(t8).append(" = bitcast %cang_lang_Object* ").append(tgt).append(" to i8*\n");
+        String offv = "%fa.offv." + tmpCount++;
         body.append("  ").append(offv).append(" = load i32, i32* ").append(off).append("\n");
-        String off64 = "%fs.off64." + tmpCount++;
+        String off64 = "%fa.off64." + tmpCount++;
         body.append("  ").append(off64).append(" = sext i32 ").append(offv).append(" to i64\n");
-        String bp = "%fs.bp." + tmpCount++;
+        String bp = "%fa.bp." + tmpCount++;
         body.append("  ").append(bp).append(" = getelementptr i8, i8* ").append(t8).append(", i64 ").append(off64).append("\n");
-        String fp = "%fs.fp." + tmpCount++;
-        body.append("  ").append(fp).append(" = bitcast i8* ").append(bp).append(" to ").append(llvmT).append("*\n");
-        body.append("  store ").append(llvmT).append(" ").append(casted).append(", ").append(llvmT).append("* ").append(fp).append("\n");
-        return new LLVMValue("void", "void");
+
+        // getType: hand back the metadata display-name pointer directly.
+        if (m.equals("getType")) {
+            return new LLVMValue(ftype, "i8*", "String");
+        }
+
+        // getString: the display type must be "String".
+        if (m.equals("getString")) {
+            LLVMValue strC = makeStringConstant("String");
+            String sln1 = "%fa.sln1." + tmpCount++;
+            body.append("  ").append(sln1).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
+            String sln2 = "%fa.sln2." + tmpCount++;
+            body.append("  ").append(sln2).append(" = call i64 @strlen(i8* ").append(strC.value).append(")\n");
+            String seld = "%fa.seld." + tmpCount++;
+            body.append("  ").append(seld).append(" = icmp eq i64 ").append(sln1).append(", ").append(sln2).append("\n");
+            String smem2 = "%fa.smem2." + tmpCount++;
+            body.append("  ").append(smem2).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
+                 .append(strC.value).append(", i64 ").append(sln1).append(")\n");
+            String smok2 = "%fa.smok2." + tmpCount++;
+            body.append("  ").append(smok2).append(" = icmp eq i32 ").append(smem2).append(", 0\n");
+            String ssame = "%fa.ssame." + tmpCount++;
+            body.append("  ").append(ssame).append(" = and i1 ").append(seld).append(", ").append(smok2).append("\n");
+            String sBad = "%fa.sbad." + tmpCount++;
+            body.append("  ").append(sBad).append(" = icmp eq i1 ").append(ssame).append(", 0\n");
+            String serrY = nx + ".typemismatch", sokY = nx + ".typeok";
+            body.append("  br i1 ").append(sBad).append(", label %").append(serrY).append(", label %").append(sokY).append("\n");
+            body.append(serrY).append(":\n");
+            emitRuntimeErrorDynamic(buildFieldErrorMsg(m, "field \"%s\" is not String", nameV), node.line, sokY);
+            body.append(sokY).append(":\n");
+            String sfp = "%fa.sfp." + tmpCount++;
+            body.append("  ").append(sfp).append(" = bitcast i8* ").append(bp).append(" to i8**\n");
+            String sv = "%fa.sv." + tmpCount++;
+            body.append("  ").append(sv).append(" = load i8*, i8** ").append(sfp).append("\n");
+            return new LLVMValue(sv, "i8*", "String");
+        }
+
+        // Typed primitive getters: display name must equal the accessor's primitive.
+        if (expectedPrim != null) {
+            LLVMValue expected = makeStringConstant(expectedPrim);
+            String eln1 = "%fa.eln1." + tmpCount++;
+            body.append("  ").append(eln1).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
+            String eln2 = "%fa.eln2." + tmpCount++;
+            body.append("  ").append(eln2).append(" = call i64 @strlen(i8* ").append(expected.value).append(")\n");
+            String eld = "%fa.eld." + tmpCount++;
+            body.append("  ").append(eld).append(" = icmp eq i64 ").append(eln1).append(", ").append(eln2).append("\n");
+            String emem = "%fa.emem." + tmpCount++;
+            body.append("  ").append(emem).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
+                 .append(expected.value).append(", i64 ").append(eln1).append(")\n");
+            String emok = "%fa.emok." + tmpCount++;
+            body.append("  ").append(emok).append(" = icmp eq i32 ").append(emem).append(", 0\n");
+            String same = "%fa.esame." + tmpCount++;
+            body.append("  ").append(same).append(" = and i1 ").append(eld).append(", ").append(emok).append("\n");
+            String tBad = "%fa.tb." + tmpCount++;
+            body.append("  ").append(tBad).append(" = icmp eq i1 ").append(same).append(", 0\n");
+            String errY = nx + ".typemismatch", okY = nx + ".typeok";
+            body.append("  br i1 ").append(tBad).append(", label %").append(errY).append(", label %").append(okY).append("\n");
+            body.append(errY).append(":\n");
+            emitRuntimeErrorDynamic(buildFieldErrorMsg(m, "field \"%s\" is not " + expectedPrim, nameV), node.line, okY);
+            body.append(okY).append(":\n");
+            String llvmT = toLLVMType(expectedPrim);
+            String fp = "%fa.fp." + tmpCount++;
+            body.append("  ").append(fp).append(" = bitcast i8* ").append(bp).append(" to ").append(llvmT).append("*\n");
+            String v = "%fa.v." + tmpCount++;
+            body.append("  ").append(v).append(" = load ").append(llvmT).append(", ").append(llvmT).append("* ").append(fp).append("\n");
+            return new LLVMValue(v, llvmT);
+        }
+
+        // ---- getObject ----
+        // isPrim = the display type matches one of the six primitive names at runtime.
+        String nlen = "%fa.nlen." + tmpCount++;
+        body.append("  ").append(nlen).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
+        String isPrim = "%fa.isprim." + tmpCount++;
+        body.append("  ").append(isPrim).append(" = icmp eq i32 0, 1\n"); // constant false
+        for (String prim : FIELD_PRIMS) {
+            LLVMValue pc = makeStringConstant(prim);
+            String plen = "%fa.plen." + tmpCount++;
+            body.append("  ").append(plen).append(" = call i64 @strlen(i8* ").append(pc.value).append(")\n");
+            String peq = "%fa.peq." + tmpCount++;
+            body.append("  ").append(peq).append(" = icmp eq i64 ").append(nlen).append(", ").append(plen).append("\n");
+            String pmem = "%fa.pmem." + tmpCount++;
+            body.append("  ").append(pmem).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
+                 .append(pc.value).append(", i64 ").append(nlen).append(")\n");
+            String pok = "%fa.pok." + tmpCount++;
+            body.append("  ").append(pok).append(" = icmp eq i32 ").append(pmem).append(", 0\n");
+            String pm = "%fa.pm." + tmpCount++;
+            body.append("  ").append(pm).append(" = and i1 ").append(peq).append(", ").append(pok).append("\n");
+            String pn = "%fa.pn." + tmpCount++;
+            body.append("  ").append(pn).append(" = or i1 ").append(isPrim).append(", ").append(pm).append("\n");
+            isPrim = pn;
+        }
+
+        String okP = nx + ".prim", nextSR = nx + ".strref";
+        body.append("  br i1 ").append(isPrim).append(", label %").append(okP).append(", label %").append(nextSR).append("\n");
+
+        // ---- primitive branch: box the raw bits into a Boxed wrapper ----
+        body.append(okP).append(":\n");
+        // Raw bits: @cang.boxprim dispatches on the display name (int/long/byte/bool/
+        // float/double) and widens each kind into an i64 without destroying the bits.
+        String raw = "%fa.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i64 @cang.boxprim(i8* ").append(ftype)
+             .append(", i8* ").append(bp).append(")\n");
+        ClassInfo bx = classes.get("Boxed");
+        if (bx == null || bx.typeId < 0) {
+            throw new RuntimeException("internal: Boxed wrapper class missing (getObject at line " + node.line + ")");
+        }
+        String mem = "%fa.box." + tmpCount++;
+        body.append("  ").append(mem).append(" = call i8* @").append(allocFn()).append("(i64 16)\n");
+        String btidPtr = "%fa.btidp." + tmpCount++;
+        body.append("  ").append(btidPtr).append(" = bitcast i8* ").append(mem).append(" to i32*\n");
+        body.append("  store i32 ").append(bx.typeId).append(", i32* ").append(btidPtr).append("\n");
+        String brawPtr = "%fa.brawp." + tmpCount++;
+        body.append("  ").append(brawPtr).append(" = getelementptr i8, i8* ").append(mem).append(", i64 8\n");
+        String braw64 = "%fa.braw64." + tmpCount++;
+        body.append("  ").append(braw64).append(" = bitcast i8* ").append(brawPtr).append(" to i64*\n");
+        body.append("  store i64 ").append(raw).append(", i64* ").append(braw64).append("\n");
+        body.append("  br label %").append(nx).append(".done\n");
+
+        // ---- String / reference branch: load the slot's pointer ----
+        body.append(nextSR).append(":\n");
+        String rfp = "%fa.rfp." + tmpCount++;
+        body.append("  ").append(rfp).append(" = bitcast i8* ").append(bp).append(" to i8**\n");
+        String rv = "%fa.rv." + tmpCount++;
+        body.append("  ").append(rv).append(" = load i8*, i8** ").append(rfp).append("\n");
+        body.append("  br label %").append(nx).append(".done\n");
+
+        // Merge both branches: primitive boxing result vs the loaded pointer. The result is
+        // exposed as %cang_lang_Object* so Object intrinsics (getClassName/toString/...)
+        // keep dispatching through the runtime typeId; a String field's pointer works the
+        // same shallow way (see getString for a direct read).
+        body.append(nx).append(".done").append(":\n");
+        String phi = "%fa.res." + tmpCount++;
+        body.append("  ").append(phi).append(" = phi i8* [ ").append(mem).append(", %").append(okP)
+             .append(" ], [ ").append(rv).append(", %").append(nextSR).append(" ]\n");
+        return new LLVMValue(phi, "%cang_lang_Object*");
     }
 
+    /**
+     * sprintf-style managed message builder for Field accessors: renders
+     * "Field.<method>: <verb>" where the runtime field name is embedded via %s.
+     */
+    private LLVMValue buildFieldErrorMsg(String method, String verb, LLVMValue nameV) {
+        if (!header.toString().contains("declare i32 @sprintf(")) {
+            header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
+        }
+        LLVMValue fmtV = makeStringConstant("Field." + method + ": " + verb);
+        String flen = "%fe.flen." + tmpCount++;
+        body.append("  ").append(flen).append(" = call i64 @strlen(i8* ").append(fmtV.value).append(")\n");
+        String nlen = "%fe.nlen." + tmpCount++;
+        body.append("  ").append(nlen).append(" = call i64 @strlen(i8* ").append(nameV.value).append(")\n");
+        // fmt is %s-expanded: rendered length = flen - 2 + nlen, plus the NUL.
+        String sz = "%fe.sz." + tmpCount++;
+        body.append("  ").append(sz).append(" = add i64 ").append(flen).append(", ").append(nlen).append("\n");
+        String sz2 = "%fe.sz2." + tmpCount++;
+        body.append("  ").append(sz2).append(" = sub i64 ").append(sz).append(", 1\n");
+        String buf = "%fe.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 ").append(sz2).append(")\n");
+        String n2 = "%fe.call." + tmpCount++;
+        body.append("  ").append(n2).append(" = call i32 (i8*, i8*, ...) @sprintf(i8* ").append(buf)
+             .append(", i8* ").append(fmtV.value).append(", i8* ").append(nameV.value).append(")\n");
+        return new LLVMValue(buf, "i8*");
+    }
+
+    /**
+     * Runtime error with a runtime-built message: wraps the message string into an
+     * Error(message) object (hand-allocated, matching new Error(msg) — message field set,
+     * stack initialized empty on non-null allocation) so catch handlers see the real
+     * message; without the Error class the uncaught printer prints the value directly.
+     */
+    private void emitRuntimeErrorDynamic(LLVMValue msgValue, int line, String continuationLabel) {
+        ClassInfo errorInfo = classes.get("Error");
+        String funcName = errorInfo != null ? "cang_lang_Error.constructor" : null;
+        FuncInfo oneArg = null;
+        if (errorInfo != null) {
+            List<FuncInfo> grp = overloadGroups.get(funcName);
+            if (grp != null) {
+                for (FuncInfo fi : grp) {
+                    if (fi.paramTypes.size() == 1 && "String".equals(fi.paramTypes.get(0))) {
+                        oneArg = fi;
+                        break;
+                    }
+                }
+            }
+        }
+        if (errorInfo == null || oneArg == null) {
+            // No Error type: print + exit directly, then keep the dead-block contract.
+            emitUncaughtErrorWith(msgValue, line);
+            body.append("runtime.error.dead.").append(runtimeErrorCount++).append(":\n");
+            body.append("  br label %").append(continuationLabel).append("\n");
+            return;
+        }
+        // Heap-allocate an Error, set its typeId, hand it to the init(String) constructor.
+        String sizeReg = "%fe.size." + tmpCount++;
+        body.append("  ").append(sizeReg).append(" = getelementptr ").append(errorInfo.llvmName)
+             .append(", ").append(errorInfo.llvmName).append("* null, i32 1\n");
+        String sizeVal = "%fe.sizeval." + tmpCount++;
+        body.append("  ").append(sizeVal).append(" = ptrtoint ").append(errorInfo.llvmName)
+             .append("* ").append(sizeReg).append(" to i64\n");
+        String raw = "%fe.errraw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @").append(allocFn()).append("(i64 ").append(sizeVal).append(")\n");
+        String errPtr = "%fe.errptr." + tmpCount++;
+        body.append("  ").append(errPtr).append(" = bitcast i8* ").append(raw).append(" to ")
+             .append(errorInfo.llvmName).append("*\n");
+        String tidp = "%fe.tidp." + tmpCount++;
+        body.append("  ").append(tidp).append(" = getelementptr ").append(errorInfo.llvmName)
+             .append(", ").append(errorInfo.llvmName).append("* ").append(errPtr).append(", i32 0, i32 0\n");
+        body.append("  store i32 ").append(errorInfo.typeId).append(", i32* ").append(tidp).append("\n");
+        body.append("  call void @").append(oneArg.llvmName).append("(").append(errorInfo.llvmName)
+             .append("* ").append(errPtr).append(", i8* ").append(msgValue.value).append(")\n");
+        String errI8 = "%fe.erri8." + tmpCount++;
+        body.append("  ").append(errI8).append(" = bitcast ").append(errorInfo.llvmName).append("* ")
+             .append(errPtr).append(" to i8*\n");
+        body.append("  store i8* ").append(errI8).append(", i8** @cang.current.error\n");
+        if (exceptionHandlers.isEmpty()) {
+            emitUncaughtError(line);
+        } else {
+            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+        }
+        body.append("runtime.error.dead.").append(runtimeErrorCount++).append(":\n");
+        body.append("  br label %").append(continuationLabel).append("\n");
+    }
+
+    /**
+     * Boxed-primitive bit loader, used by Field.getObject: given a metadata display name
+     * (int/long/byte/bool/float/double — the caller has already matched one of them) and
+     * the field byte address, returns the field's bits widened into an i64. Kind selection
+     * happens at runtime by name length + first byte ('long' vs 'byte'/'bool'); float bits
+     * ride through an i32 bitcast, double straight to i64.
+     */
+    private void emitBoxPrimHelper() {
+        if (header.toString().contains("define i64 @cang.boxprim(")) return;
+        if (!header.toString().contains("declare i64 @strlen(")) {
+            header.append("declare i64 @strlen(i8*)\n");
+        }
+        header.append("define i64 @cang.boxprim(i8* %disp, i8* %addr) {\n");
+        header.append("entry:\n");
+        header.append("  %len = call i64 @strlen(i8* %disp)\n");
+        // len 3 → "int" → load i32
+        header.append("  %l3 = icmp eq i64 %len, 3\n");
+        header.append("  br i1 %l3, label %ldi32, label %chkl\n");
+        header.append("chkl:\n");
+        // len 4 with first byte 'l' → "long" → load i64; len 4 otherwise → byte/bool → i8
+        header.append("  %b0 = load i8, i8* %disp\n");
+        header.append("  %l4 = icmp eq i64 %len, 4\n");
+        header.append("  %isl = icmp eq i8 %b0, 108\n");
+        header.append("  %gol = and i1 %l4, %isl\n");
+        header.append("  br i1 %gol, label %ldi64, label %chkt\n");
+        header.append("chkt:\n");
+        header.append("  br i1 %l4, label %ldi8, label %chkf\n");
+        header.append("chkf:\n");
+        // len 5 → "float"; len 6 → "double" (both pre-verified by the caller).
+        header.append("  %l5 = icmp eq i64 %len, 5\n");
+        header.append("  br i1 %l5, label %ldf, label %ldd\n");
+        header.append("ldi32:\n");
+        header.append("  %p32 = bitcast i8* %addr to i32*\n");
+        header.append("  %v32 = load i32, i32* %p32\n");
+        header.append("  %w32 = sext i32 %v32 to i64\n");
+        header.append("  br label %out\n");
+        header.append("ldi64:\n");
+        header.append("  %p64 = bitcast i8* %addr to i64*\n");
+        header.append("  %w64 = load i64, i64* %p64\n");
+        header.append("  br label %out\n");
+        header.append("ldi8:\n");
+        header.append("  %p8 = bitcast i8* %addr to i8*\n");
+        header.append("  %v8 = load i8, i8* %p8\n");
+        header.append("  %w8 = sext i8 %v8 to i64\n");
+        header.append("  br label %out\n");
+        header.append("ldf:\n");
+        header.append("  %pf = bitcast i8* %addr to float*\n");
+        header.append("  %vf = load float, float* %pf\n");
+        header.append("  %bf = bitcast float %vf to i32\n");
+        header.append("  %wf = zext i32 %bf to i64\n");
+        header.append("  br label %out\n");
+        header.append("ldd:\n");
+        header.append("  %pd = bitcast i8* %addr to double*\n");
+        header.append("  %vd = load double, double* %pd\n");
+        header.append("  %wd = bitcast double %vd to i64\n");
+        header.append("  br label %out\n");
+        header.append("out:\n");
+        header.append("  %w = phi i64 [ %w32, %ldi32 ], [ %w64, %ldi64 ], [ %w8, %ldi8 ]")
+             .append(", [ %wf, %ldf ], [ %wd, %ldd ]\n");
+        header.append("  ret i64 %w\n");
+        header.append("}\n\n");
+    }
     /**
      * Allocate + initialize an intrinsic object-style Thread object (daemon flag, optional
      * seeded task, birth parent/id). Shared by new Thread(...) and Thread-subclass start().
@@ -13688,7 +13909,7 @@ pb.append("prl.finish.").append(id).append(":\n");
 
     /** LLVM size of a field type (pointers 8, primitives natural, %CangFunction by value 16). */
     private long fieldLlvmSize(String t) {
-        if (t.equals("i1") || t.equals("byte") || t.equals("i8")) return 1;
+        if (t.equals("i1") || t.equals("byte") || t.equals("i8") || t.equals("bool")) return 1;
         if (t.equals("int") || t.equals("i32") || t.equals("float")) return 4;
         if (t.equals("long") || t.equals("i64") || t.equals("double")) return 8;
         if (isFunctionType(t)) return 16; // %CangFunction value struct { i8*, i8* }
