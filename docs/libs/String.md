@@ -7,7 +7,7 @@
 - toUpper / toLower / trim（均已在编译器内建实现，无需 import）
 - parseInt / parseLong / parseDouble：完整数字校验，非法输入或超范围是运行时错误（首尾空白按 Java 惯例忽略）
 - split / lastIndexOf 暂未提供（v1 边界）
-- 方法链式调用与 `String(...)` 数值转换
+- 方法链式调用与 `String!$(...)` 数值转换
 
 
 `String` 是不可变引用类型，标准库声明位于 `stdlib/cang/lang/String.cang`。

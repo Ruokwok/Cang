@@ -491,6 +491,11 @@ public class Cang {
             addTypeName(a.type, out);
             collectTypeRefs(a.size, out);
             return;
+        } else if (node instanceof AST.TypeCastExpr) {
+            AST.TypeCastExpr t = (AST.TypeCastExpr) node;
+            addTypeName(t.targetType, out);
+            collectTypeRefs(t.expr, out);
+            return;
         } else if (node instanceof AST.CatchClause) {
             AST.CatchClause c = (AST.CatchClause) node;
             addTypeName(c.type, out);

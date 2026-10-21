@@ -316,6 +316,8 @@ public class Lexer {
                 advance();
                 if (peek == '=') { advance(); return new Token(TokenType.NEQ, "!=", startLine, startCol); }
                 return new Token(TokenType.NOT, "!", startLine, startCol);
+            // Cast marker: Type$(expr) / Type!$(expr)
+            case '$': advance(); return new Token(TokenType.DOLLAR, "$", startLine, startCol);
             case '<':
                 advance();
                 if (peek == '=') { advance(); return new Token(TokenType.LE, "<=", startLine, startCol); }

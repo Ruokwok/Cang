@@ -457,7 +457,22 @@ public class Parser {
 
     // ==================== Types ====================
 
+    /** Current token can be a cast target type: a class name or a primitive type keyword. */
+    private boolean isCastTargetToken() {
+        return check(TokenType.IDENT, TokenType.T_BYTE, TokenType.T_INT,
+                TokenType.T_LONG, TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_STRING);
+    }
+
+    /** Full cast pattern: {@code Type!$(} (force) or {@code Type$(} (safe). */
+    private boolean isCastStart() {
+        if (!isCastTargetToken()) return false;
+        return peek(1).type == TokenType.DOLLAR
+            || (peek(1).type == TokenType.NOT && peek(2).type == TokenType.DOLLAR);
+    }
+
     private boolean isTypeStart() {
+        // `int!$(...)` / `int$(...)` is a cast expression, not a declaration.
+        if (isCastStart()) return false;
         if (check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG,
                   TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_BOOL,
                   TokenType.T_STRING, TokenType.VOID, TokenType.VAR, TokenType.FUNC)) {
@@ -1195,20 +1210,36 @@ public class Parser {
             return new NewExpr(className, typeArgs, args, line);
         }
 
-        // Type cast: byte(expr), int(expr), long(expr), float(expr), double(expr), String(expr)
-        if (check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG,
-                  TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_STRING) && peek(1).type == TokenType.LPAREN) {
+        // Casts: Type!$(expr) 强制转换（失败运行时报错） / Type$(expr) 安全转换（失败返回
+        // null 或基本类型默认值）。目标类型是基本类型关键字或类名（parser 无符号表，
+        // 未知类名在 codegen 报错）。
+        if (isCastStart()) {
+            boolean force = peek(1).type == TokenType.NOT;
             String targetType = parseType();
+            if (force) expect(TokenType.NOT);
+            expect(TokenType.DOLLAR);
             expect(TokenType.LPAREN);
             AST expr = parseExpression();
             expect(TokenType.RPAREN);
-            return new TypeCastExpr(targetType, expr, line);
+            return new TypeCastExpr(targetType, expr, line, force);
+        }
+
+        // Legacy keyword casts (int(x) / long(x) / double(x) / String(x) ...) are removed.
+        if (check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG,
+                  TokenType.T_FLOAT, TokenType.T_DOUBLE, TokenType.T_STRING) && peek(1).type == TokenType.LPAREN) {
+            String name = current().value;
+            error("'" + name + "(...)' cast syntax has been removed, use " + name + "!$(...) or " + name + "$(...)");
+        }
+        // Common typo: Type!(expr) — the '$' marker is mandatory.
+        if (isCastTargetToken() && peek(1).type == TokenType.NOT && peek(2).type == TokenType.LPAREN) {
+            String name = current().value;
+            error("'" + name + "!(...)' is missing '$', use " + name + "!$(...)");
         }
 
         if (check(TokenType.IDENT)) {
             // `string(expr)` used to be the str cast; now it would parse as a plain call.
             if (current().value.equals("string") && peek(1).type == TokenType.LPAREN) {
-                error("'string' cast has been removed, use String(...) instead");
+                error("'string' cast has been removed, use String!$(...) or String$(...)");
             }
             return new Identifier(advance().value, line);
         }

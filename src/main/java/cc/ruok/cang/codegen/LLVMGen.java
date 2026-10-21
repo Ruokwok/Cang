@@ -5655,17 +5655,22 @@ public class LLVMGen {
     }
 
     /**
-     * Class downcast Apple(fruitRef): runtime type check (target or a concrete subclass —
-     * same id set as `like`), then bitcast. Null casts to null (Java semantics); a
-     * mismatch raises a catchable runtime error with the source line.
+     * Class downcast: {@code Apple!$(fruitRef)} 强制 / {@code Apple$(fruitRef)} 安全.
+     * Runtime type check (target or a concrete subclass — same id set as `like`), then
+     * bitcast. Null casts to null (Java semantics). force=true raises a catchable runtime
+     * error on mismatch; force=false (safe cast) yields null instead.
      */
-    private LLVMValue generateClassCast(LLVMValue val, String className, int line) {
+    private LLVMValue generateClassCast(LLVMValue val, String className, int line, boolean force) {
+        ClassInfo targetInfo = classes.get(className);
+        if (targetInfo == null) throw unknownClassError(className, line);
+        // Literal null casts to null (Java: (Apple) null == null).
+        if (val.value.equals("null") && val.type.equals("i8*")) {
+            return new LLVMValue("null", targetInfo.llvmName + "*", className);
+        }
         if (!val.type.startsWith("%") || !val.type.endsWith("*")) {
             throw new RuntimeException("Cannot cast a non-object value to '" + className
                 + "' (at line " + line + ")");
         }
-        ClassInfo targetInfo = classes.get(className);
-        if (targetInfo == null) throw unknownClassError(className, line);
         java.util.List<Integer> validIds = new ArrayList<>();
         for (ClassInfo ci : classes.values()) {
             if (isSubclass(ci.simpleName, targetInfo.simpleName) && !ci.isAbstract) {
@@ -5709,8 +5714,11 @@ public class LLVMGen {
         }
         body.append("  br i1 ").append(match).append(", label %").append(hitL).append(", label %").append(missL).append("\n");
         body.append(missL).append(":\n");
-        emitRuntimeError("Cannot cast to " + className + ": incompatible object type", line, resumeL);
-        body.append(resumeL).append(":\n");
+        // force: catchable runtime error; safe: fall through to null.
+        if (force) {
+            emitRuntimeError("Cannot cast to " + className + ": incompatible object type", line, resumeL);
+            body.append(resumeL).append(":\n");
+        }
         body.append("  br label %").append(endL).append("\n");
         body.append(hitL).append(":\n");
         String c = "%cast.v." + tmpCount++;
@@ -5720,134 +5728,263 @@ public class LLVMGen {
         body.append(endL).append(":\n");
         String r = "%cast.r." + tmpCount++;
         body.append("  ").append(r).append(" = phi ").append(targetInfo.llvmName).append("* [ null, %")
-             .append(nullL).append(" ], [ null, %").append(resumeL).append(" ], [ ").append(c)
+             .append(nullL).append(" ], [ null, %").append(force ? resumeL : missL).append(" ], [ ").append(c)
              .append(", %").append(hitL).append(" ]\n");
         return new LLVMValue(r, targetInfo.llvmName + "*", className);
     }
 
     private LLVMValue generateTypeCast(TypeCastExpr node) {
+        boolean force = node.force;
         LLVMValue val = generateExpr(node.expr);
-        String targetType = toLLVMType(node.targetType);
 
-        // String semantic conversion while sharing the same LLVM pointer type.
-        if (targetType.equals("i8*") && node.targetType.equals("String")) {
-            if (val.type.equals("i8*")) {
-                return new LLVMValue(val.value, val.type, "String");
-            }
+        // String target: any value → its string form; toString always succeeds.
+        if (node.targetType.equals("String")) {
+            if (val.type.equals("i8*")) return new LLVMValue(val.value, val.type, "String");
             LLVMValue converted = convertToString(val);
             converted.semanticType = "String";
             return converted;
         }
 
-        // If types already match, return as-is
-        if (val.type.equals(targetType)) {
-            return val;
+        // Class downcast (target is a class name; unknown names → unknownClassError).
+        if (!isPrimitiveCastTarget(node.targetType)) {
+            return generateClassCast(val, node.targetType, node.line, force);
         }
 
-        // String to number conversion
+        // null literal → primitive: not a value conversion (force and safe both reject).
+        if (val.value.equals("null")) {
+            throw new RuntimeException("Cannot cast null to '" + node.targetType + "' (at line " + node.line + ")");
+        }
+        // Object value → primitive: a class reference is never a number.
+        if (val.type.startsWith("%") && val.type.endsWith("*")) {
+            throw new RuntimeException("Cannot cast a class value to '" + node.targetType
+                + "' (at line " + node.line + ")");
+        }
+
+        String targetType = toLLVMType(node.targetType);
+        // Same LLVM type: nothing to convert, nothing can fail.
+        if (val.type.equals(targetType)) return val;
+
+        // String → number: strict parse (full-consume) + the usual range check.
         if (val.type.equals("i8*") && !targetType.equals("i8*")) {
-            return generateStringToNumber(val, node.targetType, targetType);
+            return generateStringToNumber(val, node.targetType, targetType, node.line, force);
         }
 
-        String result = "%cast." + tmpCount++;
+        return convertNumeric(val, node.targetType, targetType, node.line, force);
+    }
 
-        // Float to int
-        if (!isFloatType(targetType) && isFloatType(val.type)) {
-            body.append("  ").append(result).append(" = fptosi ").append(val.type)
+    /** Castable primitive targets (class names take the runtime downcast path instead). */
+    private boolean isPrimitiveCastTarget(String t) {
+        return t.equals("byte") || t.equals("int") || t.equals("long")
+            || t.equals("float") || t.equals("double");
+    }
+
+    /**
+     * Numeric conversion. Widening never fails; narrowing is overflow-checked —
+     * force raises a catchable runtime error, safe yields the target default (0).
+     */
+    private LLVMValue convertNumeric(LLVMValue val, String cangTarget, String targetType, int line, boolean force) {
+        // Same LLVM type: nothing to convert, nothing can fail.
+        if (val.type.equals(targetType)) return val;
+
+        // Integer → wider integer: sign-extend (bool zero-extends so true stays 1).
+        int fromBits = llvmTypeBits(val.type);
+        int toBits = llvmTypeBits(targetType);
+        if (!isFloatType(targetType) && !isFloatType(val.type) && fromBits > 0 && toBits > fromBits) {
+            String result = "%cast." + tmpCount++;
+            String widen = val.type.equals("i1") ? "zext" : "sext";
+            body.append("  ").append(result).append(" = ").append(widen).append(" ").append(val.type)
                  .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
             return new LLVMValue(result, targetType);
         }
 
-        // Int to float
+        // Integer → narrower integer: trunc round-trip must reproduce the input.
+        if (!isFloatType(targetType) && !isFloatType(val.type) && fromBits > toBits && toBits > 0) {
+            String truncated = "%cast.trunc." + tmpCount++;
+            body.append("  ").append(truncated).append(" = trunc ").append(val.type)
+                 .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
+            String back = "%cast.truncback." + tmpCount++;
+            body.append("  ").append(back).append(" = sext ").append(targetType).append(" ")
+                 .append(truncated).append(" to ").append(val.type).append("\n");
+            String ok = "%cast.truncok." + tmpCount++;
+            body.append("  ").append(ok).append(" = icmp eq ").append(val.type)
+                 .append(" ").append(back).append(", ").append(val.value).append("\n");
+            String r = emitChecked(ok, "Cannot cast to '" + cangTarget + "': value out of range",
+                line, force, "0", targetType, () -> truncated);
+            return new LLVMValue(r, targetType);
+        }
+
+        // Integer → float: always representable (precision may drop, never overflows).
         if (isFloatType(targetType) && !isFloatType(val.type)) {
+            String result = "%cast." + tmpCount++;
             body.append("  ").append(result).append(" = sitofp ").append(val.type)
                  .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
             return new LLVMValue(result, targetType);
         }
 
-        // Float to float
-        if (isFloatType(targetType) && isFloatType(val.type)) {
-            if (val.type.equals("float") && targetType.equals("double")) {
-                body.append("  ").append(result).append(" = fpext float ").append(val.value).append(" to double\n");
-            } else if (val.type.equals("double") && targetType.equals("float")) {
-                body.append("  ").append(result).append(" = fptrunc double ").append(val.value).append(" to float\n");
+        // Float → wider/equal float: exact widening.
+        if (isFloatType(targetType) && val.type.equals("float") && targetType.equals("double")) {
+            String result = "%cast." + tmpCount++;
+            body.append("  ").append(result).append(" = fpext float ").append(val.value).append(" to double\n");
+            return new LLVMValue(result, targetType);
+        }
+
+        // double → float: overflow check (|v| > FLT_MAX fails; NaN passes through as NaN).
+        if (isFloatType(targetType) && val.type.equals("double") && targetType.equals("float")) {
+            String ge = "%cast.fge." + tmpCount++;
+            body.append("  ").append(ge).append(" = fcmp oge double ").append(val.value)
+                 .append(", -3.4028234663852886E+38\n");
+            String le = "%cast.fle." + tmpCount++;
+            body.append("  ").append(le).append(" = fcmp ole double ").append(val.value)
+                 .append(", 3.4028234663852886E+38\n");
+            String inRange = "%cast.fin." + tmpCount++;
+            body.append("  ").append(inRange).append(" = and i1 ").append(ge).append(", ").append(le).append("\n");
+            String isNan = "%cast.fnan." + tmpCount++;
+            body.append("  ").append(isNan).append(" = fcmp uno double ").append(val.value).append(", ").append(val.value).append("\n");
+            String ok = "%cast.fok." + tmpCount++;
+            body.append("  ").append(ok).append(" = or i1 ").append(inRange).append(", ").append(isNan).append("\n");
+            String r = emitChecked(ok, "Cannot cast to 'float': value out of range", line, force, "0.0", "float", () -> {
+                String c = "%cast." + tmpCount++;
+                body.append("  ").append(c).append(" = fptrunc double ").append(val.value).append(" to float\n");
+                return c;
+            });
+            return new LLVMValue(r, targetType);
+        }
+
+        // Float → integer: range (+NaN) checked — fptosi is poison out of range.
+        if (!isFloatType(targetType) && isFloatType(val.type)) {
+            // fptosi needs a double; fpext float first (always exact).
+            final String srcValue;
+            if (val.type.equals("float")) {
+                String ext = "%cast.fext." + tmpCount++;
+                body.append("  ").append(ext).append(" = fpext float ").append(val.value).append(" to double\n");
+                srcValue = ext;
+            } else {
+                srcValue = val.value;
             }
-            return new LLVMValue(result, targetType);
+            String min, upper;
+            if (targetType.equals("i8")) { min = "-1.28E+02"; upper = "1.28E+02"; }
+            else if (targetType.equals("i32")) { min = "-2.147483648E+09"; upper = "2.147483648E+09"; }
+            else { min = "-9.223372036854775808E+18"; upper = "9.223372036854775808E+18"; }
+            // NaN fails both ordered compares, so this test also rejects NaN.
+            String ge = "%cast.ge." + tmpCount++;
+            body.append("  ").append(ge).append(" = fcmp oge double ").append(srcValue).append(", ").append(min).append("\n");
+            String lt = "%cast.lt." + tmpCount++;
+            body.append("  ").append(lt).append(" = fcmp olt double ").append(srcValue).append(", ").append(upper).append("\n");
+            String ok = "%cast.in." + tmpCount++;
+            body.append("  ").append(ok).append(" = and i1 ").append(ge).append(", ").append(lt).append("\n");
+            String r = emitChecked(ok, "Cannot cast to '" + cangTarget + "': value out of range",
+                line, force, "0", targetType, () -> {
+                    String c = "%cast." + tmpCount++;
+                    body.append("  ").append(c).append(" = fptosi double ").append(srcValue)
+                         .append(" to ").append(targetType).append("\n");
+                    return c;
+                });
+            return new LLVMValue(r, targetType);
         }
 
-        // Int to int
-        int fromBits = llvmTypeBits(val.type);
-        int toBits = llvmTypeBits(targetType);
-        if (fromBits > 0 && toBits > 0) {
-            if (toBits > fromBits) {
-                // i1 (bool) zero-extends so true stays 1; signed integers must sign-extend
-                // or int(-5) would widen to 4294967291.
-                String widen = val.type.equals("i1") ? "zext" : "sext";
-                body.append("  ").append(result).append(" = ").append(widen).append(" ").append(val.type)
-                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
-            } else if (toBits < fromBits) {
-                body.append("  ").append(result).append(" = trunc ").append(val.type)
-                     .append(" ").append(val.value).append(" to ").append(targetType).append("\n");
-            }
-            return new LLVMValue(result, targetType);
-        }
-
-        // bool to int
-        if (val.type.equals("i1") && llvmTypeBits(targetType) > 1) {
-            body.append("  ").append(result).append(" = zext i1 ").append(val.value)
-                 .append(" to ").append(targetType).append("\n");
-            return new LLVMValue(result, targetType);
-        }
-
-        // Fallback: just change type label (shouldn't happen often)
-        return new LLVMValue(val.value, targetType);
+        // Fallback: relabel (unreachable for the supported cast matrix).
+        String result = "%cast." + tmpCount++;
+        return new LLVMValue(result, targetType);
     }
 
     /**
-     * Convert String to number using atoi/atol/atof.
-     * int("123") 閳?123, double("3.14") 閳?3.14, long("100") 閳?100
+     * Branch on {@code ok}: the true path emits {@code convert} and joins; the false path
+     * raises a catchable runtime error (force) or yields {@code defaultValue} (safe).
+     * Returns the phi register holding the cast result.
      */
-    private LLVMValue generateStringToNumber(LLVMValue strVal, String cangTargetType, String llvmTargetType) {
-        String result = "%str2num." + tmpCount++;
-
-        switch (cangTargetType) {
-            case "byte":
-                // atoi returns i32, then trunc to i8
-                String byteTmp = "%str2num.i32." + tmpCount++;
-                body.append("  ").append(byteTmp).append(" = call i32 @atoi(i8* ").append(strVal.value).append(")\n");
-                body.append("  ").append(result).append(" = trunc i32 ").append(byteTmp).append(" to i8\n");
-                break;
-            case "int":
-                body.append("  ").append(result).append(" = call i32 @atoi(i8* ").append(strVal.value).append(")\n");
-                break;
-            case "long":
-                // Use sscanf with %lld for 64-bit parsing
-                String longFmt = "@.fmt.sscanf.long";
-                if (!header.toString().contains(longFmt)) {
-                    header.append(longFmt).append(" = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
-                }
-                // Allocate temp, sscanf writes to it, then load
-                String longPtr = "%long.ptr." + tmpCount++;
-                body.append("  ").append(longPtr).append(" = alloca i64\n");
-                body.append("  call i32 @sscanf(i8* ").append(strVal.value)
-                     .append(", i8* ").append(longFmt)
-                     .append(", i64* ").append(longPtr).append(")\n");
-                body.append("  ").append(result).append(" = load i64, i64* ").append(longPtr).append("\n");
-                break;
-            case "float":
-                // atof returns double, then fptrunc to float
-                String floatTmp = "%str2num.f64." + tmpCount++;
-                body.append("  ").append(floatTmp).append(" = call double @atof(i8* ").append(strVal.value).append(")\n");
-                body.append("  ").append(result).append(" = fptrunc double ").append(floatTmp).append(" to float\n");
-                break;
-            case "double":
-                body.append("  ").append(result).append(" = call double @atof(i8* ").append(strVal.value).append(")\n");
-                break;
-            default:
-                throw new RuntimeException("Cannot convert String to " + cangTargetType);
+    private String emitChecked(String okCond, String message, int line, boolean force,
+                               String defaultValue, String phiType,
+                               java.util.function.Supplier<String> convert) {
+        int id = labelCount++;
+        String okL = "cast.ok." + id, failL = "cast.bad." + id, joinL = "cast.join." + id;
+        body.append("  br i1 ").append(okCond).append(", label %").append(okL)
+             .append(", label %").append(failL).append("\n");
+        body.append(okL).append(":\n");
+        String converted = convert.get();
+        body.append("  br label %").append(joinL).append("\n");
+        body.append(failL).append(":\n");
+        String failPred = failL;
+        if (force) {
+            String resumeL = "cast.rcv." + id;
+            emitRuntimeError(message, line, resumeL);
+            body.append(resumeL).append(":\n");
+            failPred = resumeL;
         }
+        body.append("  br label %").append(joinL).append("\n");
+        body.append(joinL).append(":\n");
+        String r = "%cast.chk." + tmpCount++;
+        body.append("  ").append(r).append(" = phi ").append(phiType)
+             .append(" [ ").append(converted).append(", %").append(okL).append(" ], [ ")
+             .append(defaultValue).append(", %").append(failPred).append(" ]\n");
+        return r;
+    }
 
-        return new LLVMValue(result, llvmTargetType);
+    /**
+     * String → number: strict full-consume parse (strtoll/strtod + end-pointer guard, no
+     * surrounding whitespace tolerance — a cast is not parseInt). Parse failure or a
+     * value outside the target range is a cast failure: force → catchable runtime error,
+     * safe → 0. Values are parsed as i64/double first, then the usual range checks apply.
+     */
+    private LLVMValue generateStringToNumber(LLVMValue strVal, String cangTargetType, String llvmTargetType,
+                                             int line, boolean force) {
+        boolean dbl = cangTargetType.equals("float") || cangTargetType.equals("double");
+        int id = labelCount++;
+        String okL = "s2n.ok." + id, failL = "s2n.fail." + id, joinL = "s2n.join." + id;
+        String resumeL = "s2n.rcv." + id;
+        String parsedType = dbl ? "double" : "i64";
+
+        // Null string: no value to parse — same failure path as an unparsable one.
+        String isNull = "%s2n.isnull." + tmpCount++;
+        body.append("  ").append(isNull).append(" = icmp eq i8* ").append(strVal.value).append(", null\n");
+
+        String epSlot = "%s2n.ep." + tmpCount++;
+        body.append("  ").append(epSlot).append(" = alloca i8*\n");
+        String parsed = "%s2n.v." + tmpCount++;
+        // strtoll/strtod on a null pointer is UB — branch first.
+        String parseL = "s2n.parse." + id;
+        body.append("  br i1 ").append(isNull).append(", label %").append(failL)
+             .append(", label %").append(parseL).append("\n");
+        body.append(parseL).append(":\n");
+        if (dbl) {
+            body.append("  ").append(parsed).append(" = call double @strtod(i8* ").append(strVal.value)
+                 .append(", i8** ").append(epSlot).append(")\n");
+        } else {
+            body.append("  ").append(parsed).append(" = call i64 @strtoll(i8* ").append(strVal.value)
+                 .append(", i8** ").append(epSlot).append(", i32 10)\n");
+        }
+        String ep = "%s2n.epv." + tmpCount++;
+        body.append("  ").append(ep).append(" = load i8*, i8** ").append(epSlot).append("\n");
+        String c = "%s2n.c." + tmpCount++;
+        body.append("  ").append(c).append(" = load i8, i8* ").append(ep).append("\n");
+        // Full-consume: at least one character consumed AND the end pointer is at '\0'.
+        String consumed = "%s2n.cons." + tmpCount++;
+        body.append("  ").append(consumed).append(" = icmp ne i8* ").append(ep).append(", ").append(strVal.value).append("\n");
+        String term = "%s2n.term." + tmpCount++;
+        body.append("  ").append(term).append(" = icmp eq i8 ").append(c).append(", 0\n");
+        String ok = "%s2n.pok." + tmpCount++;
+        body.append("  ").append(ok).append(" = and i1 ").append(consumed).append(", ").append(term).append("\n");
+        body.append("  br i1 ").append(ok).append(", label %").append(okL)
+             .append(", label %").append(failL).append("\n");
+        body.append(okL).append(":\n");
+        body.append("  br label %").append(joinL).append("\n");
+        body.append(failL).append(":\n");
+        String failPred = failL;
+        if (force) {
+            emitRuntimeError("Cannot convert String to '" + cangTargetType + "'", line, resumeL);
+            body.append(resumeL).append(":\n");
+            failPred = resumeL;
+        }
+        body.append("  br label %").append(joinL).append("\n");
+        body.append(joinL).append(":\n");
+        // On the null/unparsable path `parsed` is undefined — the phi takes the zero default.
+        String zero = dbl ? "0.0" : "0";
+        String v = "%s2n.parsed." + tmpCount++;
+        body.append("  ").append(v).append(" = phi ").append(parsedType)
+             .append(" [ ").append(parsed).append(", %").append(okL).append(" ], [ ")
+             .append(zero).append(", %").append(failPred).append(" ]\n");
+
+        // Range-check the parsed value against the real target (int/byte narrowing, f64→f32).
+        return convertNumeric(new LLVMValue(v, parsedType), cangTargetType, llvmTargetType, line, force);
     }
 
     private LLVMValue generateListMethod(LLVMValue list, String listType, String method, List<AST> args, int line) {
@@ -6438,10 +6575,10 @@ public class LLVMGen {
             }
             FuncInfo fi = resolveOverload(overloadGroups.get(node.method), node.args, node.line);
             if (fi == null) {
-                // Class-name callee with one argument: downcast `Apple(fruitRef)` — parsed as a
-                // call (parser has no symbol table); a global function of that name wins when present.
+                // `Apple(fruitRef)` used to be the downcast; it is now a plain (unknown) call.
                 if (node.args.size() == 1 && classes.containsKey(node.method)) {
-                    return generateClassCast(generateExpr(node.args.get(0)), node.method, node.line);
+                    throw new RuntimeException("'" + node.method + "(...)' cast syntax has been removed, use "
+                        + node.method + "!$(...) or " + node.method + "$(...) (at line " + node.line + ")");
                 }
                 throw new RuntimeException("Unknown function: " + node.method);
             }

@@ -121,8 +121,10 @@ public abstract class AST {
     public static class TypeCastExpr extends AST {
         public String targetType;
         public AST expr;
-        public TypeCastExpr(String targetType, AST expr, int line) {
-            super(line); this.targetType = targetType; this.expr = expr;
+        /** true = Type!$(expr) 强制转换（失败运行时报错）；false = Type$(expr) 安全转换（失败返回 null/默认值）。 */
+        public boolean force;
+        public TypeCastExpr(String targetType, AST expr, int line, boolean force) {
+            super(line); this.targetType = targetType; this.expr = expr; this.force = force;
         }
     }
 
