@@ -10084,13 +10084,74 @@ public class LLVMGen {
         header.append("miss:\n");
         header.append("  ret i8* null\n");
         header.append("}\n\n");
+        emitFieldListHelper();
+    }
+
+    /**
+     * Field.list runtime helper @cang.field.list(i32 %tid): walk the metadata range for
+     * %tid and return a String[] (standard array ABI: [i64 count][i8* elements...]) of
+     * the field-name pointers stored in @cang.fieldmeta.tab. The pointers are compile-time
+     * string constants shared with the table — no per-name copy. Zero fields → empty array.
+     */
+    private void emitFieldListHelper() {
+        if (header.toString().contains("define i8* @cang.field.list(")) return;
+        String alloc = allocFn();
+        int size = classNameTableSize();
+        int total = 0;
+        ClassInfo[] byId = new ClassInfo[size];
+        for (ClassInfo ci : classes.values()) {
+            if (ci.typeId >= 0 && ci.typeId < size) byId[ci.typeId] = ci;
+        }
+        for (int i = 0; i < size; i++) {
+            ClassInfo ci = byId[i];
+            if (ci != null) {
+                for (String fn : ci.fieldNames) if (!fn.equals("_dummy")) total++;
+            }
+        }
+        header.append("define i8* @cang.field.list(i32 %tid) {\n");
+        header.append("entry:\n");
+        header.append("  %n = zext i32 %tid to i64\n");
+        header.append("  %rp = getelementptr [").append(size).append(" x { i32, i32 }], [")
+             .append(size).append(" x { i32, i32 }]* @cang.fieldmeta.range, i64 0, i64 %n\n");
+        header.append("  %sp = getelementptr { i32, i32 }, { i32, i32 }* %rp, i32 0, i32 0\n");
+        header.append("  %start = load i32, i32* %sp\n");
+        header.append("  %cp = getelementptr { i32, i32 }, { i32, i32 }* %rp, i32 0, i32 1\n");
+        header.append("  %cnt = load i32, i32* %cp\n");
+        header.append("  %cnt64 = zext i32 %cnt to i64\n");
+        header.append("  %dsz = shl i64 %cnt64, 3\n");
+        header.append("  %tsz = add i64 %dsz, 8\n");
+        header.append("  %arr = call i8* @").append(alloc).append("(i64 %tsz)\n");
+        header.append("  store i64 %cnt64, i64* %arr\n");
+        header.append("  %data = getelementptr i8, i8* %arr, i64 8\n");
+        header.append("  %typed = bitcast i8* %data to i8**\n");
+        header.append("  %s64 = zext i32 %start to i64\n");
+        header.append("  %i = alloca i64\n  store i64 0, i64* %i\n");
+        header.append("  br label %loop\n");
+        header.append("loop:\n");
+        header.append("  %iv = load i64, i64* %i\n");
+        header.append("  %go = icmp slt i64 %iv, %cnt64\n");
+        header.append("  br i1 %go, label %body, label %done\n");
+        header.append("body:\n");
+        header.append("  %gi = add i64 %s64, %iv\n");
+        header.append("  %ep = getelementptr [").append(total).append(" x { i8*, i8*, i32 }], [")
+             .append(total).append(" x { i8*, i8*, i32 }]* @cang.fieldmeta.tab, i64 0, i64 %gi\n");
+        header.append("  %np = getelementptr { i8*, i8*, i32 }, { i8*, i8*, i32 }* %ep, i32 0, i32 0\n");
+        header.append("  %name = load i8*, i8** %np\n");
+        header.append("  %slot = getelementptr i8*, i8** %typed, i64 %iv\n");
+        header.append("  store i8* %name, i8** %slot\n");
+        header.append("  %iv2 = add i64 %iv, 1\n");
+        header.append("  store i64 %iv2, i64* %i\n");
+        header.append("  br label %loop\n");
+        header.append("done:\n");
+        header.append("  ret i8* %arr\n");
+        header.append("}\n\n");
     }
 
     // ==================== Field reflection (builtin Field class) ====================
 
     /** Methods on the builtin Field class (stdlib/cang/lang/Field.cang) generated intrinsically. */
     private static final java.util.Set<String> FIELD_ACCESSOR_METHODS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "getObject", "getString", "getInt", "getLong", "getByte", "getBool", "getFloat", "getDouble", "getType"));
+        "getObject", "getString", "getInt", "getLong", "getByte", "getBool", "getFloat", "getDouble", "getType", "list"));
 
     /** Accessor method -> expected primitive field type (getObject/getType are absent). */
     private static final Map<String, String> FIELD_PRIM_METHODS = new java.util.LinkedHashMap<>();
@@ -10145,6 +10206,14 @@ public class LLVMGen {
     private LLVMValue generateFieldAccessor(ClassInfo fieldCi, LLVMValue recv, MethodCallExpr node) {
         String m = node.method;
         String expectedPrim = FIELD_PRIM_METHODS.get(m); // null for getObject/getType
+        // Field.list(): no field-name argument — enumerate every field of the target via
+        // the shared metadata table. Returns the standard String[] array ABI.
+        if (m.equals("list")) {
+            if (!node.args.isEmpty()) {
+                throw new RuntimeException("Field.list expects no arguments (at line " + node.line + ")");
+            }
+            return generateFieldList(fieldCi, recv, node);
+        }
         if (node.args.size() != 1) {
             throw new RuntimeException("Field." + m + " expects exactly one field-name argument (at line " + node.line + ")");
         }
@@ -10346,6 +10415,45 @@ public class LLVMGen {
         body.append("  ").append(phi).append(" = phi i8* [ ").append(mem).append(", %").append(okP)
              .append(" ], [ ").append(rv).append(", %").append(nextSR).append(" ]\n");
         return new LLVMValue(phi, "%cang_lang_Object*");
+    }
+
+    /**
+     * Field.list(): load the bound target, null-check it, read the runtime typeId, then
+     * call @cang.field.list to build a String[] (standard array ABI) of every field name
+     * registered for that type in the metadata table — parent fields first, own fields
+     * after (the same order collectClass records them). Field name pointers are shared
+     * with the metadata table (compile-time string constants), not copied.
+     */
+    private LLVMValue generateFieldList(ClassInfo fieldCi, LLVMValue recv, MethodCallExpr node) {
+        int id = labelCount++;
+        String nx = "fa.list." + id;
+
+        String recvBase = fieldCi.llvmName.substring(1);
+        int tgtOff = fieldCi.fieldIndices.get("target");
+        String tgtPtr = "%fa.tp." + tmpCount++;
+        body.append("  ").append(tgtPtr).append(" = getelementptr %").append(recvBase)
+             .append(", %").append(recvBase).append("* ").append(recv.value)
+             .append(", i32 0, i32 ").append(tgtOff).append("\n");
+        String tgt = "%fa.tgt." + tmpCount++;
+        body.append("  ").append(tgt).append(" = load %cang_lang_Object*, %cang_lang_Object** ").append(tgtPtr).append("\n");
+        String tNull = "%fa.tn." + tmpCount++;
+        body.append("  ").append(tNull).append(" = icmp eq %cang_lang_Object* ").append(tgt).append(", null\n");
+        String errT = nx + ".nulltgt", okT = nx + ".tgt";
+        body.append("  br i1 ").append(tNull).append(", label %").append(errT).append(", label %").append(okT).append("\n");
+        body.append(errT).append(":\n");
+        emitRuntimeError("Field.list: target object is null", node.line, okT);
+        body.append(okT).append(":\n");
+
+        String tidPtr = "%fa.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr %cang_lang_Object, %cang_lang_Object* ")
+             .append(tgt).append(", i32 0, i32 0\n");
+        String tid = "%fa.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+        emitFieldMeta();
+        emitFieldListHelper();
+        String arr = "%fa.arr." + tmpCount++;
+        body.append("  ").append(arr).append(" = call i8* @cang.field.list(i32 ").append(tid).append(")\n");
+        return new LLVMValue(arr, "i8*", "Array<String>");
     }
 
     /**

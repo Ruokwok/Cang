@@ -32,3 +32,10 @@ native func double getDouble(String name)
 
 # 字段类型名：int/long/byte/bool/float/double；引用类型返回类的全限定名
 native func String getType(String name)
+
+# 列出目标对象的全部字段名（声明顺序：先父类字段后本类字段；不含编译器占位）。
+# 返回 String[] 快照，可直接 for-each / length() / 下标访问：
+#   String[] names = f.list()
+#   for (String n : names) { Stdout.println(n + " = " + f.getType(n)) }
+# 目标对象为 null → 运行时错误（同其他访问器）。
+native func String[] list()
