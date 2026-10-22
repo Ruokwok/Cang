@@ -503,10 +503,12 @@ public class LLVMGen {
         if (mainFi.paramTypes.isEmpty()) {
             // static void main() — the args array is still initialized so System.ARGS works.
             body.append("  call void @").append(mainFi.llvmName).append("()\n");
+            emitBoundaryUnwindCheck(body);
         } else {
             String argsV = "%main.args." + tmpCount++;
             body.append("  ").append(argsV).append(" = load i8*, i8** @system.args\n");
             body.append("  call void @").append(mainFi.llvmName).append("(i8* ").append(argsV).append(")\n");
+            emitBoundaryUnwindCheck(body);
         }
 
         emitGcFramePop();
@@ -1179,6 +1181,7 @@ public class LLVMGen {
             String result = "%disp.val." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(retType)
                  .append(" @").append(symOf(target)).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             body.append("  store ").append(retType).append(" ").append(result)
                  .append(", ").append(retType).append("* ").append(phiSlot).append("\n");
             body.append("  br label %").append(endLabel).append("\n\n");
@@ -1243,6 +1246,7 @@ public class LLVMGen {
                     .append(castValue(argVal, toLLVMType(paramType)));
             }
             body.append("  call void @").append(symOf(target)).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             body.append("  br label %").append(endLabel).append("\n\n");
 
             // Next label
@@ -1448,6 +1452,10 @@ public class LLVMGen {
         header.append("declare double @llvm.exp.f64(double)\n");
         header.append("declare void @exit(i32)\n");
         header.append("@cang.current.error = global i8* null\n");
+        // Cross-function exception propagation (flag-based unwinding): a throw with no
+        // local handler sets these and returns; every user-call site checks the flag.
+        header.append("@cang.err.pending = global i32 0\n");
+        header.append("@cang.err.line = global i32 0\n");
         header.append("declare void @cang_throw(i8*)\n");
         header.append("declare i8* @getenv(i8*)\n");
         header.append("declare i64 @time(i64*)\n");
@@ -1770,6 +1778,7 @@ public class LLVMGen {
                         args.append(", ").append(argVal.type).append(" ").append(argVal.value);
                     }
                     body.append("  call void @").append(parentCtor).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
                 }
             }
         }
@@ -1900,6 +1909,7 @@ public class LLVMGen {
                     }
                     String pSym = pfi.llvmName != null ? pfi.llvmName : pfi.name;
                     body.append("  call void @").append(pSym).append("(").append(pargs).append(")\n");
+            emitPostCallUnwindCheck();
                 }
             }
         }
@@ -2183,11 +2193,7 @@ public class LLVMGen {
         String raw = "%runtime.error." + tmpCount++;
         body.append("  ").append(raw).append(" = bitcast ").append(error.type).append(" ").append(error.value).append(" to i8*\n");
         body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
-        if (exceptionHandlers.isEmpty()) {
-            emitUncaughtError(line);
-        } else {
-            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
-        }
+        emitUnwindOrHandler(line);
         // Unreachable continuation so following code keeps forming a valid block.
         body.append("runtime.error.dead.").append(runtimeErrorCount++).append(":\n");
         body.append("  br label %").append(continuationLabel).append("\n");
@@ -2282,8 +2288,11 @@ public class LLVMGen {
         String raw = "%throw.raw." + tmpCount++;
         body.append("  ").append(raw).append(" = bitcast ").append(value.type).append(" ").append(value.value).append(" to i8*\n");
         body.append("  store i8* ").append(raw).append(", i8** @cang.current.error\n");
+        body.append("  store i32 ").append(Math.max(1, line)).append(", i32* @cang.err.line\n");
         if (exceptionHandlers.isEmpty()) {
-            emitUncaughtError(line);
+            // No local catch: mark pending and return from this function so the caller's
+            // post-call check picks it up (Java-style cross-function propagation).
+            emitStartPropagation();
             body.append("throw.dead.").append(labelCount++).append(":\n");
         } else {
             // Throw from a CATCH clause: inline every enclosing finally before propagating
@@ -2299,6 +2308,150 @@ public class LLVMGen {
             // Statements after throw are dead code but must still form a valid LLVM block.
             body.append("throw.dead.").append(labelCount++).append(":\n");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-function exception propagation (flag-based unwinding).
+    // A throw with no local handler stores @cang.err.pending = 1 and returns from the
+    // current function; every user-function/method/constructor call site checks the
+    // flag afterwards: with a local catch it is absorbed (cleared, jump to handler),
+    // otherwise the frame returns too — unwinding one frame per call boundary.
+    // ------------------------------------------------------------------
+
+    /** Set the pending flag and return from the current function (inline finally layers first). */
+    private void emitStartPropagation() {
+        body.append("  store i32 1, i32* @cang.err.pending\n");
+        emitUnwindReturn();
+    }
+
+    /**
+     * After a user-function/method/constructor call: if the pending flag is set, absorb
+     * the error into the lexically enclosing catch (clearing the flag) or return from
+     * this function to keep unwinding. Ends by opening a fresh block for the code that
+     * follows the call site.
+     */
+    private void emitPostCallUnwindCheck() {
+        int id = labelCount++;
+        String p = "%ehc.p." + tmpCount++;
+        String nz = "%ehc.nz." + tmpCount++;
+        String cont = "eh.cont." + id;
+        String unw = "eh.unw." + id;
+        body.append("  ").append(p).append(" = load i32, i32* @cang.err.pending\n");
+        body.append("  ").append(nz).append(" = icmp ne i32 ").append(p).append(", 0\n");
+        body.append("  br i1 ").append(nz).append(", label %").append(unw).append(", label %").append(cont).append("\n");
+        body.append(unw).append(":\n");
+        if (exceptionHandlers.isEmpty()) {
+            emitUnwindReturn();
+        } else {
+            body.append("  store i32 0, i32* @cang.err.pending\n");
+            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+        }
+        body.append(cont).append(":\n");    }
+
+    /** Return from the current function while unwinding: inline finally layers, pop the
+     *  GC frame, then ret (void) or ret a zero/default value (the caller discards it when
+     *  the pending flag is set). */
+    private void emitUnwindReturn() {
+        abandonRegion();
+        boolean hadFinally = !finallyStack.isEmpty();
+        boolean swallowed = inlineFinallyLayers();
+        if (swallowed) {
+            // A finally layer returned or threw itself: it decides the control flow.
+            body.append("uh.dead.").append(labelCount++).append(":\n");
+            body.append("  unreachable\n");
+            return;
+        }
+        emitGcFramePop();
+        String retType = currentFuncReturnType;
+        if (retType == null || retType.equals("void")) {
+            body.append("  ret void\n");
+        } else {
+            String llvm = toLLVMType(retType);
+            body.append("  ret ").append(llvm).append(" ").append(defaultLLVMValue(llvm)).append("\n");
+        }
+        // Statements still left in the caller's buffer after this ret are dead code; they
+        // must not dangle as an unterminated block.
+        body.append("uh.dead.").append(labelCount++).append(":\n");
+        body.append("  unreachable\n");
+    }
+
+    /** Unwind decision shared by runtime-error emitters: jump to the local catch, or
+     *  start propagating to the caller (the Error object was already stored by them).
+     *  Callers append their own dead continuation block afterwards. */
+    private void emitUnwindOrHandler(int line) {
+        if (exceptionHandlers.isEmpty()) {
+            body.append("  store i32 ").append(Math.max(1, line)).append(", i32* @cang.err.line\n");
+            emitStartPropagation();
+        } else {
+            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
+        }
+    }
+
+    /** Zero/default value for an LLVM type, used by unwind returns (callers never use it). */
+    private String defaultLLVMValue(String llvmType) {
+        switch (llvmType) {
+            case "i1": return "false";
+            case "i8": case "i16": case "i32": case "i64": return "0";
+            case "float": return "0.0";
+            case "double": return "0.0";
+            case "%CangFunction": return "zeroinitializer";
+            default: return "null";
+        }
+    }
+
+    /** Post-call check for boundary wrappers (process main / thread entry): a pending flag
+     *  here means the exception escaped every function — print it and exit(1). */
+    private void emitBoundaryUnwindCheck(StringBuilder out) {
+        int id = labelCount++;
+        String p = "%ehb.p." + tmpCount++;
+        String nz = "%ehb.nz." + tmpCount++;
+        String cont = "eh.bcont." + id;
+        String unw = "eh.bunw." + id;
+        out.append("  ").append(p).append(" = load i32, i32* @cang.err.pending\n");
+        out.append("  ").append(nz).append(" = icmp ne i32 ").append(p).append(", 0\n");
+        out.append("  br i1 ").append(nz).append(", label %").append(unw).append(", label %").append(cont).append("\n");
+        out.append(unw).append(":\n");
+        emitUncaughtFinal(out);
+        out.append(cont).append(":\n");
+    }
+
+    /** Print the pending error (message from @cang.current.error when Error is known) with
+     *  the runtime throw line, then exit(1). Used by main and thread-entry boundaries. */
+    private void emitUncaughtFinal(StringBuilder out) {
+        out.append("  store i32 0, i32* @cang.err.pending\n");
+        String msgReg;
+        ClassInfo errorInfo = classes.get("Error");
+        if (errorInfo != null && errorInfo.fieldIndices.containsKey("message")) {
+            String raw = "%uf.raw." + tmpCount++;
+            String isnul = "%uf.isnul." + tmpCount++;
+            String typed = "%uf.err." + tmpCount++;
+            String fptr = "%uf.msgp." + tmpCount++;
+            String msg = "%uf.msg." + tmpCount++;
+            String use = "%uf.use." + tmpCount++;
+            out.append("  ").append(raw).append(" = load i8*, i8** @cang.current.error\n");
+            out.append("  ").append(isnul).append(" = icmp eq i8* ").append(raw).append(", null\n");
+            out.append("  ").append(typed).append(" = bitcast i8* ").append(raw).append(" to ").append(errorInfo.llvmName).append("*\n");
+            out.append("  ").append(fptr).append(" = getelementptr ").append(errorInfo.llvmName)
+                 .append(", ").append(errorInfo.llvmName).append("* ").append(typed)
+                 .append(", i32 0, i32 ").append(errorInfo.fieldIndices.get("message")).append("\n");
+            out.append("  ").append(msg).append(" = load i8*, i8** ").append(fptr).append("\n");
+            String fallback = ensureStringConstant("@.str.uncaught", "uncaught exception\\0A\\00", 20);
+            out.append("  ").append(use).append(" = select i1 ").append(isnul).append(", i8* ").append(fallback)
+                 .append(", i8* ").append(msg).append("\n");
+            msgReg = use;
+        } else {
+            msgReg = ensureStringConstant("@.str.uncaught", "uncaught exception\\0A\\00", 20);
+        }
+        String fileName = ensureStringConstant("@.str.srcfile", escapeBytes(sourceFile.replace('\\', '/')) + "\\00", utf8Len(sourceFile) + 1);
+        ensureStringConstant("@.str.locfmt", "  at %s:%d\\0A\\00", 12);
+        String line = "%uf.line." + tmpCount++;
+        out.append("  ").append(line).append(" = load i32, i32* @cang.err.line\n");
+        out.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([11 x i8], [11 x i8]* @.str.errprefix, i32 0, i32 0), i8* ")
+             .append(msgReg).append(")\n");
+        out.append("  call i32 (i8*, ...) @printf(i8* getelementptr ([12 x i8], [12 x i8]* @.str.locfmt, i32 0, i32 0), i8* ")
+             .append(fileName).append(", i32 ").append(line).append(")\n");
+        out.append("  call void @exit(i32 1)\n");
+        out.append("  unreachable\n");
     }
 
     // ------------------------------------------------------------------
@@ -2712,9 +2865,9 @@ public class LLVMGen {
             if (!exceptionHandlers.isEmpty()) {
                 body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
             } else {
-                emitUncaughtError(stmt.line);
-                body.append("runtime.rethrow.dead.").append(labelCount++).append(":\n");
-                // emitUncaughtError terminates the uncaught block; continue in a dead block.
+                // No outer handler in this function: propagate to the caller instead.
+                emitStartPropagation();
+                body.append("prop.dead.").append(labelCount++).append(":\n");
                 body.append("  br label %").append(continueLabel).append("\n");
             }
             body.append(continueLabel).append(":\n");
@@ -2753,6 +2906,20 @@ public class LLVMGen {
         int lastBreak = trimmed.lastIndexOf('\n');
         String lastLine = (lastBreak >= 0 ? trimmed.substring(lastBreak + 1) : trimmed).trim();
         return lastLine.startsWith("ret ") || lastLine.startsWith("br ") || lastLine.equals("unreachable");
+    }
+
+    /** The label currently open in `body` (last plain `xxx:` line). Post-call unwind checks
+     *  re-open blocks inside expression arms, so phi preds must name the real branching
+     *  block rather than the arm label. */
+    private String currentBlockName() {
+        String[] lines = body.toString().split("\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i].trim();
+            if (line.endsWith(":") && !line.contains(" ") && line.matches("[A-Za-z0-9_.]+:")) {
+                return line.substring(0, line.length() - 1);
+            }
+        }
+        return "entry";
     }
 
     /** True when a class derives (transitively) from cang/lang/Error. */
@@ -5602,19 +5769,24 @@ public class LLVMGen {
         body.append(tLabel).append(":\n");
         LLVMValue trueVal = generateExpr(node.trueExpr);
         String tOp = castValue(trueVal, trueVal.type);
+        // The post-call unwind check may split this arm into an eh.cont block; the phi
+        // pred must be the block that actually branches to the join, so scan for the
+        // currently open block instead of trusting the arm label.
+        String tPred = currentBlockName();
         body.append("  br label %").append(joinLabel).append("\n\n");
 
         body.append(fLabel).append(":\n");
         LLVMValue falseVal = generateExpr(node.falseExpr);
         // Casts must be emitted inside their own block (phi has to be first in the join block).
         String fOp = castValue(falseVal, trueVal.type);
+        String fPred = currentBlockName();
         body.append("  br label %").append(joinLabel).append("\n\n");
 
         body.append(joinLabel).append(":\n");
         String result = "%ternary." + tmpCount++;
         body.append("  ").append(result).append(" = phi ").append(trueVal.type)
-             .append(" [ ").append(tOp).append(", %").append(tLabel)
-             .append(" ], [ ").append(fOp).append(", %").append(fLabel).append(" ]\n");
+             .append(" [ ").append(tOp).append(", %").append(tPred)
+             .append(" ], [ ").append(fOp).append(", %").append(fPred).append(" ]\n");
         return new LLVMValue(result, trueVal.type);
     }
 
@@ -6620,11 +6792,13 @@ public class LLVMGen {
             if (fi.returnType.equals("void")) {
                 String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
             body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
+                emitPostCallUnwindCheck();
                 return new LLVMValue("void", "void");
             } else {
                 String result = "%call." + tmpCount++;
                 body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                      .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
+                emitPostCallUnwindCheck();
                 String retSem = (callResultCarriesSemantic(fi.returnType))
                     ? fi.returnType : null;
                 return new LLVMValue(result, toLLVMType(fi.returnType), retSem);
@@ -6715,11 +6889,13 @@ public class LLVMGen {
         if (fi.returnType.equals("void")) {
             String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
             body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             // Array-returning calls (File.readLines/list) expose their Array<T> semantic type
             // so chained .length() and var-decl element tracking work; Function returns need
             // their signature semantic for checkFunctionValue.
@@ -6953,6 +7129,8 @@ public class LLVMGen {
         }
         fnType.append(")*");
         x.append("  %fp = bitcast i8* %code to ").append(fnType).append("\n");
+        // Thread boundary: exceptions never cross threads (doc 15/17); isolate the flag.
+        x.append("  store i32 0, i32* @cang.err.pending\n");
         if (isVoid) {
             x.append("  call void %fp(").append(args).append(")\n");
         } else {
@@ -6963,6 +7141,7 @@ public class LLVMGen {
             x.append("  %rpt = bitcast i8* %rpp to ").append(retLLVM).append("*\n");
             x.append("  store ").append(retLLVM).append(" %r, ").append(retLLVM).append("* %rpt\n");
         }
+        emitBoundaryUnwindCheck(x);
         if (registerWithGc) {
             x.append("  %gc.sbres3.").append(id).append(" = call i32 @GC_unregister_my_thread(i8* ").append(sb8).append(")\n");
         }
@@ -8061,11 +8240,13 @@ public class LLVMGen {
         if (fi.returnType.equals("void")) {
             String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
             body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             return new LLVMValue("void", "void");
         } else {
             String result = "%call." + tmpCount++;
             body.append("  ").append(result).append(" = call ").append(toLLVMType(fi.returnType))
                  .append(" @").append(fi.llvmName).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
             if (isProcessExec(fi)) {
                 emitSpawnFailThrow(result, line);
             }
@@ -9991,11 +10172,7 @@ public class LLVMGen {
         body.append("  ").append(errI8).append(" = bitcast ").append(errorInfo.llvmName).append("* ")
              .append(errPtr).append(" to i8*\n");
         body.append("  store i8* ").append(errI8).append(", i8** @cang.current.error\n");
-        if (exceptionHandlers.isEmpty()) {
-            emitUncaughtError(line);
-        } else {
-            body.append("  br label %").append(exceptionHandlers.peek()).append("\n");
-        }
+        emitUnwindOrHandler(line);
         body.append("runtime.error.dead.").append(runtimeErrorCount++).append(":\n");
         body.append("  br label %").append(continuationLabel).append("\n");
     }
@@ -10694,6 +10871,7 @@ public class LLVMGen {
             }
             String ctorSym = fi.llvmName != null ? fi.llvmName : fi.name;
             body.append("  call void @").append(ctorSym).append("(").append(args).append(")\n");
+            emitPostCallUnwindCheck();
         }
 
         return new LLVMValue(obj, ci.llvmName + "*",
@@ -13734,11 +13912,13 @@ pb.append("prl.finish.").append(id).append(":\n");
         body.append("  ").append(codePtr).append(" = bitcast i8* ").append(code).append(" to ").append(codeType).append("\n");
         if (returnLLVM.equals("void")) {
             body.append("  call void ").append(codePtr).append("(").append(String.join(", ", callArgs)).append(")\n");
+            emitPostCallUnwindCheck();
             return new LLVMValue("void", "void");
         }
         String result = "%indirect.call." + tmpCount++;
         body.append("  ").append(result).append(" = call ").append(returnLLVM).append(" ")
              .append(codePtr).append("(").append(String.join(", ", callArgs)).append(")\n");
+        emitPostCallUnwindCheck();
         return new LLVMValue(result, returnLLVM);
     }
 
