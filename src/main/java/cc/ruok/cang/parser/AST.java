@@ -54,6 +54,15 @@ public abstract class AST {
         public Identifier(String name, int line) { super(line); this.name = name; }
     }
 
+    /** 类字面量：Apple.class / String.class / int.class。className 随后由 codegen 解析
+     *  import 别名；每个类型在运行时对应一个全局单例 Class 对象。 */
+    public static class ClassLiteralExpr extends AST {
+        public String className;
+        public ClassLiteralExpr(String className, int line) {
+            super(line); this.className = className;
+        }
+    }
+
     public static class LambdaExpr extends AST {
         public List<String> parameters; // may be empty: () -> { ... }
         public AST body;

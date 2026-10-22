@@ -491,6 +491,13 @@ public class Cang {
             addTypeName(a.type, out);
             collectTypeRefs(a.size, out);
             return;
+        } else if (node instanceof AST.ClassLiteralExpr) {
+            AST.ClassLiteralExpr c = (AST.ClassLiteralExpr) node;
+            addTypeName(c.className, out);
+            // The literal's value type is cang.lang.Class: auto-load its stdlib declaration
+            // so `Apple.class` works without an explicit import.
+            addTypeName("Class", out);
+            return;
         } else if (node instanceof AST.TypeCastExpr) {
             AST.TypeCastExpr t = (AST.TypeCastExpr) node;
             addTypeName(t.targetType, out);
@@ -800,7 +807,8 @@ public class Cang {
         "cang/io/File.cang",
         "cang/io/Scanner.cang",
         "cang/lang/ProcessBuilder.cang",
-        "cang/lang/StringBuilder.cang"
+        "cang/lang/StringBuilder.cang",
+        "cang/lang/Class.cang"
     };
 
     /**

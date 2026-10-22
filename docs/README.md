@@ -46,6 +46,7 @@
 | [Function.md](libs/Function.md) | `Function<R,...>` | 函数对象类型声明 |
 | [Error.md](libs/Error.md) | `Error` | 异常基类、message/stack |
 | [Object.md](libs/Object.md) | `Object` | 所有类的隐式根类 |
+| [Class.md](libs/Class.md) | `Class` | 类信息对象：`Apple.class`、名称、父类、单例 |
 
 ## 标准库源码位置
 
@@ -54,4 +55,4 @@ stdlib/cang/lang/    # 自动查找，也可显式 import（支持 as 别名）
 stdlib/cang/io/      # 需显式 import cang/io/File
 ```
 
-当前清单：`Object`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`List`、`Dict`、`cang/io/File`。
+当前清单：`Object`、`Class`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`List`、`Dict`、`cang/io/File`。

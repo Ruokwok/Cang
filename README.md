@@ -219,6 +219,7 @@ stdlib/cang/lang/
 主要文件：
 
 - `Object.cang`：基础对象；
+- `Class.cang`：类信息对象（`Apple.class`，名称/父类/单例）；
 - `Stdout.cang`：输出；
 - `String.cang`：字符串对象接口；
 - `Math.cang`：数学常量和函数；

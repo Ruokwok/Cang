@@ -1,0 +1,48 @@
+namespace cang/lang
+
+# Class - 类信息对象（对应 Java 的 java.lang.Class，不含泛型）。
+# 通过类字面量获取：Apple.class / String.class / int.class。
+# 同一个类在程序中只有一个 Class 实例，因此可直接用 == 比较身份：
+#   if (a.class == b.class) { ... }
+# 类对象由编译器在 main 启动时统一创建，字段只读（私有），通过方法访问。
+# 注意：Class 本身不可 new（_init 私有），也不表示数组类型。
+class Class
+    String _name
+    String _simpleName
+    Class _superClass
+
+    _init() {
+    }
+
+    # 全名（命名空间用 '_' 连接，如 demo_Apple；与 Object.getClassName() 一致）
+    func String getName() {
+        return this._name
+    }
+
+    # 简单类名（如 Apple）
+    func String getSimpleName() {
+        return this._simpleName
+    }
+
+    # 父类 Class；Object、基本类型和 void 返回 null
+    func Class getSuperclass() {
+        return this._superClass
+    }
+
+    # 本类是否与 other 相同、或是 other 的父类/祖先。
+    # 即 Animal.class.isAssignableFrom(Dog.class) == true。
+    func bool isAssignableFrom(Class other) {
+        Class current = other
+        while (current != null) {
+            if (current == this) {
+                return true
+            }
+            current = current._superClass
+        }
+        return false
+    }
+
+    func String toString() {
+        String n = this._name
+        return "class " + n
+    }

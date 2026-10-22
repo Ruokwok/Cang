@@ -1048,6 +1048,16 @@ public class Parser {
         while (true) {
             if (check(TokenType.DOT)) {
                 advance();
+                // Class literal: Type.class (Apple.class / String.class / int.class).
+                // `class` is a keyword, so it can never be a field/method name.
+                if (check(TokenType.CLASS)) {
+                    int classLine = advance().line;
+                    if (!(expr instanceof Identifier)) {
+                        error("'.class' must follow a type name");
+                    }
+                    expr = new ClassLiteralExpr(((Identifier) expr).name, classLine);
+                    continue;
+                }
                 String member = expect(TokenType.IDENT).value;
                 if (check(TokenType.LPAREN)) {
                     // method call
@@ -1241,6 +1251,14 @@ public class Parser {
             if (current().value.equals("string") && peek(1).type == TokenType.LPAREN) {
                 error("'string' cast has been removed, use String!$(...) or String$(...)");
             }
+            return new Identifier(advance().value, line);
+        }
+        // Primitive/String class literals: int.class, bool.class, String.class, void.class.
+        // Type keywords are not ordinary identifiers, so expose them to the postfix chain as
+        // an Identifier wrapping the source spelling; codegen maps it to a Class singleton.
+        if ((check(TokenType.T_BYTE, TokenType.T_INT, TokenType.T_LONG, TokenType.T_FLOAT,
+                  TokenType.T_DOUBLE, TokenType.T_BOOL, TokenType.T_STRING, TokenType.VOID))
+                && peek(1).type == TokenType.DOT && peek(2).type == TokenType.CLASS) {
             return new Identifier(advance().value, line);
         }
         // String.fromCodePoint(...) — 'String' lexes as the T_STRING type keyword; treat it as

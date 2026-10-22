@@ -221,6 +221,15 @@ public class LLVMGen {
         this.gcEnabled = enabled;
     }
 
+    // Class literals (Apple.class): cang.lang.Class was auto-loaded and the singleton table +
+    // @cang.classinit() body were emitted into the header.
+    private boolean classObjectInitEmitted = false;
+
+    /** Class-literal names that are not real ClassInfo entries: String and primitives. */
+    private static final String[] SPECIAL_CLASS_LITERAL_NAMES = {
+        "String", "byte", "int", "long", "float", "double", "bool", "void"
+    };
+
     private String allocFn() { return gcEnabled ? "GC_malloc" : "malloc"; }
     private String reallocFn() { return gcEnabled ? "GC_realloc" : "realloc"; }
     private String freeFn() { return gcEnabled ? "GC_free" : "free"; }
@@ -499,6 +508,7 @@ public class LLVMGen {
         emitGcFrameSetup();
 
         emitArgsArrayInit();
+        if (classObjectInitEmitted) body.append("  call void @cang.classinit()\n");
 
         if (mainFi.paramTypes.isEmpty()) {
             // static void main() — the args array is still initialized so System.ARGS works.
@@ -1032,19 +1042,25 @@ public class LLVMGen {
      */
     private void assignTypeIds() {
         int nextId = 1; // Object = 0
-        java.util.Set<String> assigned = new java.util.HashSet<>();
-        // Object gets 0
+        // Built-in registrations and stdlib files can both provide a ClassInfo for the same
+        // full name (Object/Stdout): the map then holds two distinct instances. Key IDs by
+        // full name so every instance of a class shares one typeId — otherwise the second
+        // instance keeps its default 0 and aliases Object in @cang.classobjs.
+        Map<String, Integer> idByName = new java.util.HashMap<>();
         ClassInfo obj = classes.get("Object");
+        if (obj == null) obj = classes.get("cang_lang_Object");
         if (obj != null) {
             obj.typeId = 0;
-            assigned.add(obj.fullName);
+            idByName.put(obj.fullName, 0);
         }
-        // Assign IDs to other classes
         for (Map.Entry<String, ClassInfo> entry : classes.entrySet()) {
             ClassInfo ci = entry.getValue();
-            if (assigned.contains(ci.fullName)) continue;
-            ci.typeId = nextId++;
-            assigned.add(ci.fullName);
+            Integer id = idByName.get(ci.fullName);
+            if (id == null) {
+                id = nextId++;
+                idByName.put(ci.fullName, id);
+            }
+            ci.typeId = id;
         }
     }
 
@@ -1641,6 +1657,7 @@ public class LLVMGen {
         emitScannerRuntime();
         emitProcessRuntime();
         emitStringBuilderWrappers();
+        emitClassObjects();
     }
 
     private final Map<String, String> fmtConstants = new LinkedHashMap<>();
@@ -4114,6 +4131,9 @@ public class LLVMGen {
         }
         if (node instanceof FieldAccessExpr) {
             return generateFieldAccess((FieldAccessExpr) node);
+        }
+        if (node instanceof ClassLiteralExpr) {
+            return generateClassLiteral((ClassLiteralExpr) node);
         }
         if (node instanceof NewExpr) {
             return generateNew((NewExpr) node);
@@ -9525,6 +9545,238 @@ public class LLVMGen {
         return stringLiterals.get(value);
     }
 
+    /** True for class-literal spellings that have no ClassInfo (String / primitives / void). */
+    private boolean isSpecialClassLiteral(String name) {
+        for (String s : SPECIAL_CLASS_LITERAL_NAMES) if (s.equals(name)) return true;
+        return false;
+    }
+
+    private String specialClassObjectGlobal(String name) {
+        return "@cang.classobj.special." + name;
+    }
+
+    /** cang.lang.Class ClassInfo, or null when the program never references Class/.class. */
+    private ClassInfo classInfoOfClass() {
+        ClassInfo ci = classes.get("cang_lang_Class");
+        if (ci == null) ci = classes.get("Class");
+        return ci;
+    }
+
+    /** Runtime ClassInfo of a class's parent, or null (Object / native synthetic roots). */
+    private ClassInfo resolveParentInfo(ClassInfo ci) {
+        if (ci == null || ci.parentName == null) return null;
+        ClassInfo parent = classes.get(ci.parentName);
+        if (parent == null) {
+            String mapped = importAliases.getOrDefault(ci.parentName, ci.parentName);
+            parent = classes.get(mapped);
+        }
+        return parent;
+    }
+
+    /**
+     * Class literals: one global Class object per runtime type, created once at startup.
+     * The table is indexed by the existing compiler typeId, so `Apple.class` is just a load
+     * and `Apple.class == Apple.class` is reference identity. String/primitives get their own
+     * globals (they have no ClassInfo). The initializer runs from @main after GC_init().
+     */
+    private void emitClassObjects() {
+        ClassInfo cls = classInfoOfClass();
+        if (cls == null || classObjectInitEmitted) return;
+        classObjectInitEmitted = true;
+        String clsPtr = cls.llvmName + "*";
+        int size = classNameTableSize();
+
+        // Unique real classes by typeId (alias keys point at the same ClassInfo).
+        java.util.TreeMap<Integer, ClassInfo> byId = new java.util.TreeMap<>();
+        for (ClassInfo ci : classes.values()) byId.put(ci.typeId, ci);
+
+        // Reserve every string constant BEFORE writing the function body:
+        // ensureClassNameStrConst appends globals to `header`, and globals must not be
+        // interleaved into a function definition.
+        Map<Integer, String> nameConst = new java.util.HashMap<>();
+        Map<Integer, String> simpleConst = new java.util.HashMap<>();
+        for (Map.Entry<Integer, ClassInfo> e : byId.entrySet()) {
+            nameConst.put(e.getKey(), ensureClassNameStrConst(e.getValue().fullName));
+            simpleConst.put(e.getKey(), ensureClassNameStrConst(e.getValue().simpleName));
+        }
+        Map<String, String> specialConst = new java.util.HashMap<>();
+        for (String n : SPECIAL_CLASS_LITERAL_NAMES) {
+            specialConst.put(n, ensureClassNameStrConst(n));
+        }
+
+        header.append("@cang.classobjs = internal global [").append(size).append(" x ")
+              .append(clsPtr).append("] zeroinitializer\n");
+        for (String n : SPECIAL_CLASS_LITERAL_NAMES) {
+            header.append(specialClassObjectGlobal(n)).append(" = internal global ")
+                  .append(clsPtr).append(" null\n");
+        }
+
+        StringBuilder f = new StringBuilder();
+        f.append("define void @cang.classinit() {\nentry:\n");
+
+        // Pass 1: allocate every Class object and fill the name fields.
+        Map<Integer, String> objVar = new java.util.HashMap<>();
+        for (Map.Entry<Integer, ClassInfo> e : byId.entrySet()) {
+            ClassInfo ci = e.getValue();
+            String p = "c" + e.getKey();
+            String obj = emitClassObjectAlloc(f, p, cls, clsPtr);
+            objVar.put(e.getKey(), obj);
+            emitClassObjectFieldDefaults(f, p, obj, cls, clsPtr);
+            emitClassObjectNameStore(f, p + ".name", obj, cls, clsPtr, "_name",
+                nameConst.get(e.getKey()), ci.fullName);
+            emitClassObjectNameStore(f, p + ".simple", obj, cls, clsPtr, "_simpleName",
+                simpleConst.get(e.getKey()), ci.simpleName);
+            String slot = "%cls.slot." + p;
+            f.append("  ").append(slot).append(" = getelementptr [").append(size).append(" x ")
+             .append(clsPtr).append("], [").append(size).append(" x ").append(clsPtr)
+             .append("]* @cang.classobjs, i64 0, i64 ").append(e.getKey()).append("\n");
+            f.append("  store ").append(clsPtr).append(" ").append(obj)
+             .append(", ").append(clsPtr).append("* ").append(slot).append("\n");
+        }
+
+        // String.class / int.class / ...: Class objects without a ClassInfo.
+        Map<String, String> specialObj = new java.util.HashMap<>();
+        for (String n : SPECIAL_CLASS_LITERAL_NAMES) {
+            String p = "special." + n;
+            String obj = emitClassObjectAlloc(f, p, cls, clsPtr);
+            specialObj.put(n, obj);
+            emitClassObjectFieldDefaults(f, p, obj, cls, clsPtr);
+            emitClassObjectNameStore(f, p + ".name", obj, cls, clsPtr, "_name",
+                specialConst.get(n), n);
+            emitClassObjectNameStore(f, p + ".simple", obj, cls, clsPtr, "_simpleName",
+                specialConst.get(n), n);
+            f.append("  store ").append(clsPtr).append(" ").append(obj).append(", ")
+             .append(clsPtr).append("* ").append(specialClassObjectGlobal(n)).append("\n");
+        }
+
+        // Pass 2: link superClass now that every pointer exists.
+        Integer superIdx = cls.fieldIndices.get("_superClass");
+        if (superIdx == null) {
+            throw new RuntimeException("cang/lang/Class must declare a 'Class _superClass' field");
+        }
+        for (Map.Entry<Integer, ClassInfo> e : byId.entrySet()) {
+            ClassInfo parent = resolveParentInfo(e.getValue());
+            if (parent == null) continue;
+            String p = "super." + e.getKey();
+            String slot = "%cls.pslot." + p;
+            f.append("  ").append(slot).append(" = getelementptr [").append(size).append(" x ")
+             .append(clsPtr).append("], [").append(size).append(" x ").append(clsPtr)
+             .append("]* @cang.classobjs, i64 0, i64 ").append(parent.typeId).append("\n");
+            String pv = "%cls.pval." + p;
+            f.append("  ").append(pv).append(" = load ").append(clsPtr).append(", ")
+             .append(clsPtr).append("* ").append(slot).append("\n");
+            String fp = "%cls.sfield." + p;
+            f.append("  ").append(fp).append(" = getelementptr ").append(cls.llvmName)
+             .append(", ").append(clsPtr).append(" ").append(objVar.get(e.getKey()))
+             .append(", i32 0, i32 ").append(superIdx).append("\n");
+            f.append("  store ").append(clsPtr).append(" ").append(pv).append(", ")
+             .append(clsPtr).append("* ").append(fp).append("\n");
+        }
+        // String is a normal reference class in Cang: String.class extends Object.class.
+        String objectSlot = "%cls.pslot.String";
+        f.append("  ").append(objectSlot).append(" = getelementptr [").append(size).append(" x ")
+         .append(clsPtr).append("], [").append(size).append(" x ").append(clsPtr)
+         .append("]* @cang.classobjs, i64 0, i64 0\n");
+        String objectVal = "%cls.pval.String";
+        f.append("  ").append(objectVal).append(" = load ").append(clsPtr).append(", ")
+         .append(clsPtr).append("* ").append(objectSlot).append("\n");
+        String stringField = "%cls.sfield.special.String";
+        f.append("  ").append(stringField).append(" = getelementptr ").append(cls.llvmName)
+         .append(", ").append(clsPtr).append(" ").append(specialObj.get("String"))
+         .append(", i32 0, i32 ").append(superIdx).append("\n");
+        f.append("  store ").append(clsPtr).append(" ").append(objectVal).append(", ")
+         .append(clsPtr).append("* ").append(stringField).append("\n");
+
+        f.append("  ret void\n}\n\n");
+        header.append(f);
+    }
+
+    private String emitClassObjectAlloc(StringBuilder f, String suffix, ClassInfo cls, String clsPtr) {
+        String sizePtr = "%cls.size." + suffix;
+        f.append("  ").append(sizePtr).append(" = getelementptr ").append(cls.llvmName)
+         .append(", ").append(clsPtr).append(" null, i32 1\n");
+        String sizeI = "%cls.sizei." + suffix;
+        f.append("  ").append(sizeI).append(" = ptrtoint ").append(clsPtr).append(" ")
+         .append(sizePtr).append(" to i64\n");
+        String raw = "%cls.raw." + suffix;
+        f.append("  ").append(raw).append(" = call i8* @").append(allocFn())
+         .append("(i64 ").append(sizeI).append(")\n");
+        String obj = "%cls.obj." + suffix;
+        f.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to ")
+         .append(clsPtr).append("\n");
+        String tidp = "%cls.tid." + suffix;
+        f.append("  ").append(tidp).append(" = getelementptr ").append(cls.llvmName)
+         .append(", ").append(clsPtr).append(" ").append(obj).append(", i32 0, i32 0\n");
+        f.append("  store i32 ").append(cls.typeId).append(", i32* ").append(tidp).append("\n");
+        return obj;
+    }
+
+    private void emitClassObjectFieldDefaults(StringBuilder f, String suffix, String obj,
+                                              ClassInfo cls, String clsPtr) {
+        for (int i = 0; i < cls.fieldTypes.size(); i++) {
+            String fieldType = cls.fieldTypes.get(i);
+            String llvmType = toLLVMType(fieldType);
+            String ptr = "%cls.f." + suffix + "." + i;
+            f.append("  ").append(ptr).append(" = getelementptr ").append(cls.llvmName)
+             .append(", ").append(clsPtr).append(" ").append(obj)
+             .append(", i32 0, i32 ").append(i + 1).append("\n");
+            f.append("  store ").append(llvmType).append(" ")
+             .append(defaultValueForType(fieldType)).append(", ").append(llvmType)
+             .append("* ").append(ptr).append("\n");
+        }
+    }
+
+    private void emitClassObjectNameStore(StringBuilder f, String suffix, String obj,
+                                          ClassInfo cls, String clsPtr, String fieldName,
+                                          String constant, String value) {
+        Integer idx = cls.fieldIndices.get(fieldName);
+        if (idx == null) {
+            throw new RuntimeException("cang/lang/Class must declare a 'String " + fieldName + "' field");
+        }
+        String ptr = "%cls.nameptr." + suffix;
+        f.append("  ").append(ptr).append(" = getelementptr ").append(cls.llvmName)
+         .append(", ").append(clsPtr).append(" ").append(obj)
+         .append(", i32 0, i32 ").append(idx).append("\n");
+        String sp = "%cls.namev." + suffix;
+        int len = utf8Len(value) + 1;
+        f.append("  ").append(sp).append(" = getelementptr inbounds [").append(len)
+         .append(" x i8], [").append(len).append(" x i8]* ").append(constant)
+         .append(", i32 0, i32 0\n");
+        f.append("  store i8* ").append(sp).append(", i8** ").append(ptr).append("\n");
+    }
+
+    /** Apple.class: load the singleton Class* for the resolved class (or String/primitive). */
+    private LLVMValue generateClassLiteral(ClassLiteralExpr node) {
+        ClassInfo cls = classInfoOfClass();
+        if (cls == null || !classObjectInitEmitted) {
+            throw new RuntimeException("Class literal requires the stdlib class cang/lang/Class "
+                + "(at line " + node.line + ")");
+        }
+        String clsPtr = cls.llvmName + "*";
+        String resolved = importAliases.getOrDefault(node.className, node.className);
+        ClassInfo target = classes.get(resolved);
+        if (target != null) {
+            int size = classNameTableSize();
+            String slot = "%cls.slot." + tmpCount++;
+            body.append("  ").append(slot).append(" = getelementptr [").append(size)
+                .append(" x ").append(clsPtr).append("], [").append(size).append(" x ")
+                .append(clsPtr).append("]* @cang.classobjs, i64 0, i64 ")
+                .append(target.typeId).append("\n");
+            String val = "%cls.val." + tmpCount++;
+            body.append("  ").append(val).append(" = load ").append(clsPtr).append(", ")
+                .append(clsPtr).append("* ").append(slot).append("\n");
+            return new LLVMValue(val, clsPtr, "Class");
+        }
+        if (isSpecialClassLiteral(node.className)) {
+            String val = "%cls.val." + tmpCount++;
+            body.append("  ").append(val).append(" = load ").append(clsPtr).append(", ")
+                .append(clsPtr).append("* ").append(specialClassObjectGlobal(node.className))
+                .append("\n");
+            return new LLVMValue(val, clsPtr, "Class");
+        }
+        throw unknownClassError(node.className, node.line);
+    }
+
     /** Static field of the CURRENT class by bare name (class-internal `instance` etc.), or null. */
     private FieldDecl findCurrentStaticField(String name) {
         if (currentClassName == null) return null;
@@ -11334,6 +11586,7 @@ public class LLVMGen {
         emitGcFrameSetup();
 
         emitArgsArrayInit();
+        if (classObjectInitEmitted) body.append("  call void @cang.classinit()\n");
 
         for (AST stmt : topLevelStmts) {
             generateStmt(stmt);
