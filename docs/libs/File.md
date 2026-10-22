@@ -3,12 +3,12 @@
 > 返回 [文档索引](../README.md)
 
 ## 要点
-- import cang/io/File；构造即路径，toSystemPath 转分隔符
+- `cang/io/File`；构造即路径，toSystemPath 转分隔符（引用时自动加载，显式 import 亦可）
 - 路径/状态/目录操作/文本读写 20 个方法
 - 失败语义 Java 风格：readText->null、list->null、mkdir->false
 
 
-文件读写标准库，对象模型参考 Java 的 `java.io.File`。相对路径的根目录是**程序运行目录**（进程当前工作目录）。`cang/io` 下的模块需要显式导入：
+文件读写标准库，对象模型参考 Java 的 `java.io.File`。相对路径的根目录是**程序运行目录**（进程当前工作目录）。引用 `File` 时编译器会自动从 `cang/io` 加载，显式导入仍然有效：
 
 ```cang
 import cang/io/File
@@ -20,7 +20,7 @@ class Main
     }
 ```
 
-### 18.1 系统路径分隔符
+### 系统路径分隔符
 
 `File.separator` 是平台常量：Windows 为 `\`，Linux/macOS 为 `/`。
 
@@ -38,7 +38,7 @@ Stdout.println(f.toSystemPath())            # windows: src\util\helper.cang
 
 注意：Linux 上反斜杠是合法的文件名字符，`toSystemPath()` 会把它们全部替换为 `/`，只应在处理跨平台路径字面量时调用，不要对已存在的 Linux 文件名使用。
 
-### 18.2 路径信息
+### 路径信息
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
@@ -60,7 +60,7 @@ File bare = new File("abc.txt")
 Stdout.println(bare.getParent() == null)   # true（null 比较安全）
 ```
 
-### 18.3 状态查询
+### 状态查询
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ Stdout.println(bare.getParent() == null)   # true（null 比较安全）
 | `isDirectory()` | bool | 是否目录 |
 | `length()` | long | 文件字节数；目录或不存在时为 0 |
 
-### 18.4 文件与目录操作
+### 文件与目录操作
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
@@ -91,7 +91,7 @@ moved.delete()
 dir.delete()          # 目录非空时失败（只能删空目录）
 ```
 
-### 18.5 文本读写
+### 文本读写
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
@@ -117,7 +117,7 @@ File dir = new File("data")
 String[] names = dir.list()           # 非目录时为 null，先判 isDirectory()
 ```
 
-### 18.6 失败语义与内存
+### 失败语义与内存
 
 - 打开失败不抛异常（语言没有异常到 stdlib 的通路），按上表返回 `null` / 空数组 / `false`。
   与 Java 的差异：Java `readText` 失败抛 `IOException`，这里返回 `null`，请用 `== null` 判断。

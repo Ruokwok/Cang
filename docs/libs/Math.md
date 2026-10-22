@@ -16,7 +16,7 @@ Math.PI
 Math.E
 ```
 
-### 15.1 绝对值
+### 绝对值
 
 ```cang
 Math.abs(-10)
@@ -25,7 +25,7 @@ Math.abs(-1.5)
 
 支持 `int`、`long`、`float`、`double`。
 
-### 15.2 最大值和最小值
+### 最大值和最小值
 
 ```cang
 Math.max(3, 8)
@@ -34,14 +34,14 @@ Math.max(1.5, 2.5)
 Math.min(1.5, 2.5)
 ```
 
-### 15.3 幂和根
+### 幂和根
 
 ```cang
 Math.sqrt(9.0)
 Math.pow(2.0, 3.0)
 ```
 
-### 15.4 舍入
+### 舍入
 
 ```cang
 Math.floor(2.9)
@@ -49,7 +49,7 @@ Math.ceil(2.1)
 Math.round(2.6)
 ```
 
-### 15.5 三角函数
+### 三角函数
 
 ```cang
 Math.sin(x)
@@ -61,7 +61,7 @@ Math.atan(x)
 Math.atan2(y, x)
 ```
 
-### 15.6 对数和指数
+### 对数和指数
 
 ```cang
 Math.log(x)
@@ -70,7 +70,7 @@ Math.log2(x)
 Math.exp(x)
 ```
 
-### 15.7 斜边、取余与符号
+### 斜边、取余与符号
 
 ```cang
 Math.hypot(3.0, 4.0)   # 5.0，sqrt(a*a + b*b)
@@ -78,7 +78,7 @@ Math.fmod(7.5, 2.0)    # 1.5，C 语义向零截断
 Math.signum(-0.5)      # -1.0（零 -> 0.0，NaN -> 0.0）
 ```
 
-### 15.8 随机数
+### 随机数
 
 ```cang
 double value = Math.random()

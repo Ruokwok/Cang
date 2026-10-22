@@ -7,7 +7,7 @@
 - Windows 用 __acrt_iob_func(2)+fprintf，POSIX 用 stderr
 - 适合错误日志：与 stdout 分流可分别重定向
 
-### 14.3 Stderr（标准错误输出）
+### Stderr（标准错误输出）
 
 成员方法与 `Stdout` 完全一致（`print` / `println`，支持同样的参数类型），区别仅是输出到**标准错误**（stderr）：
 

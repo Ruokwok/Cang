@@ -45,7 +45,7 @@ try {
 
 - **Windows**：`CreateProcessW`（UTF-8 参数转 UTF-16），PATH 搜索经 `SearchPathW`，管道读取用 `PeekNamedPipe` 轮询 + `GetTickCount64` 超时
 - **POSIX**：`fork + execvp`，`poll(20ms)` 轮询 + `waitpid` 收尸，超时 `SIGKILL`
-- 回调运行在 exec 的调用线程内（同步执行）；回调内可正常 `Stdout` 打印与赋值捕获变量
+- 回调运行在 exec 的调用线程内（同步执行）；回调内可正常 `Stdout` 打印、读取捕获变量，或修改捕获引用指向的容器（不能给捕获变量本身重新赋值）
 - 输出编码跟随子进程原样字节（Windows 中文控制台子进程若输出 GBK 则回调收到 GBK 字节——期望子进程输出 UTF-8）
 
 ## 限制（v1）

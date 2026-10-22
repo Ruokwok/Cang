@@ -7,7 +7,7 @@
 - put/get/getOrDefault/containsKey/remove/keys/values
 - get 未找到抛 Error；keys()/values() 快照按插入序对应
 
-### 13.1 cang/lang/Dict（KV 映射）
+### cang/lang/Dict（KV 映射）
 
 `Dict<K, V>` 是键值映射（纯 Cang 实现，API 参考 `java.util.HashMap`），多类型参数泛型的第一个标准库用户：
 

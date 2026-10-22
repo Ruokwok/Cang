@@ -7,9 +7,9 @@
 - **Thread.spawn 已移除**（编译期报错并提示迁移）；对象式任务为 void 无参，fn 收方法引用/顶层函数/无参 lambda
 - 仅值类型跨线程（对象式任务的 receiver 除外）；与 Boehm GC 兼容（GC_CreateThread）；`Thread.sleep(ms)` 休眠**当前线程**（long 毫秒，可省 import）
 
-## Thread<T> 与 spawn 的移除
+## Thread / Thread<void> 与 spawn 的移除
 
-`Thread<T>` 是编译器内建的线程句柄类型。**显式创建线程只有一种写法**：
+`Thread` 是编译器内建的线程句柄类型；代码中通常用 `Thread<void>` 表示 `start()` 返回的句柄。**显式创建线程只有一种写法**：
 
 ```cang
 var t = new Thread().task(fn).start()
@@ -21,7 +21,7 @@ t.join()
 - 原 spawn 支持的**值类型返回 join**（`Thread<int> t = Thread.spawn(...); t.join()` 取值）
   随移除一并消失，当前对象式与 `thread { }` 均为 **void 任务**（`start()` 返回的句柄可
   `join()` 等待完成，但不携带返回值）；需要输出结果请在任务内部打印或写入共享变量；
-- `Thread<T>` 类型仍用于 join 句柄（`start()` 返回 `Thread<void>`）；
+- `Thread<void>` 类型用于 start 返回的 join 句柄（`Thread` 本身没有泛型参数消费者）；
 - 平台与 GC：Windows 经 `GC_CreateThread` 附着（`--no-gc` 用 `CreateThread`），join 用
   `WaitForSingleObject`；Linux/macOS `pthread_create/pthread_join` 且线程入口注册线程栈；
 - `join()` 每个句柄只能调用一次（重复报 `Thread already joined`）；创建失败报错退出；

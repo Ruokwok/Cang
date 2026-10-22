@@ -12,13 +12,13 @@
 | 02 | [项目结构与入口](02-项目结构与入口.md) | class 前后布局、import/as 别名、分号、注释、目录结构 |
 | 03 | [基本类型](03-基本类型.md) | byte/int/long/float/double/bool、字面量增强、null |
 | 04 | [字符串 String](04-字符串.md) | 字面量写法、数值转换、内容比较、常量池 |
-| 05 | [变量与类型推导](05-变量与类型推导.md) | 显式声明、var、作用域 |
+| 05 | [变量与类型推导](05-变量与类型推导.md) | 显式声明、var、作用域、final |
 | 06 | [运算符](06-运算符.md) | 算术/比较/逻辑、三目、短路求值 |
 | 07 | [条件语句](07-条件语句.md) | if/else、switch/case/default |
 | 08 | [循环](08-循环.md) | while、for、break/continue、for-each |
 | 09 | [函数与方法](09-函数与方法.md) | 定义、默认参数、return 检查、方法重载 |
 | 10 | [函数对象与 lambda](10-函数对象与lambda.md) | Function 类型、lambda 捕获、方法引用 |
-| 11 | [类与对象](11-类与对象.md) | 字段与 init/_init 构造、实例/静态方法、继承声明 |
+| 11 | [类与对象](11-类与对象.md) | 字段与 init/_init 构造、实例/静态方法、继承声明、Class 类字面量 |
 | 12 | [泛型](12-泛型.md) | 单态化、多类型参数 Pair<K, V>、diamond |
 | 13 | [数组](13-数组.md) | T[]/T[N]、字面量、运行时长度、越界检查 |
 | 14 | [继承与多态](14-继承与多态.md) | Object 根类、动态分派、like、final |
@@ -38,21 +38,24 @@
 | [String.md](libs/String.md) | `String` | 字符串类 API（length/substring/查找/大小写） |
 | [List.md](libs/List.md) | `List<T>` | 泛型动态数组（参考 ArrayList） |
 | [Dict.md](libs/Dict.md) | `Dict<K, V>` | 泛型 KV 映射（参考 HashMap） |
-| [Thread.md](libs/Thread.md) | `Thread<T>` | 对象式 task/start/join（spawn 已移除）、thread{} |
+| [Thread.md](libs/Thread.md) | `Thread` / `Thread<void>` | 对象式 task/start/join（spawn 已移除）、thread{} |
+| [Coroutine.md](libs/Coroutine.md) | `Coroutine` | libuv 单线程事件循环协程（task/start/join、coroutine{}） |
 | [File.md](libs/File.md) | `cang/io/File` | 文件路径、状态、目录、文本读写 |
 | [Scanner.md](libs/Scanner.md) | `cang/io/Scanner` | 单例标准输入：readLine/readKey 阻塞读取 |
 | [StringBuilder.md](libs/StringBuilder.md) | `cang/lang/StringBuilder` | 高效字符串构建：append/toString 快照/clear |
 | [ProcessBuilder.md](libs/ProcessBuilder.md) | `cang/lang/ProcessBuilder` | 本地命令执行：exec 按行回调、超时、退出码 |
 | [Function.md](libs/Function.md) | `Function<R,...>` | 函数对象类型声明 |
+| [Void.md](libs/Void.md) | `Void` | 无返回值包装类型（`Function<Void, ...>`） |
 | [Error.md](libs/Error.md) | `Error` | 异常基类、message/stack |
 | [Object.md](libs/Object.md) | `Object` | 所有类的隐式根类 |
 | [Class.md](libs/Class.md) | `Class` | 类信息对象：`Apple.class`、名称、父类、单例 |
+| [Field.md](libs/Field.md) | `Field` | 按字段名反射读取：getInt/getString/getObject/getType |
 
 ## 标准库源码位置
 
 ```text
 stdlib/cang/lang/    # 自动查找，也可显式 import（支持 as 别名）
-stdlib/cang/io/      # 需显式 import cang/io/File
+stdlib/cang/io/      # IO 标准库（同样自动查找，也可显式 import）
 ```
 
-当前清单：`Object`、`Class`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`List`、`Dict`、`cang/io/File`。
+当前清单：`Object`、`Class`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`Coroutine`、`List`、`Dict`、`Field`、`StringBuilder`、`ProcessBuilder`、`cang/io/File`、`cang/io/Scanner`。

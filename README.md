@@ -23,11 +23,12 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - 函数与方法重载（按参数个数/类型解析；带默认参数的方法禁止同名重载）；
 - lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
-- `Math`、`System`、`Stdout`、`Stderr`、`String`、`List`、`Dict` 等基础标准库；
-- `try/catch/finally` 与 `Error` 的第一版实现；
+- `Math`、`System`、`Stdout`、`Stderr`、`String`、`List`、`Dict`、`Class`、`Field` 等基础标准库；
+- `try/catch/finally` 与 `Error`（支持跨函数传播、可捕获运行时错误）；
 - 线程：`new Thread().task(fn).start()` 对象式写法与 `thread { }` 语法糖（`Thread.spawn` 已移除）；
+- 协程：`new Coroutine(fn).start().join()` 与 `coroutine { }` 语法糖（libuv 单线程事件循环）；
 - Boehm GC 自动内存管理（默认）+ `free` 提前释放，`--no-gc` 可切回手动模式；
-- Windows、Linux、macOS 目标平台常量和基础交叉编译参数。
+- Windows/Linux 目标编译与 macOS 平台常量（macOS 目标编译尚未实现）。
 
 ## 快速示例
 
@@ -108,7 +109,7 @@ class Main
     }
 ```
 
-当前异常系统仍是第一版实现，存在跨函数传播和运行时错误覆盖范围有限等限制。
+异常已支持同函数控制流与跨函数传播，并覆盖常见的可捕获运行时错误；当前同一 `try` 只支持一个 `catch`，`Error.stack` 尚未自动填充。
 
 ## 编译环境
 
@@ -206,33 +207,39 @@ cang app.cang --no-gc      # 切回纯手动 free 模式
 - GC 模式下 `free` 映射为 `GC_free`，对象别名下提前 `free` 仍可能 use-after-free；
 - 字符串字面量来自常量池，不能 `free`；
 - 线程与 GC 兼容：Windows 经 `GC_CreateThread` 附着，posix 在线程入口注册线程栈，无需降级；
-- Linux GC 库已就位但端到端链接依赖本机 WSL；macOS 目标编译尚未实现。
+- Linux GC 库已就位；Linux 目标链接需要对应架构的 glibc sysroot；macOS 目标编译尚未实现。
 
 ## 标准库
 
 标准库源码位于：
 
 ```text
-stdlib/cang/lang/
+stdlib/cang/lang/    # 语言标准库
+stdlib/cang/io/      # IO 标准库
 ```
 
 主要文件：
 
-- `Object.cang`：基础对象；
-- `Class.cang`：类信息对象（`Apple.class`，名称/父类/单例）；
-- `Stdout.cang`：输出；
-- `String.cang`：字符串对象接口；
-- `Math.cang`：数学常量和函数；
-- `System.cang`：参数、平台、环境变量、时间和退出；
-- `Function.cang`：函数对象类型声明；
-- `Void.cang`：无返回值包装类型；
-- `Error.cang`：异常对象基础类型；
-- `List.cang`：泛型动态数组（参考 ArrayList）；
-- `Dict.cang`：泛型 KV 映射（参考 HashMap）；
-- `Thread.cang`：线程句柄类型声明。
-- `cang/io/Scanner.cang`：单例标准输入（readLine/readKey 阻塞读取）；
+- `cang/lang/Object.cang`：基础对象；
+- `cang/lang/Class.cang`：类信息对象（`Apple.class`，名称/父类/单例）；
+- `cang/lang/Stdout.cang` / `Stderr.cang`：标准输出/错误；
+- `cang/lang/String.cang`：字符串对象接口；
+- `cang/lang/Math.cang`：数学常量和函数；
+- `cang/lang/System.cang`：参数、平台、环境变量、时间和退出；
+- `cang/lang/Function.cang`：函数对象类型声明；
+- `cang/lang/Void.cang`：无返回值包装类型；
+- `cang/lang/Error.cang`：异常对象基础类型；
+- `cang/lang/List.cang`：泛型动态数组（参考 ArrayList）；
+- `cang/lang/Dict.cang`：泛型 KV 映射（参考 HashMap）；
+- `cang/lang/Thread.cang`：线程句柄与对象式线程；
+- `cang/lang/Coroutine.cang`：libuv 单线程事件循环协程；
+- `cang/lang/Field.cang`：按字段名反射读取；
 - `cang/lang/ProcessBuilder.cang`：本地命令执行（exec 按行回调、超时终止、退出码；argv 直执行无 shell）；
 - `cang/lang/StringBuilder.cang`：高效字符串构建（append 摊还 O(1)、toString 不可变快照、自动翻倍扩容）；
+- `cang/io/File.cang`：路径、目录与文本文件读写；
+- `cang/io/Scanner.cang`：单例标准输入（readLine/readKey 阻塞读取）。
+
+引用这些类型时编译器会自动按 `cang/lang`、`cang/io` 顺序加载；显式 `import` 仍然有效且优先。
 
 ## 项目结构
 
@@ -244,7 +251,8 @@ Cang/
 │   ├── codegen/     # LLVM IR 生成
 │   └── util/        # 编译错误和工具类
 ├── stdlib/
-│   └── cang/lang/   # Cang 标准库源码
+│   ├── cang/lang/   # 语言标准库源码
+│   └── cang/io/     # IO 标准库源码
 ├── docs/             # 文档（按学习路线拆分：语言一章一文件 + 标准库每类一文件）
 ├── test/             # 测试和示例（仅本地，不入库）
 ├── working/          # 多文件工作示例（仅本地，不入库）
@@ -259,9 +267,9 @@ Cang 目前不应被视为稳定语言或生产级编译器，主要限制包括
 
 - 编译器缺少完整的自动化测试、持续集成和模糊测试体系；
 - 错误恢复和诊断能力仍有限；
-- 标准库规模较小，缺少成熟的集合、文件、网络、JSON 等 API；
-- 异常系统目前只覆盖第一版同函数控制流场景；
-- 数组越界和空指针等部分运行时错误仍可能直接终止程序；
+- 标准库规模较小，网络、JSON 等 API 仍缺失；
+- 异常系统已支持跨函数传播，但同一 `try` 只支持一个 `catch`，`Error.stack` 尚未自动填充；
+- 数组越界和空指针等运行时错误在未捕获时会终止程序（已捕获则走 `catch`）；
 - 在别名场景下提前 `free` 存在 use-after-free 风险；
 - Unicode、非 ASCII 字符串和跨平台细节仍需持续完善；
 - 编译器当前主要通过字符串拼接生成 LLVM IR，鲁棒性和优化能力有限；

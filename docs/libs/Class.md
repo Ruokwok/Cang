@@ -114,7 +114,7 @@ Stdout.println(int.class.getSuperclass() == null)       # true
 ## 限制
 
 - 不支持数组类字面量（`String[].class`）；
-- 不提供 Java 反射式 API（字段/方法枚举等），`Class` 只保存类名与父类信息；
+- `Class` 本身不提供字段/方法枚举；按字段名读取实例字段请用 [Field](Field.md)，方法枚举仍不支持；
 - 不提供 `Object.getClass()`；当前入口是 `类名.class`；
 - 泛型类没有独立的运行时类对象，类字面量面向具体类名；
 - `Class` 的字段是私有的，元数据只读（请使用 getter），也不可 `new Class()`。

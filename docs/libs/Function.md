@@ -12,9 +12,9 @@
 ## 类型写法
 
 ```cang
-Function<int, int, int> add = (a, b) -> a + b     # R=int，参数 int, int
-Function<void> task = () -> { ... }               # 无参无返回
-Function<int, int> twice = (x) -> x * 2
+Function<int, int, int> add = (a, b) -> { return a + b }   # R=int，参数 int, int
+Function<Void> task = () -> { ... }                        # 无参无返回
+Function<int, int> twice = (x) -> { return x * 2 }
 ```
 
 - `Function.cang` 为类型声明面（`cang/lang` 自动可用）；
@@ -29,7 +29,7 @@ func int applyTwice(int x, Function<int, int> f) {
 
 class Main
     static func void main(String[] args) {
-        Stdout.println(applyTwice(3, (x) -> x + 1))   # 5
+        Stdout.println(applyTwice(3, (x) -> { return x + 1 }))   # 5
     }
 ```
 
@@ -39,7 +39,7 @@ class Main
 class Main
     static func void main(String[] args) {
         int base = 10
-        Function<int> getBase = () -> base     # 创建时快照 base 的值
+        Function<int> getBase = () -> { return base }   # 创建时快照 base 的值
         base = 99
         Stdout.println(getBase())              # 10（不是 99）
     }
@@ -95,7 +95,7 @@ class Main
 - 赋值/传参时校验 `Function<返回, 参数...>` 签名匹配（返回协变不放宽到无关类型）；
 - 方法引用解析不到、签名不符在编译期报错（如 `Unknown method in reference`、参数个数/类型不匹配）。
 
-## 限制（第一版）
+## 限制
 
 - 不可对 `Function` 做 `==` 比较（无函数相等语义）；
 - `thread {}` 与对象式 `task()` 同源：任务为**无参无返回**函数（方法引用/顶层函数/无参 lambda），按值捕获外部变量；

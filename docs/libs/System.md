@@ -8,7 +8,7 @@
 - 目标平台常量按编译目标确定而非宿主机
 
 
-### 16.1 启动参数
+### 启动参数
 
 ```cang
 String program = System.ARGS[0]
@@ -19,7 +19,7 @@ for (String arg : System.ARGS) {
 
 `System.ARGS[0]` 通常是程序路径，后面是用户参数。
 
-### 16.2 目标平台信息
+### 目标平台信息
 
 ```cang
 Stdout.println(System.OS_TYPE)
@@ -32,14 +32,14 @@ Stdout.println(System.ARCH_TYPE)
 Cang program.cang --target linux --arch aarch64
 ```
 
-### 16.3 退出程序
+### 退出程序
 
 ```cang
 System.exit(0)
 System.exit(1)
 ```
 
-### 16.4 环境变量
+### 环境变量
 
 ```cang
 String path = System.getenv("PATH")
@@ -48,17 +48,17 @@ String path = System.getenv("PATH")
 找不到环境变量时返回 `null`。
 
 
-### 16.5 目录
+### 目录
 
 ```cang
-String dir = System.getCwd()          // 当前工作目录
-String exe = System.getExecDir()      // 本可执行文件所在目录
+String dir = System.getCwd()          # 当前工作目录
+String exe = System.getExecDir()      # 本可执行文件所在目录
 ```
 
 进程启动时的工作目录（Windows 下为 `C:\...` 形式）；获取失败返回 `null`。
 
 `getExecDir()` 返回**本 exe 自身**所在的目录，与从哪个目录启动无关——定位旁边的资源文件用它更可靠。
-### 16.6 当前时间
+### 当前时间
 
 ```cang
 long now = System.currentTimeMillis()

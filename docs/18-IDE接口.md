@@ -76,7 +76,8 @@ for (Function f : CangApi.findFunctions("add")) {
 // 调用处参数提示（自动识别重载、接收者、new 构造、当前参数下标）
 SignatureHelp h = CangApi.getSignatureHelp(buffer, caretOffset);
 h.getOverloads();        // 候选重载
-h.getActive();           // 激活的重载（按参数个数推断，多义时 -1）
+h.getActive();           // 激活的 Function；无激活项返回 null
+h.getActiveIndex();      // 激活下标（-1 = 未选定 / 无候选）
 h.getActiveParameter();  // 光标在第几个参数（0 起）
 ```
 
@@ -104,10 +105,13 @@ CompileResult r = CangApi.compile("src/Main.cang",
             .targetRoot("D:/proj")   // 产物目录根：输出到 D:/proj/target/xxx.exe
             .noLink(false)           // true = 只生成 .ll
             .target("windows")       // windows | linux | macos
+            .arch("amd64")           // amd64 | aarch64 | i386（影响 target triple / 平台常量）
             .gc(true)                // Boehm GC（默认开）
             .gui(true)                // GUI 子系统（仅 windows 生效；默认 false=console）
             .libRoot("D:/toolchain") // 库根：其 lib/ 下查 .a
             .sysroot("D:/sysroot")   // Linux sysroot；null = 默认 <jar 所在目录>/../lib/sysroot_linux_<arch>
+            .clang("clang")          // clang 可执行文件；默认 PATH 中的 clang
+            .gcc("gcc")              // 链接器/驱动；默认 PATH 中的 gcc
             .quiet(true));           // 默认静默：过程输出不进 stdout
 
 if (r.isSuccess()) {
@@ -127,13 +131,15 @@ if (r.isSuccess()) {
 - **产物目录**：`.targetRoot(目录)` → 产物一律在 `<目录>/target/` 下
   （`xxx.exe` / `.ll` / `.o` 同基名；不传 = 进程 cwd 的 `target/`，与 CLI 一致）。
   与 `outputName` 组合即 `<targetRoot>/target/<name>.exe`；`outputName` 自带路径分隔符时
-  视为显式路径、忽略 targetRoot。- **库根目录与 cwd 无关**：其 `lib/` 下将来的其它库同样从这里找。GC 默认查找**只认** `lib/libgc_<os>_amd64.a`（cwd 及其上级的 lib/，无 runtime 兜底）——IDE 进程 cwd 不在编译器目录时必须传 `libRoot`。`.libRoot(目录)` 会在 `<目录>/lib/` 下按平台名查找
-  （如 `window_amd64_libgc.a`，另认 `<目录>/lib/libgc.a`、`<目录>/libgc.a` 与文件直传）——
-  IDE 进程的 cwd 不是编译器安装目录时**必须传**，否则报
-  `Boehm GC static library not found for windows target`；CLI 的 `--gc-lib <目录>` 同语义；
+  视为显式路径、忽略 targetRoot。
+- **库根目录与 cwd 无关**：GC 默认查找**只认** `lib/libgc_<os>_amd64.a`（cwd 及其上级的 `lib/`，无 runtime 兜底）。
+  `.libRoot(目录)` 依次查 `<目录>/libgc.a`、`<目录>/lib/libgc.a`、`<目录>/lib/libgc_<os>_amd64.a`；也可直接传 `.a` 文件。
+  IDE 进程 cwd 不是编译器安装目录时**必须传** `libRoot`，否则报
+  `Boehm GC static library not found for windows target`；CLI 的 `--gc-lib <目录或文件>` 同语义。`--arch` 不改变 GC 库名，非 amd64 目标需要显式传对应 `.a` 文件；
 - **诊断**：词法/语法/语义错误 = `CompileError` 原文 + 真实行列；`LinkFailed`（工具链失败、目标未实现等）= 短消息 + `buildOutput`；
 - **静默默认**：`quiet(true)` 时进度（[1/3]…、[OK] Compiled）走 null sink；`quiet(false)` 与 CLI 完全一致；
 - **未保存缓冲**：编译以磁盘文件为单位（import 按路径解析）——先写临时文件再调 `compile(tempPath)`。
+
 ## 编辑器集成流程（伪代码）
 
 ```text

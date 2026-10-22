@@ -10,7 +10,7 @@
 
 Cang 支持函数作为参数传递。
 
-### 9.1 Function 类型
+### 10.1 Function 类型
 
 ```cang
 Function<返回类型, 参数类型1, 参数类型2>
@@ -30,7 +30,7 @@ Function<int, int, int>
 Function<Void, int>
 ```
 
-### 9.2 方法作为参数
+### 10.2 方法作为参数
 
 方法是类体成员，可通过实例方法引用传递：
 
@@ -50,7 +50,7 @@ class Main
     }
 ```
 
-### 9.3 lambda 捕获外部变量
+### 10.3 lambda 捕获外部变量
 
 ```cang
 class Main
@@ -90,9 +90,9 @@ f(2)        # 43（仍是创建时的 41）
 - **lambda 内对外部（被捕获）变量赋值 / `++` 是编译错误**（`cannot assign to captured variable`——与 Java effectively-final 同思路）；要回传结果请用容器（StringBuilder/数组/对象）或字段；
 - lambda 内声明的同名局部变量会遮蔽捕获（同名局部优先）；
 - 捕获数组、List 或类实例只快照引用本身，对象内容仍共享（对 List 的 add/remove 外部可见）；
-- 线程块 `thread { }` 仍然**禁止捕获**（见文档开头 Thread 章节）。
+- `thread { }` / `coroutine { }` 与 lambda 共用按值捕获规则：可以读取外部变量与 `this`，但任务体内对外部变量赋值仍是编译错误。
 
-### 9.4 this 方法引用
+### 10.4 this 方法引用
 
 ```cang
 class Main
@@ -116,7 +116,7 @@ class Main
 
 `this::add` 会绑定当前对象的 `this`（仅实例方法内可用）。
 
-### 9.5 对象方法引用
+### 10.5 对象方法引用
 
 ```cang
 class Main
@@ -135,7 +135,7 @@ class Main
 
 `obj::add` 会绑定对象 `obj`。
 
-### 9.6 静态方法引用
+### 10.6 静态方法引用
 
 ```cang
 class Main
@@ -158,7 +158,7 @@ class Main
 ClassName::staticMethod
 ```
 
-### 9.7 Function 类型检查
+### 10.7 Function 类型检查
 
 编译器会检查：
 

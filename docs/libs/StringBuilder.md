@@ -6,7 +6,7 @@
 
 - 高效拼接：`append` 摊还 O(len(s))，容量不足自动翻倍（最低 16 字节）
 - `toString()` 返回**不可变快照**——之后继续 append 不影响已取的字符串
-- 编译器内建（Design B wrapper），需 `import cang/lang/StringBuilder`
+- 编译器内建（Design B wrapper）；引用 `StringBuilder` 时自动加载，显式 `import cang/lang/StringBuilder` 亦可
 
 ## 用法
 
@@ -17,8 +17,8 @@ StringBuilder sb = new StringBuilder()
 sb.append("hello")
 sb.append(", ")
 sb.append("world")
-Stdout.println(sb.toString())   // hello, world
-Stdout.println(sb.length())     // 12（字节数）
+Stdout.println(sb.toString())   # hello, world
+Stdout.println(sb.length())     # 12（字节数）
 
 # 预留容量（可选，第一个参数是 cap）
 StringBuilder buf = new StringBuilder(256)
@@ -26,7 +26,7 @@ StringBuilder buf = new StringBuilder(256)
 # 快照隔离
 String snap = sb.toString()
 sb.append("!")
-Stdout.println(snap)            // 不含后面的 "!"
+Stdout.println(snap)            # 不含后面的 "!"
 
 # 复用：clear 保留已分配容量
 buf.clear()
