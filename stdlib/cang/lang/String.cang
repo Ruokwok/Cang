@@ -39,6 +39,12 @@ native func String trim()
 # 截取 index 处的单字节字符（UTF-8 字节粒度；结构扫描按 ASCII 比较即可），越界运行时错误
 native func String charAt(int index)
 
+# 读取 index 处的原始字节值（0..255，UTF-8 字节粒度）。
+# 不调用 strlen、不分配内存，适合 O(n) 扫描（JSON/词法分析等热路径）；
+# 调用方必须保证 0 <= index < length()——上界不检查，越界行为未定义。
+# 负下标抛运行时错误。
+native func int byteAt(int index)
+
 # 字面全量替换：from 出现处全部换成 to；from 为空运行时错误；插入内容不重扫描（to 含 from 不死循环）
 native func String replace(String from, String to)
 

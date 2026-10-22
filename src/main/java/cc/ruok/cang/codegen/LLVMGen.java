@@ -8086,7 +8086,7 @@ public class LLVMGen {
     /** The native String surface (stdlib/cang/lang/String.cang) — dispatched intrinsically. */
     private static final java.util.Set<String> STRING_METHODS = java.util.Set.of(
         "length", "startsWith", "endsWith", "indexOf", "indexOfIgnoreCase",
-        "substring", "toUpper", "toLower", "trim", "charAt", "replace", "split",
+        "substring", "toUpper", "toLower", "trim", "charAt", "byteAt", "replace", "split",
         "parseInt", "parseLong", "parseDouble");
 
     /** String intrinsics: receiver is the i8* string itself (no struct header). */
@@ -8258,6 +8258,33 @@ public class LLVMGen {
                 body.append("  ").append(term).append(" = getelementptr i8, i8* ").append(buf).append(", i64 1\n");
                 body.append("  store i8 0, i8* ").append(term).append("\n");
                 return new LLVMValue(buf, "i8*", "String");
+            }
+            case "byteAt": {
+                requireArgs(node, 1, m);
+                LLVMValue ix = generateExpr(node.args.get(0));
+                if (!ix.type.equals("i32")) {
+                    throw new RuntimeException("String.byteAt expects an int index (at line " + line + ")");
+                }
+                String i64 = "%ba.i." + tmpCount++;
+                body.append("  ").append(i64).append(" = sext i32 ").append(ix.value).append(" to i64\n");
+                // 只检查负下标：上界检查需要 strlen，会让逐字节扫描退化为 O(n^2)。
+                // 调用方必须自行保证 index < length()（与 C 的指针访问一致）。
+                String neg = "%ba.neg." + tmpCount++;
+                body.append("  ").append(neg).append(" = icmp slt i64 ").append(i64).append(", 0\n");
+                String bad = "str.ba.bad." + id, bok = "str.ba.ok." + id;
+                body.append("  br i1 ").append(neg).append(", label %").append(bad)
+                     .append(", label %").append(bok).append("\n");
+                body.append(bad).append(":\n");
+                emitRuntimeError("String index out of bounds", line, bok);
+                body.append(bok).append(":\n");
+                String ptr = "%ba.src." + tmpCount++;
+                body.append("  ").append(ptr).append(" = getelementptr i8, i8* ").append(recv.value)
+                     .append(", i64 ").append(i64).append("\n");
+                String ch = "%ba.ch." + tmpCount++;
+                body.append("  ").append(ch).append(" = load i8, i8* ").append(ptr).append("\n");
+                String out = "%ba.out." + tmpCount++;
+                body.append("  ").append(out).append(" = zext i8 ").append(ch).append(" to i32\n");
+                return new LLVMValue(out, "i32");
             }
             case "replace": {
                 requireArgs(node, 2, m);
