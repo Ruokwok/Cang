@@ -13,7 +13,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - Java 17 编写的 Lexer、Parser、AST 和 LLVM IR 后端；
 - 输出 `.ll` LLVM IR，并通过 clang/gcc 生成本地可执行文件；
 - 基本类型：`byte`、`int`、`long`、`float`、`double`、`bool`；
-- 字符串类型 `String`，支持双引号、单引号与反引号多行字符串；
+- 字符串类型 `String`，支持双引号、单引号单行字符串与反引号多行字符串（引号内换行需写 `\n`）；
 - 类、单继承（`: Parent`，构造参数经 `super(...)` 传递）、`init`/`_init` 构造方法、字段、实例方法、静态方法和类型 ID 动态分派；一个文件一个类；
 - 抽象类与抽象方法（`abstract class` / `abstract func`）；
 - 泛型类：编译期单态化，支持多类型参数（`Pair<K, V>`）与多实参特化；

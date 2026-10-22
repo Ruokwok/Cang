@@ -80,7 +80,7 @@ public class Lexer {
         int startCol = column;
         char c = code.charAt(pos);
 
-        // Both quote styles produce String literals: "..." / '...' / `...` (multi-line).
+        // "..." and '...' are single-line (use \n); `...` is the only multi-line form.
         if (c == '"' || c == '\'') return readQuotedString(c, startLine, startCol);
 
         // Multi-line string literal (backticks)
@@ -114,29 +114,25 @@ public class Lexer {
                     case '"': sb.append('"'); break;
                     case '\'': sb.append('\''); break;
                     case '0': sb.append('\0'); break;
-                    case '\n': sb.append('\n'); break; // escaped newline continuation (debug.md #26)
+                    case '\n':
+                    case '\r':
+                        // Single-line literals may not span source lines, not even via a
+                        // backslash continuation: use the two characters \n, or a `...` string.
+                        throw new RuntimeException("Lexer error at line " + line + ", column " + column
+                            + ": Newline in string literal; use \\n or a backtick (`) string");
                     default:
                         // Unknown escape: reject instead of silently dropping the backslash (debug.md #25).
                         throw new RuntimeException("Lexer error at line " + startLine + ", column " + startCol
                             + ": Unknown escape sequence '\\" + esc + "'");
                 }
-                if (esc == '\n') {
-                    // Escaped newline also advances the line counter (debug.md #26).
-                    advance();
-                    line++;
-                    column = 1;
-                    continue;
-                }
                 advance();
             } else {
-                sb.append(ch);
-                if (ch == '\n') {
-                    // Count real newlines inside the literal so later positions stay correct.
-                    advance();
-                    line++;
-                    column = 1;
-                    continue;
+                if (ch == '\n' || ch == '\r') {
+                    // "..." / '...' are single-line; only `...` may contain a real newline.
+                    throw new RuntimeException("Lexer error at line " + line + ", column " + column
+                        + ": Newline in string literal; use \\n or a backtick (`) string");
                 }
+                sb.append(ch);
                 advance();
             }
         }
