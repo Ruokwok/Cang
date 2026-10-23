@@ -6572,6 +6572,16 @@ public class LLVMGen {
                 // not a Thread receiver — fall through to the normal instance path
             }
         }
+        // Class.newInstance(): reflection construction via @cang.newinstance(typeId).
+        // Detection: the receiver's class is the builtin Class class (cang_lang_Class).
+        if (node.object != null && node.method.equals("newInstance")) {
+            if (objCache == null) objCache = generateExpr(node.object);
+            ClassInfo recvCi = classes.get(extractClassName(objCache.type));
+            if (recvCi != null && "cang_lang_Class".equals(recvCi.fullName)) {
+                return generateClassNewInstance(recvCi, objCache, node);
+            }
+            // not a Class receiver — fall through (objCache reused below)
+        }
         // Field reflection: getObject/getInt/.../getType by field name on the bound target.
         // Detection: the receiver's class is the builtin Field class (cang_lang_Field).
         if (node.object != null && FIELD_ACCESSOR_METHODS.contains(node.method)) {
@@ -9626,6 +9636,7 @@ public class LLVMGen {
                 nameConst.get(e.getKey()), ci.fullName);
             emitClassObjectNameStore(f, p + ".simple", obj, cls, clsPtr, "_simpleName",
                 simpleConst.get(e.getKey()), ci.simpleName);
+            emitClassObjectIdStore(f, p + ".tid", obj, cls, clsPtr, "_typeId", ci.typeId);
             String slot = "%cls.slot." + p;
             f.append("  ").append(slot).append(" = getelementptr [").append(size).append(" x ")
              .append(clsPtr).append("], [").append(size).append(" x ").append(clsPtr)
@@ -9635,6 +9646,8 @@ public class LLVMGen {
         }
 
         // String.class / int.class / ...: Class objects without a ClassInfo.
+        // Their _typeId stays -1 (emitClassObjectFieldDefaults wrote 0 for int, fix to -1)
+        // so Class.newInstance() rejects them at runtime.
         Map<String, String> specialObj = new java.util.HashMap<>();
         for (String n : SPECIAL_CLASS_LITERAL_NAMES) {
             String p = "special." + n;
@@ -9645,6 +9658,7 @@ public class LLVMGen {
                 specialConst.get(n), n);
             emitClassObjectNameStore(f, p + ".simple", obj, cls, clsPtr, "_simpleName",
                 specialConst.get(n), n);
+            emitClassObjectIdStore(f, p + ".tid", obj, cls, clsPtr, "_typeId", -1);
             f.append("  store ").append(clsPtr).append(" ").append(obj).append(", ")
              .append(clsPtr).append("* ").append(specialClassObjectGlobal(n)).append("\n");
         }
@@ -9743,6 +9757,102 @@ public class LLVMGen {
          .append(" x i8], [").append(len).append(" x i8]* ").append(constant)
          .append(", i32 0, i32 0\n");
         f.append("  store i8* ").append(sp).append(", i8** ").append(ptr).append("\n");
+    }
+
+    /** Store an int constant into a named field of a compiler-built Class object (e.g. _typeId). */
+    private void emitClassObjectIdStore(StringBuilder f, String suffix, String obj,
+                                        ClassInfo cls, String clsPtr, String fieldName, int value) {
+        Integer idx = cls.fieldIndices.get(fieldName);
+        if (idx == null) {
+            throw new RuntimeException("cang/lang/Class must declare an 'int " + fieldName + "' field");
+        }
+        String ptr = "%cls.idptr." + suffix;
+        f.append("  ").append(ptr).append(" = getelementptr ").append(cls.llvmName)
+         .append(", ").append(clsPtr).append(" ").append(obj)
+         .append(", i32 0, i32 ").append(idx).append("\n");
+        f.append("  store i32 ").append(value).append(", i32* ").append(ptr).append("\n");
+    }
+
+    /**
+     * Zero-arg constructor of ci available for reflection (Class.newInstance), or null:
+     * abstract / private-class / native / private-zero-arg-init all disqualify. The implicit
+     * no-explicit-init constructor counts when its param list is empty (always is — ctorParams
+     * empty plus parent Object is the common `class Point { int x = 7 }` shape).
+     */
+    private FuncInfo findZeroArgCtorForNewInstance(ClassInfo ci) {
+        if (ci == null || ci.isAbstract || ci.isPrivateCtor) return null;
+        if (ci.privateInitSigs.contains("")) return null; // explicit private init()
+        String ctorName = ci.fullName + ".constructor";
+        List<FuncInfo> grp = overloadGroups.get(ctorName);
+        if (grp != null) {
+            for (FuncInfo fi : grp) {
+                if (fi.paramTypes.isEmpty() && !fi.isNative) return fi;
+            }
+            return null; // overloads exist but none is a public zero-arg
+        }
+        FuncInfo fi = functions.get(ctorName);
+        if (fi != null && fi.paramTypes.isEmpty() && !fi.isNative) return fi;
+        return null;
+    }
+
+    /**
+     * Class.newInstance runtime @cang.newinstance(i32 %tid): a switch over every type that
+     * has a public zero-arg constructor — allocate sizeof via the null-GEP trick, bitcast,
+     * call the constructor (exceptions leave @cang.err.pending set; the call site unwinds).
+     * Returns the object pointer, or null when the type cannot be reflectively constructed
+     * (abstract, private, no zero-arg ctor, special literal typeId -1, unknown id).
+     */
+    private void emitNewInstanceHelper() {
+        if (header.toString().contains("define i8* @cang.newinstance(")) return;
+        String alloc = allocFn();
+        // Unique real classes by typeId (aliases share ClassInfo).
+        java.util.TreeMap<Integer, ClassInfo> byId = new java.util.TreeMap<>();
+        for (ClassInfo ci : classes.values()) byId.put(ci.typeId, ci);
+
+        StringBuilder f = new StringBuilder();
+        f.append("define i8* @cang.newinstance(i32 %tid) {\n");
+        f.append("entry:\n");
+        String pendingNext = null; // label to fall into on "not this type"
+        for (Map.Entry<Integer, ClassInfo> e : byId.entrySet()) {
+            ClassInfo ci = e.getValue();
+            if (findZeroArgCtorForNewInstance(ci) == null) continue;
+            int tid = e.getKey();
+            String cmp = "%ni.cmp." + tid;
+            String caseL = "ni.case." + tid;
+            String nextL = "ni.next." + tid;
+            if (pendingNext != null) {
+                f.append(pendingNext).append(":\n");
+            }
+            f.append("  ").append(cmp).append(" = icmp eq i32 %tid, ").append(tid).append("\n");
+            f.append("  br i1 ").append(cmp).append(", label %").append(caseL)
+             .append(", label %").append(nextL).append("\n");
+            pendingNext = nextL;
+            f.append(caseL).append(":\n");
+            // size = sizeof(ci) via null GEP; alloc; bitcast; call zero-arg ctor; return.
+            String szp = "%ni.szp." + tid;
+            f.append("  ").append(szp).append(" = getelementptr ").append(ci.llvmName)
+             .append(", ").append(ci.llvmName).append("* null, i32 1\n");
+            String sz = "%ni.sz." + tid;
+            f.append("  ").append(sz).append(" = ptrtoint ").append(ci.llvmName)
+             .append("* ").append(szp).append(" to i64\n");
+            String raw = "%ni.raw." + tid;
+            f.append("  ").append(raw).append(" = call i8* @").append(alloc)
+             .append("(i64 ").append(sz).append(")\n");
+            String obj = "%ni.obj." + tid;
+            f.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to ")
+             .append(ci.llvmName).append("*\n");
+            FuncInfo ctor = findZeroArgCtorForNewInstance(ci);
+            String ctorSym = ctor.llvmName != null ? ctor.llvmName : ctor.name;
+            f.append("  call void @").append(ctorSym).append("(").append(ci.llvmName)
+             .append("* ").append(obj).append(")\n");
+            f.append("  ret i8* ").append(raw).append("\n");
+        }
+        if (pendingNext != null) {
+            f.append(pendingNext).append(":\n");
+        }
+        f.append("  ret i8* null\n");
+        f.append("}\n\n");
+        header.append(f);
     }
 
     /** Apple.class: load the singleton Class* for the resolved class (or String/primitive). */
@@ -10454,6 +10564,82 @@ public class LLVMGen {
         String arr = "%fa.arr." + tmpCount++;
         body.append("  ").append(arr).append(" = call i8* @cang.field.list(i32 ").append(tid).append(")\n");
         return new LLVMValue(arr, "i8*", "Array<String>");
+    }
+
+    /**
+     * Class.newInstance(): read the receiver's _typeId, call @cang.newinstance, then
+     * null-check the result (typeId -1 / abstract / no public zero-arg ctor → null from
+     * the helper) and raise a catchable runtime Error carrying the class name. The
+     * constructed pointer is handed back as %cang_lang_Object* so Object intrinsics
+     * (getClassName/...) keep dispatching through the runtime typeId.
+     */
+    private LLVMValue generateClassNewInstance(ClassInfo classCi, LLVMValue recv, MethodCallExpr node) {
+        if (!node.args.isEmpty()) {
+            throw new RuntimeException("Class.newInstance accepts no arguments (at line " + node.line + ")");
+        }
+        int id = labelCount++;
+        String nx = "ni." + id;
+
+        // Load _typeId from the Class object.
+        Integer tidIdx = classCi.fieldIndices.get("_typeId");
+        if (tidIdx == null) {
+            throw new RuntimeException("cang/lang/Class must declare an 'int _typeId' field");
+        }
+        String tidPtr = "%ni.tidp." + tmpCount++;
+        body.append("  ").append(tidPtr).append(" = getelementptr ").append(classCi.llvmName)
+             .append(", ").append(classCi.llvmName).append("* ").append(recv.value)
+             .append(", i32 0, i32 ").append(tidIdx).append("\n");
+        String tid = "%ni.tid." + tmpCount++;
+        body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
+
+        emitNewInstanceHelper();
+        String raw = "%ni.raw." + tmpCount++;
+        body.append("  ").append(raw).append(" = call i8* @cang.newinstance(i32 ").append(tid).append(")\n");
+        emitPostCallUnwindCheck();
+
+        String isNull = "%ni.isnull." + tmpCount++;
+        body.append("  ").append(isNull).append(" = icmp eq i8* ").append(raw).append(", null\n");
+        String errL = nx + ".fail", okL = nx + ".ok";
+        body.append("  br i1 ").append(isNull).append(", label %").append(errL)
+             .append(", label %").append(okL).append("\n");
+        body.append(errL).append(":\n");
+        // Message: "Class.newInstance: <name> cannot be instantiated" — name from the Class
+        // object's _name field (allocation-free pointer into a compile-time constant).
+        Integer nameIdx = classCi.fieldIndices.get("_name");
+        String namePtr = "%ni.namep." + tmpCount++;
+        body.append("  ").append(namePtr).append(" = getelementptr ").append(classCi.llvmName)
+             .append(", ").append(classCi.llvmName).append("* ").append(recv.value)
+             .append(", i32 0, i32 ").append(nameIdx).append("\n");
+        String nameV = "%ni.name." + tmpCount++;
+        body.append("  ").append(nameV).append(" = load i8*, i8** ").append(namePtr).append("\n");
+        emitRuntimeErrorDynamic(buildClassNewInstanceMsg(new LLVMValue(nameV, "i8*")), node.line, okL);
+        body.append(okL).append(":\n");
+        String obj = "%ni.obj." + tmpCount++;
+        body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %cang_lang_Object*\n");
+        return new LLVMValue(obj, "%cang_lang_Object*", "Object");
+    }
+
+    /** "Class.newInstance: <name> cannot be instantiated" with the runtime class name. */
+    private LLVMValue buildClassNewInstanceMsg(LLVMValue nameV) {
+        if (!header.toString().contains("declare i32 @sprintf(")) {
+            header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
+        }
+        LLVMValue fmtV = makeStringConstant("Class.newInstance: %s cannot be instantiated");
+        String flen = "%nim.flen." + tmpCount++;
+        body.append("  ").append(flen).append(" = call i64 @strlen(i8* ").append(fmtV.value).append(")\n");
+        String nlen = "%nim.nlen." + tmpCount++;
+        body.append("  ").append(nlen).append(" = call i64 @strlen(i8* ").append(nameV.value).append(")\n");
+        // fmt is %s-expanded: rendered length = flen - 2 + nlen, plus the NUL.
+        String sz = "%nim.sz." + tmpCount++;
+        body.append("  ").append(sz).append(" = add i64 ").append(flen).append(", ").append(nlen).append("\n");
+        String sz2 = "%nim.sz2." + tmpCount++;
+        body.append("  ").append(sz2).append(" = sub i64 ").append(sz).append(", 1\n");
+        String buf = "%nim.buf." + tmpCount++;
+        body.append("  ").append(buf).append(" = call i8* @").append(allocFn()).append("(i64 ").append(sz2).append(")\n");
+        String n2 = "%nim.call." + tmpCount++;
+        body.append("  ").append(n2).append(" = call i32 (i8*, i8*, ...) @sprintf(i8* ").append(buf)
+             .append(", i8* ").append(fmtV.value).append(", i8* ").append(nameV.value).append(")\n");
+        return new LLVMValue(buf, "i8*");
     }
 
     /**

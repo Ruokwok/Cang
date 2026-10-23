@@ -10,6 +10,7 @@ class Class
     String _name
     String _simpleName
     Class _superClass
+    int _typeId = -1
 
     _init() {
     }
@@ -46,3 +47,10 @@ class Class
         String n = this._name
         return "class " + n
     }
+
+    # 反射构造：按本类的公开零参构造函数创建实例并返回 Object。
+    # 要求类非 abstract、非私有构造、且存在零参 init()（或隐式零参构造）。
+    # String.class / int.class 等特殊类字面量、以及只有带参构造的类 → 运行时错误。
+    # 构造函数体抛出的异常正常传播（可被调用方 try/catch 捕获）。
+    # 返回值用转型取回具体类型：var p = Point!$(Point.class.newInstance())
+    native func Object newInstance()

@@ -94,6 +94,7 @@ class Main
 | `getSuperclass()` | `Class` | 父类；`Object`、基本类型、`void` 返回 `null` |
 | `isAssignableFrom(Class other)` | `bool` | 本类是否等于 `other` 或是其父类/祖先 |
 | `toString()` | `String` | `"class " + 全名` |
+| `newInstance()` | `Object` | 反射构造：按本类公开零参构造创建实例；失败抛可捕获运行时错误 |
 
 ## String 与基本类型
 
@@ -110,6 +111,47 @@ Stdout.println(int.class.getSuperclass() == null)       # true
 ```
 
 这些 `Class` 对象同样全局单例；`String` 被视为普通引用类，父类为 `Object`。
+
+## 反射构造（newInstance）
+
+`newInstance()` 按本类的**公开零参构造**创建实例并返回 `Object`。返回值用转型取回具体类型：
+
+```cang
+# Point.cang
+class Point
+    int x = 7
+    String tag = "pt"
+```
+
+```cang
+# Main.cang
+import Point
+
+class Main
+    static func void main(String[] args) {
+        Object obj = Point.class.newInstance()
+        var f = new Field(obj)
+        Stdout.println(f.getInt("x"))    # 7
+        Stdout.println(f.getString("tag")) # pt
+
+        # 配合转型使用（需类型匹配）
+        Point p = Point!$(obj)
+        Stdout.println(p.x)              # 7
+    }
+}
+```
+
+要求与失败行为：
+
+- 类必须非 `abstract`、非私有构造（`class _Foo` / 私有 `_init()`）；
+- 必须存在公开零参构造：显式 `init()`，或无显式 `init` 时的隐式零参构造（字段只有默认值的常见形态）；
+- 只有带参构造（如仅 `init(int x)`）→ 运行时错误；
+- `String.class` / `int.class` 等特殊类字面量 → 运行时错误；
+- 失败抛出可被 `try/catch` 捕获的 `Error`，消息形如
+  `Class.newInstance: Point cannot be instantiated`；
+- 构造函数体中抛出的异常正常传播。
+
+与 [Field.list()](Field.md) 组合可实现"反射构造 + 字段枚举"的序列化雏形。
 
 ## 限制
 
