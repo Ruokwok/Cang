@@ -1,0 +1,23 @@
+namespace cang/util/json
+
+# JsonException - JSON 解析 / 类型访问错误
+# offset 为 UTF-8 字节偏移，line/column 从 1 开始（column 按字节计数）。
+# 继承 Error，可被 catch (Error e) 或 catch (JsonException e) 捕获。
+
+import cang/lang/Error
+
+class JsonException : Error
+    int offset = 0;
+    int line = 1;
+    int column = 1;
+
+    init(String message) {
+        super(message)
+    }
+
+    init(String message, int offset, int line, int column) {
+        super(message)
+        this.offset = offset
+        this.line = line
+        this.column = column
+    }

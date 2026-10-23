@@ -1,0 +1,119 @@
+namespace cang/util/json
+
+# Json - JSON 库入口（纯 Cang 实现，不依赖反射）
+#
+# 核心 API：
+#   JsonValue v = Json.parse(text)              # 严格解析
+#   String s = Json.stringify(v)                # 紧凑序列化
+#   String p = Json.stringify(v, true)          # 两空格缩进
+#   JsonObject o = Json.parseObject(text)
+#   JsonArray a = Json.parseArray(text)
+#
+# 对象映射（不使用反射）：
+#   实现 JsonAdapter，注册到 JsonMapper，详见 JsonMapper / JsonAdapter 注释。
+#
+# 值构造：
+#   Json.object() / Json.array() / Json.text("x") / Json.integer(1) / Json.decimal(1.5)
+#   Json.boolValue(true) / Json.nullValue()
+
+import cang/util/json/JsonArray
+import cang/util/json/JsonBool
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonNumber
+import cang/util/json/JsonObject
+import cang/util/json/JsonParser
+import cang/util/json/JsonSerializable
+import cang/util/json/JsonString
+import cang/util/json/JsonValue
+import cang/util/json/JsonWriter
+
+class Json
+    # 解析完整 JSON 文本；非法输入抛 JsonException
+    static func JsonValue parse(String text) {
+        return new JsonParser(text).parse()
+    }
+
+    # 解析并要求根节点是对象
+    static func JsonObject parseObject(String text) {
+        JsonValue v = new JsonParser(text).parse()
+        JsonObject o = JsonObject$(v)
+        if (o == null) {
+            throw new JsonException("Expected JSON object but got " + v.typeName())
+        }
+        return o
+    }
+
+    # 解析并要求根节点是数组
+    static func JsonArray parseArray(String text) {
+        JsonValue v = new JsonParser(text).parse()
+        JsonArray a = JsonArray$(v)
+        if (a == null) {
+            throw new JsonException("Expected JSON array but got " + v.typeName())
+        }
+        return a
+    }
+
+    # 紧凑序列化
+    static func String stringify(JsonValue value) {
+        return new JsonWriter().write(value)
+    }
+
+    # pretty=true 时两空格缩进
+    static func String stringify(JsonValue value, bool pretty) {
+        return new JsonWriter(pretty).write(value)
+    }
+
+    # JsonSerializable 自编码对象（无需注册 adapter）
+    static func String stringifySerializable(JsonSerializable value) {
+        if (value == null) {
+            return "null"
+        }
+        return new JsonWriter().write(value.toJson())
+    }
+
+    static func String stringifySerializable(JsonSerializable value, bool pretty) {
+        if (value == null) {
+            return "null"
+        }
+        return new JsonWriter(pretty).write(value.toJson())
+    }
+
+    # 两空格缩进的便捷入口
+    static func String pretty(JsonValue value) {
+        return new JsonWriter(true).write(value)
+    }
+
+    # ---- 值构造便捷方法 ----
+
+    static func JsonNull nullValue() {
+        return JsonNull.instance()
+    }
+
+    static func JsonBool boolValue(bool value) {
+        return new JsonBool(value)
+    }
+
+    static func JsonString text(String value) {
+        return new JsonString(value)
+    }
+
+    static func JsonNumber integer(int value) {
+        return new JsonNumber(value)
+    }
+
+    static func JsonNumber integer(long value) {
+        return new JsonNumber(value)
+    }
+
+    static func JsonNumber decimal(double value) {
+        return new JsonNumber(value)
+    }
+
+    static func JsonArray array() {
+        return new JsonArray()
+    }
+
+    static func JsonObject object() {
+        return new JsonObject()
+    }

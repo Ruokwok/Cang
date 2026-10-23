@@ -1,0 +1,127 @@
+namespace cang/util/json
+
+# JsonValue - JSON 值树抽象基类（纯 Cang 实现，不依赖反射）
+# 结构对应 RFC 8259：null / bool / number / string / array / object。
+# 子类：JsonNull、JsonBool、JsonNumber、JsonString、JsonArray、JsonObject。
+# 说明：
+# - type() 返回 JsonValue.TYPE_*，用于 writer 分派；
+# - asXxx() 在类型不匹配时抛 JsonException；
+# - get(key)/get(index)/size()/keys() 由容器子类覆盖，基类默认抛错。
+
+import cang/util/json/JsonException
+
+abstract class JsonValue
+    static final int TYPE_NULL = 0
+    static final int TYPE_BOOL = 1
+    static final int TYPE_NUMBER = 2
+    static final int TYPE_STRING = 3
+    static final int TYPE_ARRAY = 4
+    static final int TYPE_OBJECT = 5
+
+    init() {
+    }
+
+    # 值类型（TYPE_* 常量）
+    abstract func int type()
+
+    # 类型名的可读形式（错误信息用）
+    func String typeName() {
+        int t = this.type()
+        if (t == JsonValue.TYPE_NULL) {
+            return "null"
+        }
+        if (t == JsonValue.TYPE_BOOL) {
+            return "bool"
+        }
+        if (t == JsonValue.TYPE_NUMBER) {
+            return "number"
+        }
+        if (t == JsonValue.TYPE_STRING) {
+            return "string"
+        }
+        if (t == JsonValue.TYPE_ARRAY) {
+            return "array"
+        }
+        if (t == JsonValue.TYPE_OBJECT) {
+            return "object"
+        }
+        return "unknown"
+    }
+
+    func bool isNull() {
+        return this.type() == JsonValue.TYPE_NULL
+    }
+
+    func bool isBool() {
+        return this.type() == JsonValue.TYPE_BOOL
+    }
+
+    func bool isNumber() {
+        return this.type() == JsonValue.TYPE_NUMBER
+    }
+
+    func bool isString() {
+        return this.type() == JsonValue.TYPE_STRING
+    }
+
+    func bool isArray() {
+        return this.type() == JsonValue.TYPE_ARRAY
+    }
+
+    func bool isObject() {
+        return this.type() == JsonValue.TYPE_OBJECT
+    }
+
+    # ---- 标量访问（子类覆盖；基类抛类型错误）----
+
+    func bool asBool() {
+        throw new JsonException("Expected JSON bool but got " + this.typeName())
+        return false
+    }
+
+    func long asLong() {
+        throw new JsonException("Expected JSON number but got " + this.typeName())
+        return 0L
+    }
+
+    func int asInt() {
+        throw new JsonException("Expected JSON number but got " + this.typeName())
+        return 0
+    }
+
+    func double asDouble() {
+        throw new JsonException("Expected JSON number but got " + this.typeName())
+        return 0.0
+    }
+
+    func String asString() {
+        throw new JsonException("Expected JSON string but got " + this.typeName())
+        return ""
+    }
+
+    # ---- 容器访问（JsonObject / JsonArray 覆盖）----
+
+    # 对象按 key 取值；不存在抛错
+    func JsonValue get(String key) {
+        throw new JsonException("Expected JSON object but got " + this.typeName())
+        JsonValue none = null
+        return none
+    }
+
+    # 数组按下标取值；越界抛错
+    func JsonValue get(int index) {
+        throw new JsonException("Expected JSON array but got " + this.typeName())
+        JsonValue none = null
+        return none
+    }
+
+    # 容器元素个数；标量返回 1（语义上只有一个值）
+    func int size() {
+        return 1
+    }
+
+    # 对象键快照；非对象抛错
+    func String[] keys() {
+        throw new JsonException("Expected JSON object but got " + this.typeName())
+        return new String[0]
+    }

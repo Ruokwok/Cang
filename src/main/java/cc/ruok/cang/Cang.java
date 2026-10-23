@@ -417,6 +417,8 @@ public class Cang {
                     pkg = "cang/lang/" + r;
                 } else if (pkg == null && resolveImportFile(sourceRoot, "cang/io/" + r) != null) {
                     pkg = "cang/io/" + r;
+                } else if (pkg == null && resolveImportFile(sourceRoot, "cang/util/json/" + r) != null) {
+                    pkg = "cang/util/json/" + r;
                 }
                 if (pkg == null) continue;
                 List<AST> more = loadImport(pkg, sourceRoot, visitedFiles);
@@ -808,7 +810,22 @@ public class Cang {
         "cang/io/Scanner.cang",
         "cang/lang/ProcessBuilder.cang",
         "cang/lang/StringBuilder.cang",
-        "cang/lang/Class.cang"
+        "cang/lang/Class.cang",
+        "cang/util/json/Json.cang",
+        "cang/util/json/JsonAdapter.cang",
+        "cang/util/json/JsonArray.cang",
+        "cang/util/json/JsonBool.cang",
+        "cang/util/json/JsonContext.cang",
+        "cang/util/json/JsonException.cang",
+        "cang/util/json/JsonMapper.cang",
+        "cang/util/json/JsonNull.cang",
+        "cang/util/json/JsonNumber.cang",
+        "cang/util/json/JsonObject.cang",
+        "cang/util/json/JsonParser.cang",
+        "cang/util/json/JsonSerializable.cang",
+        "cang/util/json/JsonString.cang",
+        "cang/util/json/JsonValue.cang",
+        "cang/util/json/JsonWriter.cang"
     };
 
     /**

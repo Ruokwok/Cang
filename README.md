@@ -24,6 +24,7 @@ Cang 是一个使用 Java 编写前端、输出 LLVM IR 的实验性编程语言
 - lambda 闭包（按值捕获外部变量与 `this`）；
 - `this::method`、`object::method`、`Class::staticMethod` 方法引用；
 - `Math`、`System`、`Stdout`、`Stderr`、`String`、`List`、`Dict`、`Class`、`Field` 等基础标准库；
+- `cang/util/json`：严格 RFC 8259 JSON 解析/序列化、`JsonValue` 树，以及不使用反射的手工 `JsonAdapter` 对象映射；
 - `try/catch/finally` 与 `Error`（支持跨函数传播、可捕获运行时错误）；
 - 线程：`new Thread().task(fn).start()` 对象式写法与 `thread { }` 语法糖（`Thread.spawn` 已移除）；
 - 协程：`new Coroutine(fn).start().join()` 与 `coroutine { }` 语法糖（libuv 单线程事件循环）；
@@ -214,8 +215,9 @@ cang app.cang --no-gc      # 切回纯手动 free 模式
 标准库源码位于：
 
 ```text
-stdlib/cang/lang/    # 语言标准库
-stdlib/cang/io/      # IO 标准库
+stdlib/cang/lang/       # 语言标准库
+stdlib/cang/io/         # IO 标准库
+stdlib/cang/util/json/  # JSON 解析、序列化与对象映射
 ```
 
 主要文件：
@@ -237,9 +239,12 @@ stdlib/cang/io/      # IO 标准库
 - `cang/lang/ProcessBuilder.cang`：本地命令执行（exec 按行回调、超时终止、退出码；argv 直执行无 shell）；
 - `cang/lang/StringBuilder.cang`：高效字符串构建（append 摊还 O(1)、toString 不可变快照、自动翻倍扩容）；
 - `cang/io/File.cang`：路径、目录与文本文件读写；
-- `cang/io/Scanner.cang`：单例标准输入（readLine/readKey 阻塞读取）。
+- `cang/io/Scanner.cang`：单例标准输入（readLine/readKey 阻塞读取）；
+- `cang/util/json/Json.cang`：JSON 门面（parse/stringify/pretty/工厂方法）；
+- `cang/util/json/JsonValue.cang` 等：JSON 值树、严格解析器、writer；
+- `cang/util/json/JsonAdapter.cang` / `JsonMapper.cang`：不使用反射的手工对象映射。
 
-引用这些类型时编译器会自动按 `cang/lang`、`cang/io` 顺序加载；显式 `import` 仍然有效且优先。
+引用这些类型时编译器会自动按 `cang/lang`、`cang/io`、`cang/util/json` 顺序加载；显式 `import` 仍然有效且优先。
 
 ## 项目结构
 
@@ -251,8 +256,9 @@ Cang/
 │   ├── codegen/     # LLVM IR 生成
 │   └── util/        # 编译错误和工具类
 ├── stdlib/
-│   ├── cang/lang/   # 语言标准库源码
-│   └── cang/io/     # IO 标准库源码
+│   ├── cang/lang/       # 语言标准库源码
+│   ├── cang/io/         # IO 标准库源码
+│   └── cang/util/json/  # JSON 解析、序列化与对象映射
 ├── docs/             # 文档（按学习路线拆分：语言一章一文件 + 标准库每类一文件）
 ├── test/             # 测试和示例（仅本地，不入库）
 ├── working/          # 多文件工作示例（仅本地，不入库）
@@ -267,7 +273,7 @@ Cang 目前不应被视为稳定语言或生产级编译器，主要限制包括
 
 - 编译器缺少完整的自动化测试、持续集成和模糊测试体系；
 - 错误恢复和诊断能力仍有限；
-- 标准库规模较小，网络、JSON 等 API 仍缺失；
+- 标准库规模较小，网络等 API 仍缺失（JSON 已提供 `cang/util/json`，见 [Json.md](docs/libs/Json.md)）；
 - 异常系统已支持跨函数传播，但同一 `try` 只支持一个 `catch`，`Error.stack` 尚未自动填充；
 - 数组越界和空指针等运行时错误在未捕获时会终止程序（已捕获则走 `catch`）；
 - 在别名场景下提前 `free` 存在 use-after-free 风险；

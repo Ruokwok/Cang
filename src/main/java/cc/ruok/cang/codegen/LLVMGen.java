@@ -133,6 +133,7 @@ public class LLVMGen {
     private Scope scope;
     private String currentClassName;
     private String currentFuncReturnType = "void";
+    private String currentFuncName = "";
     private String currentGcFrame = null;
     private String currentNamespace = ""; // e.g. "cc/ruok/cang"
     private final List<String> imports = new ArrayList<>();
@@ -2067,6 +2068,7 @@ public class LLVMGen {
         scope = new Scope(null);
         tmpCount = 0;
         currentFuncReturnType = decl.returnType;
+        currentFuncName = funcName;
         emitGcFrameSetup();
 
         if (className != null && !decl.isStatic) {
@@ -3989,7 +3991,7 @@ public class LLVMGen {
                     String actualCang = val.value != null && val.value.equals("null")
                         ? "null" : cangTypeFromLLVM(val.type);
                     throw new RuntimeException(
-                        "Return type mismatch: expected '" + retType +
+                        "Return type mismatch in " + currentFuncName + ": expected '" + retType +
                         "' but found '" + actualCang + "' (at line " + stmt.line + ")");
                 }
             }
@@ -4546,11 +4548,57 @@ public class LLVMGen {
         if (arg instanceof BoolLit) return "i1";
         if (arg instanceof StringLit) return "i8*";
         if (arg instanceof NullLit) return "null";
-        if (arg instanceof Identifier && scope != null) {
-            LLVMValue v = scope.lookup(((Identifier) arg).name);
+        return staticExprType(arg);
+    }
+
+    /**
+     * Best-effort static LLVM type of an expression, used only to disambiguate overloads.
+     * Never emits IR. Returns null when the type cannot be determined statically.
+     */
+    private String staticExprType(AST expr) {
+        if (expr == null) return null;
+        if (expr instanceof Identifier && scope != null) {
+            LLVMValue v = scope.lookup(((Identifier) expr).name);
             if (v != null) return v.type;
+            return null;
+        }
+        if (expr instanceof ThisExpr && scope != null) {
+            LLVMValue v = scope.lookup("this");
+            if (v != null) return v.type;
+            return null;
+        }
+        if (expr instanceof FieldAccessExpr) {
+            FieldAccessExpr fa = (FieldAccessExpr) expr;
+            String owner = staticExprType(fa.object);
+            ClassInfo ci = classInfoOfLLVMType(owner);
+            if (ci == null) return null;
+            Integer idx = ci.fieldIndices.get(fa.field);
+            if (idx == null || idx - 1 >= ci.fieldTypes.size()) return null;
+            return toLLVMType(ci.fieldTypes.get(idx - 1));
+        }
+        if (expr instanceof MethodCallExpr) {
+            MethodCallExpr mc = (MethodCallExpr) expr;
+            String owner = staticExprType(mc.object);
+            ClassInfo ci = classInfoOfLLVMType(owner);
+            if (ci == null) return null;
+            List<FuncInfo> cands = lookupInstanceMethods(ci, mc.method);
+            if (cands == null) return null;
+            String ret = null;
+            for (FuncInfo f : cands) {
+                if (f.paramTypes.size() != mc.args.size()) continue;
+                String t = toLLVMType(f.returnType);
+                if (ret == null) ret = t;
+                else if (!ret.equals(t)) return null; // overloads disagree — stay conservative
+            }
+            return ret;
         }
         return null;
+    }
+
+    /** Resolve a class from an LLVM value type such as "%Foo*"; null when primitive/unknown. */
+    private ClassInfo classInfoOfLLVMType(String llvmType) {
+        if (llvmType == null || !llvmType.startsWith("%") || !llvmType.endsWith("*")) return null;
+        return classes.get(extractClassName(llvmType));
     }
 
     /**

@@ -1,0 +1,22 @@
+namespace cang/util/json
+
+# JsonNull - JSON null（单例）
+import cang/util/json/JsonValue
+
+class JsonNull : JsonValue
+    static JsonNull shared = null
+
+    init() {
+    }
+
+    func int type() {
+        return JsonValue.TYPE_NULL
+    }
+
+    # 共享的 null 实例（推荐用 Json.nullValue()）
+    static func JsonNull instance() {
+        if (shared == null) {
+            shared = new JsonNull()
+        }
+        return shared
+    }

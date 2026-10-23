@@ -1,0 +1,147 @@
+namespace cang/util/json
+
+# JsonArray - JSON 数组
+# 底层自扩容 JsonValue[]，保持插入顺序；null 元素自动转为 JsonNull。
+# 提供 add 类型重载，手工映射时可直接写 arr.add("x").add(1)。
+
+import cang/util/json/JsonBool
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonNumber
+import cang/util/json/JsonString
+import cang/util/json/JsonValue
+
+class JsonArray : JsonValue
+    JsonValue[] items = new JsonValue[8];
+    int count = 0;
+
+    init() {
+    }
+
+    func int type() {
+        return JsonValue.TYPE_ARRAY
+    }
+
+    func int size() {
+        return this.count
+    }
+
+    func bool isEmpty() {
+        return this.count == 0
+    }
+
+    func JsonArray add(JsonValue value) {
+        return this._add(value)
+    }
+
+    # 非重载入口：参数类型已知时优先用 addValue，避免 new/嵌套调用在重载解析中的限制
+    func JsonArray addValue(JsonValue value) {
+        return this._add(value)
+    }
+
+    func JsonArray add(int value) {
+        JsonValue n = new JsonNumber(value)
+        return this._add(n)
+    }
+
+    func JsonArray add(long value) {
+        JsonValue n = new JsonNumber(value)
+        return this._add(n)
+    }
+
+    func JsonArray add(double value) {
+        JsonValue n = new JsonNumber(value)
+        return this._add(n)
+    }
+
+    func JsonArray add(String value) {
+        JsonValue n = new JsonString(value)
+        return this._add(n)
+    }
+
+    func JsonArray add(bool value) {
+        JsonValue n = new JsonBool(value)
+        return this._add(n)
+    }
+
+    func JsonArray addNull() {
+        JsonValue n = JsonNull.instance()
+        return this._add(n)
+    }
+
+    # 私有核心：绕开重载解析，避免 new 表达式在重载实参位置的类型推断问题
+    func JsonArray _add(JsonValue value) {
+        if (value == null) {
+            value = JsonNull.instance()
+        }
+        if (this.count == this.items.length()) {
+            this._grow()
+        }
+        this.items[this.count] = value
+        this.count = this.count + 1
+        return this
+    }
+
+    func JsonValue get(int index) {
+        if (index < 0 || index >= this.count) {
+            throw new JsonException("JSON array index out of bounds: " + index)
+        }
+        return this.items[index]
+    }
+
+    func void set(int index, JsonValue value) {
+        if (index < 0 || index >= this.count) {
+            throw new JsonException("JSON array index out of bounds: " + index)
+        }
+        if (value == null) {
+            value = JsonNull.instance()
+        }
+        this.items[index] = value
+    }
+
+    # 删除并返回指定下标元素
+    func JsonValue remove(int index) {
+        if (index < 0 || index >= this.count) {
+            throw new JsonException("JSON array index out of bounds: " + index)
+        }
+        JsonValue old = this.items[index]
+        int i = index
+        int last = this.count - 1
+        while (i < last) {
+            this.items[i] = this.items[i + 1]
+            i = i + 1
+        }
+        this.count = last
+        return old
+    }
+
+    func void clear() {
+        this.count = 0
+    }
+
+    # 拷贝为长度等于 size() 的新数组（可安全用于 for-each）
+    func JsonValue[] toArray() {
+        JsonValue[] out = new JsonValue[this.count]
+        int i = 0
+        while (i < this.count) {
+            out[i] = this.items[i]
+            i = i + 1
+        }
+        return out
+    }
+
+    # 私有：容量翻倍
+    func void _grow() {
+        int oldCap = this.items.length()
+        int newCap = oldCap * 2
+        if (newCap <= oldCap) {
+            newCap = oldCap + 8
+        }
+        JsonValue[] bigger = new JsonValue[newCap]
+        int i = 0
+        while (i < this.count) {
+            bigger[i] = this.items[i]
+            i = i + 1
+        }
+        this.items = bigger
+    }

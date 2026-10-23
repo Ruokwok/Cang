@@ -1,0 +1,23 @@
+namespace cang/util/json
+
+# JsonBool - JSON true / false
+import cang/util/json/JsonValue
+
+class JsonBool : JsonValue
+    bool value = false;
+
+    init(bool value) {
+        this.value = value
+    }
+
+    func int type() {
+        return JsonValue.TYPE_BOOL
+    }
+
+    func bool asBool() {
+        return this.value
+    }
+
+    static func JsonBool of(bool value) {
+        return new JsonBool(value)
+    }

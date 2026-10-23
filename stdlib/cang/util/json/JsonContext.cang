@@ -1,0 +1,19 @@
+namespace cang/util/json
+
+# JsonContext - 编解码上下文（嵌套对象递归入口）
+# JsonMapper 实现此接口；JsonAdapter 通过 ctx 编解码字段中的其他业务对象。
+# 这样 adapter 之间无需互相 import，也不会形成循环依赖。
+#
+# 嵌套解码示例：
+#   Address a = Address!$(ctx.fromJsonValue(json.get("address"), Address.class))
+
+import cang/lang/Class
+import cang/util/json/JsonException
+import cang/util/json/JsonValue
+
+abstract class JsonContext
+    # 将任意已注册对象编码为 JsonValue（null → JsonNull）
+    abstract func JsonValue toJsonValue(Object value)
+
+    # 按 Class 解码 JsonValue（JSON null → null）
+    abstract func Object fromJsonValue(JsonValue value, Class type)

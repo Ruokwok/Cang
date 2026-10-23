@@ -1,0 +1,418 @@
+namespace cang/util/json
+
+# JsonParser - 严格 RFC 8259 JSON 递归下降解析器
+# 支持：
+# - null / true / false / number / string / array / object；
+# - \uXXXX 与 UTF-16 代理对（合并为一个 Unicode 标量再转 UTF-8）；
+# - 默认最大嵌套 512 层；
+# - 错误抛 JsonException，带字节偏移与行列号。
+# 不支持：注释、尾逗号、单引号字符串、NaN/Infinity（严格 JSON）。
+# 字符串按 UTF-8 字节扫描（byteAt/charAt），整体 O(n)。
+
+import cang/lang/StringBuilder
+import cang/util/json/JsonArray
+import cang/util/json/JsonBool
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonNumber
+import cang/util/json/JsonObject
+import cang/util/json/JsonString
+import cang/util/json/JsonValue
+
+class JsonParser
+    String text = "";
+    int length = 0;
+    int pos = 0;
+    int maxDepth = 512;
+
+    init(String text) {
+        if (text == null) {
+            throw new JsonException("JSON text is null")
+        }
+        this.text = text
+        this.length = text.length()
+    }
+
+    init(String text, int maxDepth) {
+        if (text == null) {
+            throw new JsonException("JSON text is null")
+        }
+        this.text = text
+        this.length = text.length()
+        if (maxDepth > 0) {
+            this.maxDepth = maxDepth
+        }
+    }
+
+    # 解析完整 JSON 文本；尾部只允许空白
+    func JsonValue parse() {
+        this.pos = 0
+        this._skipWhitespace()
+        if (this.pos >= this.length) {
+            throw this._error("Unexpected end of input")
+        }
+        JsonValue value = this._parseValue(0)
+        this._skipWhitespace()
+        if (this.pos != this.length) {
+            throw this._error("Unexpected trailing characters")
+        }
+        return value
+    }
+
+    func JsonValue _parseValue(int depth) {
+        if (depth > this.maxDepth) {
+            throw this._error("Maximum nesting depth exceeded")
+        }
+        this._skipWhitespace()
+        if (this.pos >= this.length) {
+            throw this._error("Unexpected end of input")
+        }
+        int b = this._byteAt(this.pos)
+        if (b == 123) {
+            return this._parseObject(depth)
+        }
+        if (b == 91) {
+            return this._parseArray(depth)
+        }
+        if (b == 34) {
+            return this._parseString()
+        }
+        if (b == 116) {
+            this._expectLiteral("true")
+            JsonValue t = new JsonBool(true)
+            return t
+        }
+        if (b == 102) {
+            this._expectLiteral("false")
+            JsonValue f = new JsonBool(false)
+            return f
+        }
+        if (b == 110) {
+            this._expectLiteral("null")
+            JsonValue n = JsonNull.instance()
+            return n
+        }
+        if (b == 45 || (b >= 48 && b <= 57)) {
+            return this._parseNumber()
+        }
+        throw this._error("Unexpected character: " + this._charAt(this.pos))
+        JsonValue none = null
+        return none
+    }
+
+    func void _expectLiteral(String literal) {
+        int n = literal.length()
+        if (this.pos + n > this.length) {
+            throw this._error("Invalid literal (expected " + literal + ")")
+        }
+        if (this._slice(this.pos, this.pos + n) != literal) {
+            throw this._error("Invalid literal (expected " + literal + ")")
+        }
+        this.pos = this.pos + n
+        if (this.pos < this.length) {
+            int b = this._byteAt(this.pos)
+            if (!this._isValueBoundary(b)) {
+                throw this._error("Invalid character after literal")
+            }
+        }
+    }
+
+    func JsonValue _parseString() {
+        this.pos = this.pos + 1
+        StringBuilder sb = new StringBuilder()
+        while (this.pos < this.length) {
+            int b = this._byteAt(this.pos)
+            if (b == 34) {
+                this.pos = this.pos + 1
+                JsonString s = new JsonString(sb.toString())
+                JsonValue value = s
+                return value
+            }
+            if (b == 92) {
+                this.pos = this.pos + 1
+                if (this.pos >= this.length) {
+                    throw this._error("Unterminated escape sequence")
+                }
+                int e = this._byteAt(this.pos)
+                if (e == 34) {
+                    sb.append("\"")
+                    this.pos = this.pos + 1
+                } else if (e == 92) {
+                    sb.append("\\")
+                    this.pos = this.pos + 1
+                } else if (e == 47) {
+                    sb.append("/")
+                    this.pos = this.pos + 1
+                } else if (e == 98) {
+                    sb.append(String.fromCodePoint(8))
+                    this.pos = this.pos + 1
+                } else if (e == 102) {
+                    sb.append(String.fromCodePoint(12))
+                    this.pos = this.pos + 1
+                } else if (e == 110) {
+                    sb.append("\n")
+                    this.pos = this.pos + 1
+                } else if (e == 114) {
+                    sb.append("\r")
+                    this.pos = this.pos + 1
+                } else if (e == 116) {
+                    sb.append("\t")
+                    this.pos = this.pos + 1
+                } else if (e == 117) {
+                    this.pos = this.pos + 1
+                    int cp = this._readHex4()
+                    # Cang String 以 NUL 结尾，无法安全保存 \u0000
+                    if (cp == 0) {
+                        throw this._error("\\u0000 is not supported by Cang strings")
+                    }
+                    if (cp >= 55296 && cp <= 56319) {
+                        # 高代理项：必须紧跟 \uXXXX 低代理项
+                        if (this.pos + 1 < this.length
+                                && this._byteAt(this.pos) == 92
+                                && this._byteAt(this.pos + 1) == 117) {
+                            this.pos = this.pos + 2
+                            int low = this._readHex4()
+                            if (low < 56320 || low > 57343) {
+                                throw this._error("Invalid low surrogate")
+                            }
+                            cp = 65536 + (cp - 55296) * 1024 + (low - 56320)
+                        } else {
+                            throw this._error("Lone high surrogate")
+                        }
+                    } else if (cp >= 56320 && cp <= 57343) {
+                        throw this._error("Lone low surrogate")
+                    }
+                    sb.append(String.fromCodePoint(cp))
+                } else {
+                    throw this._error("Invalid escape sequence")
+                }
+            } else if (b < 32) {
+                throw this._error("Unescaped control character in string")
+            } else {
+                # 原样保留 UTF-8 字节（多字节字符逐字节追加）
+                sb.append(this._charAt(this.pos))
+                this.pos = this.pos + 1
+            }
+        }
+        throw this._error("Unterminated string")
+        JsonValue none = null
+        return none
+    }
+
+    # 读取 4 位十六进制（pos 指向第一位）
+    func int _readHex4() {
+        if (this.pos + 4 > this.length) {
+            throw this._error("Incomplete \\u escape")
+        }
+        int value = 0
+        int i = 0
+        while (i < 4) {
+            int d = JsonParser._hexValue(this._byteAt(this.pos))
+            if (d < 0) {
+                throw this._error("Invalid \\u escape")
+            }
+            value = value * 16 + d
+            this.pos = this.pos + 1
+            i = i + 1
+        }
+        return value
+    }
+
+    func JsonValue _parseNumber() {
+        int start = this.pos
+        if (this._byteAt(this.pos) == 45) {
+            this.pos = this.pos + 1
+        }
+        if (this.pos >= this.length) {
+            throw this._error("Invalid number")
+        }
+        int b = this._byteAt(this.pos)
+        if (b == 48) {
+            this.pos = this.pos + 1
+        } else if (b >= 49 && b <= 57) {
+            while (this.pos < this.length && JsonParser._digit(this._byteAt(this.pos))) {
+                this.pos = this.pos + 1
+            }
+        } else {
+            throw this._error("Invalid number")
+        }
+        if (this.pos < this.length && this._byteAt(this.pos) == 46) {
+            this.pos = this.pos + 1
+            if (this.pos >= this.length || !JsonParser._digit(this._byteAt(this.pos))) {
+                throw this._error("Invalid number fraction")
+            }
+            while (this.pos < this.length && JsonParser._digit(this._byteAt(this.pos))) {
+                this.pos = this.pos + 1
+            }
+        }
+        if (this.pos < this.length) {
+            b = this._byteAt(this.pos)
+            if (b == 101 || b == 69) {
+                this.pos = this.pos + 1
+                if (this.pos < this.length) {
+                    b = this._byteAt(this.pos)
+                    if (b == 43 || b == 45) {
+                        this.pos = this.pos + 1
+                    }
+                }
+                if (this.pos >= this.length || !JsonParser._digit(this._byteAt(this.pos))) {
+                    throw this._error("Invalid number exponent")
+                }
+                while (this.pos < this.length && JsonParser._digit(this._byteAt(this.pos))) {
+                    this.pos = this.pos + 1
+                }
+            }
+        }
+        if (this.pos < this.length && !this._isValueBoundary(this._byteAt(this.pos))) {
+            throw this._error("Invalid character after number")
+        }
+        String raw = this._slice(start, this.pos)
+        JsonNumber n = JsonNumber.parse(raw)
+        JsonValue value = n
+        return value
+    }
+
+    func JsonValue _parseArray(int depth) {
+        this.pos = this.pos + 1
+        JsonArray arr = new JsonArray()
+        this._skipWhitespace()
+        if (this.pos < this.length && this._byteAt(this.pos) == 93) {
+            this.pos = this.pos + 1
+            JsonValue value = arr
+            return value
+        }
+        while (true) {
+            if (this.pos >= this.length) {
+                throw this._error("Unterminated array")
+            }
+            JsonValue item = this._parseValue(depth + 1)
+            arr.addValue(item)
+            this._skipWhitespace()
+            if (this.pos >= this.length) {
+                throw this._error("Unterminated array")
+            }
+            int b = this._byteAt(this.pos)
+            if (b == 44) {
+                this.pos = this.pos + 1
+            } else if (b == 93) {
+                this.pos = this.pos + 1
+                JsonValue value = arr
+                return value
+            } else {
+                throw this._error("Expected ',' or ']'")
+            }
+        }
+        JsonValue value = arr
+        return value
+    }
+
+    func JsonValue _parseObject(int depth) {
+        this.pos = this.pos + 1
+        JsonObject obj = new JsonObject()
+        this._skipWhitespace()
+        if (this.pos < this.length && this._byteAt(this.pos) == 125) {
+            this.pos = this.pos + 1
+            JsonValue value = obj
+            return value
+        }
+        while (true) {
+            this._skipWhitespace()
+            if (this.pos >= this.length || this._byteAt(this.pos) != 34) {
+                throw this._error("Expected string key")
+            }
+            String key = this._parseString().asString()
+            this._skipWhitespace()
+            if (this.pos >= this.length || this._byteAt(this.pos) != 58) {
+                throw this._error("Expected ':'")
+            }
+            this.pos = this.pos + 1
+            JsonValue item = this._parseValue(depth + 1)
+            obj.putValue(key, item)
+            this._skipWhitespace()
+            if (this.pos >= this.length) {
+                throw this._error("Unterminated object")
+            }
+            int b = this._byteAt(this.pos)
+            if (b == 44) {
+                this.pos = this.pos + 1
+            } else if (b == 125) {
+                this.pos = this.pos + 1
+                JsonValue value = obj
+                return value
+            } else {
+                throw this._error("Expected ',' or '}'")
+            }
+        }
+        JsonValue value = obj
+        return value
+    }
+
+    func void _skipWhitespace() {
+        while (this.pos < this.length) {
+            int b = this._byteAt(this.pos)
+            if (b == 32 || b == 9 || b == 10 || b == 13) {
+                this.pos = this.pos + 1
+            } else {
+                return
+            }
+        }
+    }
+
+    # String 字段直接调用方法时静态类型可能退化为 i8*，统一经局部变量转发
+    func int _byteAt(int index) {
+        String s = this.text
+        return s.byteAt(index)
+    }
+
+    func String _charAt(int index) {
+        String s = this.text
+        return s.charAt(index)
+    }
+
+    func String _slice(int start, int end) {
+        String s = this.text
+        return s.substring(start, end)
+    }
+
+    func bool _isValueBoundary(int b) {
+        return b == 32 || b == 9 || b == 10 || b == 13
+            || b == 44 || b == 93 || b == 125
+    }
+
+    func JsonException _error(String message) {
+        int line = 1
+        int column = 1
+        int i = 0
+        int limit = this.pos
+        if (limit > this.length) {
+            limit = this.length
+        }
+        while (i < limit) {
+            if (this._byteAt(i) == 10) {
+                line = line + 1
+                column = 1
+            } else {
+                column = column + 1
+            }
+            i = i + 1
+        }
+        return new JsonException("JSON parse error: " + message
+            + " at line " + line + ", column " + column, this.pos, line, column)
+    }
+
+    static func bool _digit(int b) {
+        return b >= 48 && b <= 57
+    }
+
+    static func int _hexValue(int b) {
+        if (b >= 48 && b <= 57) {
+            return b - 48
+        }
+        if (b >= 97 && b <= 102) {
+            return b - 87
+        }
+        if (b >= 65 && b <= 70) {
+            return b - 55
+        }
+        return -1
+    }

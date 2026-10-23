@@ -1,0 +1,27 @@
+namespace cang/util/json
+
+# JsonSerializable - 可自序列化的对象（仅编码）
+# 手工在 toJson() 里构造 JsonValue；解码请使用 JsonAdapter + JsonMapper。
+#
+# 示例：
+#   class Point : JsonSerializable
+#       int x = 0;
+#       int y = 0;
+#       func JsonValue toJson() {
+#           JsonObject o = new JsonObject()
+#           o.put("x", this.x)
+#           o.put("y", this.y)
+#           JsonValue out = o
+#           return out
+#       }
+
+import cang/util/json/JsonException
+import cang/util/json/JsonValue
+
+abstract class JsonSerializable
+    # 默认实现抛错：子类必须覆盖。这样即使没有任何子类，序列化入口也能正常链接。
+    func JsonValue toJson() {
+        throw new JsonException("JsonSerializable.toJson must be implemented by a subclass")
+        JsonValue none = null
+        return none
+    }

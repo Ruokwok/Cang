@@ -1,0 +1,31 @@
+namespace cang/util/json
+
+# JsonString - JSON string（UTF-8 字节序列，不含未转义控制字符）
+import cang/util/json/JsonValue
+
+class JsonString : JsonValue
+    String value = "";
+
+    # null 视为空串（JSON 字符串不能为 null）
+    init(String value) {
+        if (value != null) {
+            this.value = value
+        }
+    }
+
+    func int type() {
+        return JsonValue.TYPE_STRING
+    }
+
+    func String asString() {
+        return this.value
+    }
+
+    func int length() {
+        String s = this.value
+        return s.length()
+    }
+
+    static func JsonString of(String value) {
+        return new JsonString(value)
+    }

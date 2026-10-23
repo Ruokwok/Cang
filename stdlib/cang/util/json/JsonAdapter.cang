@@ -1,0 +1,22 @@
+namespace cang/util/json
+
+# JsonAdapter - 手工编解码器（不使用反射）
+# 每个业务类实现一个 adapter：encode 里逐字段构造 JsonValue，decode 里逐字段读取。
+# ctx 提供嵌套对象的递归编解码：ctx.toJsonValue(child) / ctx.fromJsonValue(json, Child.class)。
+
+import cang/util/json/JsonException
+import cang/util/json/JsonValue
+
+abstract class JsonAdapter
+    # 默认实现抛错：子类按需覆盖。没有具体 adapter 时也能完成链接，错误留到运行时。
+    func JsonValue encode(JsonContext ctx, Object value) {
+        throw new JsonException("JsonAdapter.encode must be implemented by a subclass")
+        JsonValue none = null
+        return none
+    }
+
+    func Object decode(JsonContext ctx, JsonValue value) {
+        throw new JsonException("JsonAdapter.decode must be implemented by a subclass")
+        Object none = null
+        return none
+    }

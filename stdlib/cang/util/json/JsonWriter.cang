@@ -1,0 +1,207 @@
+namespace cang/util/json
+
+# JsonWriter - 将 JsonValue 树序列化为 JSON 文本
+# 默认紧凑输出；pretty=true 时按两空格缩进换行。
+# 字符串按 UTF-8 字节扫描：保留非 ASCII 原始字节，转义引号/反斜杠/控制字符。
+# 非有限 double（NaN/Infinity）按 JSON 语义输出 null。
+
+import cang/lang/StringBuilder
+import cang/util/json/JsonArray
+import cang/util/json/JsonBool
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonNumber
+import cang/util/json/JsonObject
+import cang/util/json/JsonString
+import cang/util/json/JsonValue
+
+class JsonWriter
+    static final String HEX = "0123456789abcdef"
+
+    StringBuilder out = new StringBuilder();
+    bool pretty = false;
+    String indentUnit = "  ";
+    int level = 0;
+
+    init() {
+    }
+
+    init(bool pretty) {
+        this.pretty = pretty
+    }
+
+    init(bool pretty, String indentUnit) {
+        this.pretty = pretty
+        if (indentUnit != null) {
+            this.indentUnit = indentUnit
+        }
+    }
+
+    func String write(JsonValue value) {
+        this.out.clear()
+        this.level = 0
+        this._writeValue(value)
+        return this.out.toString()
+    }
+
+    func void _writeValue(JsonValue value) {
+        if (value == null) {
+            this.out.append("null")
+            return
+        }
+        int t = value.type()
+        if (t == JsonValue.TYPE_NULL) {
+            this.out.append("null")
+        } else if (t == JsonValue.TYPE_BOOL) {
+            JsonBool b = JsonBool!$(value)
+            if (b.value) {
+                this.out.append("true")
+            } else {
+                this.out.append("false")
+            }
+        } else if (t == JsonValue.TYPE_NUMBER) {
+            JsonNumber n = JsonNumber!$(value)
+            this._writeNumber(n)
+        } else if (t == JsonValue.TYPE_STRING) {
+            JsonString s = JsonString!$(value)
+            this._writeString(s.value)
+        } else if (t == JsonValue.TYPE_ARRAY) {
+            JsonArray a = JsonArray!$(value)
+            this._writeArray(a)
+        } else if (t == JsonValue.TYPE_OBJECT) {
+            JsonObject o = JsonObject!$(value)
+            this._writeObject(o)
+        } else {
+            throw new JsonException("Unknown JSON value type: " + t)
+        }
+    }
+
+    func void _writeNumber(JsonNumber n) {
+        String raw = n.rawText()
+        if (raw != null) {
+            this.out.append(raw)
+            return
+        }
+        if (n.isIntegral()) {
+            this.out.append(String!$(n.longValue()))
+            return
+        }
+        # String.fromDouble 对 NaN/Infinity 返回 "null"，正好是合法 JSON
+        this.out.append(String.fromDouble(n.doubleValue()))
+    }
+
+    func void _writeString(String s) {
+        if (s == null) {
+            this.out.append("null")
+            return
+        }
+        this.out.append("\"")
+        String hex = JsonWriter.HEX
+        int i = 0
+        int len = s.length()
+        while (i < len) {
+            int b = s.byteAt(i)
+            if (b == 34) {
+                this.out.append("\\\"")
+            } else if (b == 92) {
+                this.out.append("\\\\")
+            } else if (b == 8) {
+                this.out.append("\\b")
+            } else if (b == 12) {
+                this.out.append("\\f")
+            } else if (b == 10) {
+                this.out.append("\\n")
+            } else if (b == 13) {
+                this.out.append("\\r")
+            } else if (b == 9) {
+                this.out.append("\\t")
+            } else if (b < 32) {
+                this.out.append("\\u00")
+                this.out.append(hex.substring(b / 16, b / 16 + 1))
+                this.out.append(hex.substring(b % 16, b % 16 + 1))
+            } else {
+                # 逐字节追加，多字节 UTF-8 序列保持原样
+                this.out.append(s.charAt(i))
+            }
+            i = i + 1
+        }
+        this.out.append("\"")
+    }
+
+    func void _writeArray(JsonArray arr) {
+        this.out.append("[")
+        int n = arr.size()
+        if (n == 0) {
+            this.out.append("]")
+            return
+        }
+        if (this.pretty) {
+            this.out.append("\n")
+        }
+        this.level = this.level + 1
+        int i = 0
+        while (i < n) {
+            if (this.pretty) {
+                this._writeIndent()
+            }
+            this._writeValue(arr.get(i))
+            if (i < n - 1) {
+                this.out.append(",")
+            }
+            if (this.pretty) {
+                this.out.append("\n")
+            }
+            i = i + 1
+        }
+        this.level = this.level - 1
+        if (this.pretty) {
+            this._writeIndent()
+        }
+        this.out.append("]")
+    }
+
+    func void _writeObject(JsonObject obj) {
+        this.out.append("{")
+        int n = obj.size()
+        if (n == 0) {
+            this.out.append("}")
+            return
+        }
+        if (this.pretty) {
+            this.out.append("\n")
+        }
+        this.level = this.level + 1
+        String[] keys = obj.keys()
+        int i = 0
+        while (i < n) {
+            if (this.pretty) {
+                this._writeIndent()
+            }
+            this._writeString(keys[i])
+            this.out.append(":")
+            if (this.pretty) {
+                this.out.append(" ")
+            }
+            this._writeValue(obj.get(keys[i]))
+            if (i < n - 1) {
+                this.out.append(",")
+            }
+            if (this.pretty) {
+                this.out.append("\n")
+            }
+            i = i + 1
+        }
+        this.level = this.level - 1
+        if (this.pretty) {
+            this._writeIndent()
+        }
+        this.out.append("}")
+    }
+
+    func void _writeIndent() {
+        int i = 0
+        while (i < this.level) {
+            this.out.append(this.indentUnit)
+            i = i + 1
+        }
+    }

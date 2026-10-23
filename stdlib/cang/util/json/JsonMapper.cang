@@ -1,0 +1,205 @@
+namespace cang/util/json
+
+# JsonMapper - 手工注册 adapter 的对象序列化器（Gson 风格，不使用反射）
+#
+# 用法：
+#   JsonMapper mapper = new JsonMapper()
+#   mapper.register(User.class, new UserAdapter())
+#   String text = mapper.toJson(user)
+#   User back = User!$(mapper.fromJson(text, User.class))
+#
+# adapter 按 Object.getClassName() 的全名匹配（命名空间用 '_' 连接）。
+# 嵌套对象在 adapter 内通过 ctx.toJsonValue / ctx.fromJsonValue(..., Child.class) 递归处理。
+# 需要按字符串类型名操作时使用 registerName / fromJsonByName。
+
+import cang/lang/Class
+import cang/util/json/JsonAdapter
+import cang/util/json/JsonContext
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonParser
+import cang/util/json/JsonSerializable
+import cang/util/json/JsonValue
+import cang/util/json/JsonWriter
+
+class JsonMapper : JsonContext
+    String[] typeNames = new String[8];
+    JsonAdapter[] adapters = new JsonAdapter[8];
+    int count = 0;
+
+    init() {
+    }
+
+    # 按 Class 注册（推荐）：User.class
+    func void register(Class type, JsonAdapter adapter) {
+        if (type == null) {
+            throw new JsonException("JsonMapper.register: type is null")
+        }
+        this.registerName(type.getName(), adapter)
+    }
+
+    # 按全名注册：命名空间用 '_' 连接，如 demo_User
+    func void registerName(String typeName, JsonAdapter adapter) {
+        if (typeName == null || typeName.length() == 0) {
+            throw new JsonException("JsonMapper.registerName: type name is empty")
+        }
+        if (adapter == null) {
+            throw new JsonException("JsonMapper.registerName: adapter is null for " + typeName)
+        }
+        int i = this._indexOf(typeName)
+        if (i >= 0) {
+            this.adapters[i] = adapter
+            return
+        }
+        if (this.count == this.typeNames.length()) {
+            this._grow()
+        }
+        this.typeNames[this.count] = typeName
+        this.adapters[this.count] = adapter
+        this.count = this.count + 1
+    }
+
+    # 用示例对象注册（等价于 registerName(sample.getClassName(), adapter)）
+    func void registerFor(Object sample, JsonAdapter adapter) {
+        if (sample == null) {
+            throw new JsonException("JsonMapper.registerFor: sample is null")
+        }
+        this.registerName(sample.getClassName(), adapter)
+    }
+
+    func JsonAdapter find(String typeName) {
+        int i = this._indexOf(typeName)
+        if (i < 0) {
+            JsonAdapter none = null
+            return none
+        }
+        return this.adapters[i]
+    }
+
+    func JsonAdapter findFor(Object value) {
+        if (value == null) {
+            JsonAdapter none = null
+            return none
+        }
+        return this.find(value.getClassName())
+    }
+
+    func bool contains(String typeName) {
+        return this._indexOf(typeName) >= 0
+    }
+
+    func int size() {
+        return this.count
+    }
+
+    # ---- JsonContext ----
+
+    func JsonValue toJsonValue(Object value) {
+        if (value == null) {
+            JsonValue n = JsonNull.instance()
+            return n
+        }
+        # 已经是 JsonValue 时直接复用
+        JsonValue existing = JsonValue$(value)
+        if (existing != null) {
+            return existing
+        }
+        JsonAdapter adapter = this.find(value.getClassName())
+        if (adapter != null) {
+            JsonContext self = this
+            JsonValue encoded = adapter.encode(self, value)
+            if (encoded == null) {
+                JsonValue n = JsonNull.instance()
+                return n
+            }
+            return encoded
+        }
+        # 没有注册 adapter 时，允许 JsonSerializable 自编码
+        JsonSerializable serializable = JsonSerializable$(value)
+        if (serializable != null) {
+            JsonValue encoded = serializable.toJson()
+            if (encoded == null) {
+                JsonValue n = JsonNull.instance()
+                return n
+            }
+            return encoded
+        }
+        throw new JsonException("No JsonAdapter registered for " + value.getClassName())
+        JsonValue none = null
+        return none
+    }
+
+    func Object fromJsonValue(JsonValue value, Class type) {
+        if (type == null) {
+            throw new JsonException("JsonMapper.fromJsonValue: type is null")
+        }
+        return this._fromJsonValue(value, type.getName())
+    }
+
+    # 按类型名解码（无 Class 时使用）
+    func Object fromJsonValueByName(JsonValue value, String typeName) {
+        return this._fromJsonValue(value, typeName)
+    }
+
+    func Object _fromJsonValue(JsonValue value, String typeName) {
+        if (value == null || value.isNull()) {
+            Object none = null
+            return none
+        }
+        JsonAdapter adapter = this.find(typeName)
+        if (adapter == null) {
+            throw new JsonException("No JsonAdapter registered for " + typeName)
+        }
+        JsonContext self = this
+        return adapter.decode(self, value)
+    }
+
+    # ---- 便捷入口 ----
+
+    func String toJson(Object value) {
+        return new JsonWriter().write(this.toJsonValue(value))
+    }
+
+    func String toJsonPretty(Object value) {
+        return new JsonWriter(true).write(this.toJsonValue(value))
+    }
+
+    func Object fromJson(String text, Class type) {
+        if (type == null) {
+            throw new JsonException("JsonMapper.fromJson: type is null")
+        }
+        return this._fromJsonValue(new JsonParser(text).parse(), type.getName())
+    }
+
+    func Object fromJsonByName(String text, String typeName) {
+        return this._fromJsonValue(new JsonParser(text).parse(), typeName)
+    }
+
+    func int _indexOf(String typeName) {
+        int i = 0
+        while (i < this.count) {
+            if (this.typeNames[i] == typeName) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func void _grow() {
+        int oldCap = this.typeNames.length()
+        int newCap = oldCap * 2
+        if (newCap <= oldCap) {
+            newCap = oldCap + 8
+        }
+        String[] bigNames = new String[newCap]
+        JsonAdapter[] bigAdapters = new JsonAdapter[newCap]
+        int i = 0
+        while (i < this.count) {
+            bigNames[i] = this.typeNames[i]
+            bigAdapters[i] = this.adapters[i]
+            i = i + 1
+        }
+        this.typeNames = bigNames
+        this.adapters = bigAdapters
+    }

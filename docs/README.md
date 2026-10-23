@@ -50,12 +50,14 @@
 | [Object.md](libs/Object.md) | `Object` | 所有类的隐式根类 |
 | [Class.md](libs/Class.md) | `Class` | 类信息对象：`Apple.class`、名称、父类、单例 |
 | [Field.md](libs/Field.md) | `Field` | 按字段名反射读取：getInt/getString/getObject/getType |
+| [Json.md](libs/Json.md) | `cang/util/json` | 严格 JSON 解析/序列化、JsonValue 树、手工 JsonAdapter 对象映射 |
 
 ## 标准库源码位置
 
 ```text
-stdlib/cang/lang/    # 自动查找，也可显式 import（支持 as 别名）
-stdlib/cang/io/      # IO 标准库（同样自动查找，也可显式 import）
+stdlib/cang/lang/       # 自动查找，也可显式 import（支持 as 别名）
+stdlib/cang/io/         # IO 标准库（同样自动查找，也可显式 import）
+stdlib/cang/util/json/  # JSON 解析、序列化与手工对象映射
 ```
 
-当前清单：`Object`、`Class`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`Coroutine`、`List`、`Dict`、`Field`、`StringBuilder`、`ProcessBuilder`、`cang/io/File`、`cang/io/Scanner`。
+当前清单：`Object`、`Class`、`Stdout`、`Stderr`、`String`、`Math`、`System`、`Function`、`Void`、`Error`、`Thread`、`Coroutine`、`List`、`Dict`、`Field`、`StringBuilder`、`ProcessBuilder`、`cang/io/File`、`cang/io/Scanner`、`cang/util/json`（`Json` / `JsonValue` / `JsonParser` / `JsonWriter` / `JsonObject` / `JsonArray` / `JsonNumber` / `JsonString` / `JsonBool` / `JsonNull` / `JsonException` / `JsonAdapter` / `JsonContext` / `JsonMapper` / `JsonSerializable`）。

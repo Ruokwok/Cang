@@ -1,0 +1,236 @@
+namespace cang/util/json
+
+# JsonObject - JSON 对象（有序键值表）
+# 底层并行数组 keys[] / values[] + count，线性查找；put 同键覆盖并保持首次插入位置。
+# null 值自动转为 JsonNull；get 不存在抛 JsonException，getOrNull 返回 null。
+
+import cang/util/json/JsonArray
+import cang/util/json/JsonBool
+import cang/util/json/JsonException
+import cang/util/json/JsonNull
+import cang/util/json/JsonNumber
+import cang/util/json/JsonString
+import cang/util/json/JsonValue
+
+class JsonObject : JsonValue
+    String[] names = new String[8];
+    JsonValue[] values = new JsonValue[8];
+    int count = 0;
+
+    init() {
+    }
+
+    func int type() {
+        return JsonValue.TYPE_OBJECT
+    }
+
+    func int size() {
+        return this.count
+    }
+
+    func bool isEmpty() {
+        return this.count == 0
+    }
+
+    func JsonObject put(String key, JsonValue value) {
+        return this._put(key, value)
+    }
+
+    # 非重载入口：参数类型已知时优先用 putValue，避免 new/嵌套调用在重载解析中的限制
+    func JsonObject putValue(String key, JsonValue value) {
+        return this._put(key, value)
+    }
+
+    func JsonObject put(String key, String value) {
+        JsonValue v = new JsonString(value)
+        return this._put(key, v)
+    }
+
+    func JsonObject put(String key, int value) {
+        JsonValue v = new JsonNumber(value)
+        return this._put(key, v)
+    }
+
+    func JsonObject put(String key, long value) {
+        JsonValue v = new JsonNumber(value)
+        return this._put(key, v)
+    }
+
+    func JsonObject put(String key, double value) {
+        JsonValue v = new JsonNumber(value)
+        return this._put(key, v)
+    }
+
+    func JsonObject put(String key, bool value) {
+        JsonValue v = new JsonBool(value)
+        return this._put(key, v)
+    }
+
+    func JsonObject putNull(String key) {
+        JsonValue v = JsonNull.instance()
+        return this._put(key, v)
+    }
+
+    # 私有核心：绕开重载解析
+    func JsonObject _put(String key, JsonValue value) {
+        if (key == null) {
+            throw new JsonException("JSON object key cannot be null")
+        }
+        if (value == null) {
+            value = JsonNull.instance()
+        }
+        int i = this._indexOf(key)
+        if (i >= 0) {
+            this.values[i] = value
+            return this
+        }
+        if (this.count == this.names.length()) {
+            this._grow()
+        }
+        this.names[this.count] = key
+        this.values[this.count] = value
+        this.count = this.count + 1
+        return this
+    }
+
+    func bool has(String key) {
+        return this._indexOf(key) >= 0
+    }
+
+    func JsonValue get(String key) {
+        int i = this._indexOf(key)
+        if (i < 0) {
+            throw new JsonException("JSON object key not found: " + key)
+        }
+        return this.values[i]
+    }
+
+    # 不存在返回 null（注意：JSON null 返回 JsonNull 实例，不是 null）
+    func JsonValue getOrNull(String key) {
+        int i = this._indexOf(key)
+        if (i < 0) {
+            JsonValue none = null
+            return none
+        }
+        return this.values[i]
+    }
+
+    func JsonValue getOrDefault(String key, JsonValue fallback) {
+        int i = this._indexOf(key)
+        if (i < 0) {
+            return fallback
+        }
+        return this.values[i]
+    }
+
+    func String getString(String key) {
+        return this.get(key).asString()
+    }
+
+    func bool getBool(String key) {
+        return this.get(key).asBool()
+    }
+
+    func int getInt(String key) {
+        return this.get(key).asInt()
+    }
+
+    func long getLong(String key) {
+        return this.get(key).asLong()
+    }
+
+    func double getDouble(String key) {
+        return this.get(key).asDouble()
+    }
+
+    func JsonObject getObject(String key) {
+        JsonValue v = this.get(key)
+        JsonObject o = JsonObject$(v)
+        if (o == null) {
+            throw new JsonException("Expected JSON object at key '" + key + "' but got " + v.typeName())
+        }
+        return o
+    }
+
+    func JsonArray getArray(String key) {
+        JsonValue v = this.get(key)
+        JsonArray a = JsonArray$(v)
+        if (a == null) {
+            throw new JsonException("Expected JSON array at key '" + key + "' but got " + v.typeName())
+        }
+        return a
+    }
+
+    # 删除指定键；不存在返回 null（不抛错）
+    func JsonValue remove(String key) {
+        int i = this._indexOf(key)
+        if (i < 0) {
+            JsonValue none = null
+            return none
+        }
+        JsonValue old = this.values[i]
+        int last = this.count - 1
+        int j = i
+        while (j < last) {
+            this.names[j] = this.names[j + 1]
+            this.values[j] = this.values[j + 1]
+            j = j + 1
+        }
+        this.count = last
+        return old
+    }
+
+    func void clear() {
+        this.count = 0
+    }
+
+    # 键快照（插入顺序）
+    func String[] keys() {
+        String[] out = new String[this.count]
+        int i = 0
+        while (i < this.count) {
+            out[i] = this.names[i]
+            i = i + 1
+        }
+        return out
+    }
+
+    # 值快照（与 keys() 顺序对应）
+    func JsonValue[] toArray() {
+        JsonValue[] out = new JsonValue[this.count]
+        int i = 0
+        while (i < this.count) {
+            out[i] = this.values[i]
+            i = i + 1
+        }
+        return out
+    }
+
+    func int _indexOf(String key) {
+        int i = 0
+        while (i < this.count) {
+            if (this.names[i] == key) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func void _grow() {
+        int oldCap = this.names.length()
+        int newCap = oldCap * 2
+        if (newCap <= oldCap) {
+            newCap = oldCap + 8
+        }
+        String[] bigNames = new String[newCap]
+        JsonValue[] bigValues = new JsonValue[newCap]
+        int i = 0
+        while (i < this.count) {
+            bigNames[i] = this.names[i]
+            bigValues[i] = this.values[i]
+            i = i + 1
+        }
+        this.names = bigNames
+        this.values = bigValues
+    }
