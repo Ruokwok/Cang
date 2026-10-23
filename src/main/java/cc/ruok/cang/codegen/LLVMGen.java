@@ -9774,85 +9774,399 @@ public class LLVMGen {
     }
 
     /**
-     * Zero-arg constructor of ci available for reflection (Class.newInstance), or null:
-     * abstract / private-class / native / private-zero-arg-init all disqualify. The implicit
-     * no-explicit-init constructor counts when its param list is empty (always is — ctorParams
-     * empty plus parent Object is the common `class Point { int x = 7 }` shape).
+     * Public constructors of ci that Class.newInstance can use, most-specific parameter
+     * lists first. Abstract/private classes, native constructors, private init signatures
+     * and parameter kinds that cannot be carried through an Object value are omitted.
      */
-    private FuncInfo findZeroArgCtorForNewInstance(ClassInfo ci) {
-        if (ci == null || ci.isAbstract || ci.isPrivateCtor) return null;
-        if (ci.privateInitSigs.contains("")) return null; // explicit private init()
+    private List<FuncInfo> findNewInstanceCtors(ClassInfo ci) {
+        List<FuncInfo> result = new ArrayList<>();
+        if (ci == null || ci.isAbstract || ci.isPrivateCtor) return result;
         String ctorName = ci.fullName + ".constructor";
+        List<FuncInfo> candidates = new ArrayList<>();
         List<FuncInfo> grp = overloadGroups.get(ctorName);
-        if (grp != null) {
-            for (FuncInfo fi : grp) {
-                if (fi.paramTypes.isEmpty() && !fi.isNative) return fi;
-            }
-            return null; // overloads exist but none is a public zero-arg
+        if (grp != null) candidates.addAll(grp);
+        else {
+            FuncInfo fi = functions.get(ctorName);
+            if (fi != null) candidates.add(fi);
         }
-        FuncInfo fi = functions.get(ctorName);
-        if (fi != null && fi.paramTypes.isEmpty() && !fi.isNative) return fi;
-        return null;
+        for (FuncInfo fi : candidates) {
+            if (fi.isNative) continue;
+            if (ci.privateInitSigs.contains(String.join(",", fi.paramTypes))) continue;
+            if (!isNewInstanceCtorSupported(fi)) continue;
+            result.add(fi);
+        }
+        // Prefer concrete parameter kinds over Object when several constructors share an arity.
+        result.sort((a, b) -> Integer.compare(
+            newInstanceCtorPriority(b), newInstanceCtorPriority(a)));
+        return result;
+    }
+
+    /** True when every constructor parameter can be decoded from an Object/Object[] arg. */
+    private boolean isNewInstanceCtorSupported(FuncInfo fi) {
+        for (String p : fi.paramTypes) {
+            if (isFieldPrimType(p) || "String".equals(p) || isObjectParam(p) || isArrayParam(p)) {
+                continue;
+            }
+            ClassInfo pci = classes.get(p);
+            if (pci == null) pci = classes.get(importAliases.getOrDefault(p, p));
+            if (pci == null || pci.typeId < 0) return false;
+        }
+        return true;
+    }
+
+    private int newInstanceCtorPriority(FuncInfo fi) {
+        int score = 0;
+        for (String p : fi.paramTypes) {
+            if (isFieldPrimType(p)) score += 4;
+            else if ("String".equals(p) || isArrayParam(p)) score += 3;
+            else if (isObjectParam(p)) score += 0;
+            else score += 2;
+        }
+        return score;
+    }
+
+    private boolean isObjectParam(String t) {
+        if ("Object".equals(t)) return true;
+        ClassInfo ci = classes.get(t);
+        return ci != null && "cang_lang_Object".equals(ci.fullName);
+    }
+
+    private boolean isArrayParam(String t) {
+        return innerElemCang(t) != null;
+    }
+
+    /** Runtime class check: actual typeId equals expected or one of its subclasses. */
+    private boolean isAssignableTo(ClassInfo actual, ClassInfo expected) {
+        ClassInfo cur = actual;
+        int guard = 0;
+        while (cur != null && guard++ < 128) {
+            if (cur.typeId == expected.typeId || cur.fullName.equals(expected.fullName)) {
+                return true;
+            }
+            cur = cur.parentName != null ? classes.get(cur.parentName) : null;
+        }
+        return false;
     }
 
     /**
-     * Class.newInstance runtime @cang.newinstance(i32 %tid): a switch over every type that
-     * has a public zero-arg constructor — allocate sizeof via the null-GEP trick, bitcast,
-     * call the constructor (exceptions leave @cang.err.pending set; the call site unwinds).
-     * Returns the object pointer, or null when the type cannot be reflectively constructed
-     * (abstract, private, no zero-arg ctor, special literal typeId -1, unknown id).
+     * Zero-arg entry point used by Class.newInstance(): delegate to the shared constructor
+     * dispatcher with an empty argv. Kept as a separate symbol so existing calls stay tiny.
      */
     private void emitNewInstanceHelper() {
         if (header.toString().contains("define i8* @cang.newinstance(")) return;
-        String alloc = allocFn();
+        emitNewInstanceArgsHelper();
+        header.append("define i8* @cang.newinstance(i32 %tid) {\n");
+        header.append("entry:\n");
+        header.append("  %ni.zero = call i8* @cang.newinstance.args(i32 %tid, i32 0, i8** null)\n");
+        header.append("  ret i8* %ni.zero\n");
+        header.append("}\n\n");
+    }
+
+    /**
+     * Class.newInstance argument dispatcher: @cang.newinstance.args(typeId, argc, argv).
+     * Walks every reflectively constructible class, then every public constructor of the
+     * requested arity. Primitive parameters are decoded from the hidden Boxed wrapper
+     * (Field.getObject), reference parameters receive the Object pointer; null is accepted
+     * for reference parameters only. Returns null when no constructor matches.
+     */
+    private void emitNewInstanceArgsHelper() {
+        if (header.toString().contains("define i8* @cang.newinstance.args(")) return;
         // Unique real classes by typeId (aliases share ClassInfo).
         java.util.TreeMap<Integer, ClassInfo> byId = new java.util.TreeMap<>();
         for (ClassInfo ci : classes.values()) byId.put(ci.typeId, ci);
+        List<ClassInfo> ctorClasses = new ArrayList<>();
+        for (ClassInfo ci : byId.values()) {
+            if (!findNewInstanceCtors(ci).isEmpty()) ctorClasses.add(ci);
+        }
 
         StringBuilder f = new StringBuilder();
-        f.append("define i8* @cang.newinstance(i32 %tid) {\n");
+        f.append("define i8* @cang.newinstance.args(i32 %tid, i32 %argc, i8** %argv) {\n");
         f.append("entry:\n");
-        String pendingNext = null; // label to fall into on "not this type"
-        for (Map.Entry<Integer, ClassInfo> e : byId.entrySet()) {
-            ClassInfo ci = e.getValue();
-            if (findZeroArgCtorForNewInstance(ci) == null) continue;
-            int tid = e.getKey();
-            String cmp = "%ni.cmp." + tid;
-            String caseL = "ni.case." + tid;
-            String nextL = "ni.next." + tid;
-            if (pendingNext != null) {
-                f.append(pendingNext).append(":\n");
+        if (ctorClasses.isEmpty()) {
+            f.append("  ret i8* null\n");
+            f.append("}\n\n");
+            header.append(f);
+            return;
+        }
+        f.append("  br label %ni.a.class.0\n");
+        for (int ciIdx = 0; ciIdx < ctorClasses.size(); ciIdx++) {
+            ClassInfo ci = ctorClasses.get(ciIdx);
+            List<FuncInfo> ctors = findNewInstanceCtors(ci);
+            String fallback = (ciIdx + 1 < ctorClasses.size())
+                ? "ni.a.class." + (ciIdx + 1) : "ni.a.done";
+            f.append("ni.a.class.").append(ciIdx).append(":\n");
+            String cmp = "%ni.a.cmp." + ciIdx;
+            f.append("  ").append(cmp).append(" = icmp eq i32 %tid, ").append(ci.typeId).append("\n");
+            f.append("  br i1 ").append(cmp).append(", label %ni.a.case.").append(ciIdx)
+             .append(", label %").append(fallback).append("\n");
+            f.append("ni.a.case.").append(ciIdx).append(":\n");
+            int candBase = labelCount;
+            labelCount += ctors.size();
+            f.append("  br label %ni.a.cand.").append(candBase).append("\n");
+            for (int j = 0; j < ctors.size(); j++) {
+                String next = (j + 1 < ctors.size())
+                    ? "ni.a.cand." + (candBase + j + 1) : fallback;
+                emitNewInstanceCandidate(f, ci, ctors.get(j), candBase + j, next);
             }
-            f.append("  ").append(cmp).append(" = icmp eq i32 %tid, ").append(tid).append("\n");
-            f.append("  br i1 ").append(cmp).append(", label %").append(caseL)
-             .append(", label %").append(nextL).append("\n");
-            pendingNext = nextL;
-            f.append(caseL).append(":\n");
-            // size = sizeof(ci) via null GEP; alloc; bitcast; call zero-arg ctor; return.
-            String szp = "%ni.szp." + tid;
-            f.append("  ").append(szp).append(" = getelementptr ").append(ci.llvmName)
-             .append(", ").append(ci.llvmName).append("* null, i32 1\n");
-            String sz = "%ni.sz." + tid;
-            f.append("  ").append(sz).append(" = ptrtoint ").append(ci.llvmName)
-             .append("* ").append(szp).append(" to i64\n");
-            String raw = "%ni.raw." + tid;
-            f.append("  ").append(raw).append(" = call i8* @").append(alloc)
-             .append("(i64 ").append(sz).append(")\n");
-            String obj = "%ni.obj." + tid;
-            f.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to ")
-             .append(ci.llvmName).append("*\n");
-            FuncInfo ctor = findZeroArgCtorForNewInstance(ci);
-            String ctorSym = ctor.llvmName != null ? ctor.llvmName : ctor.name;
-            f.append("  call void @").append(ctorSym).append("(").append(ci.llvmName)
-             .append("* ").append(obj).append(")\n");
-            f.append("  ret i8* ").append(raw).append("\n");
         }
-        if (pendingNext != null) {
-            f.append(pendingNext).append(":\n");
-        }
+        f.append("ni.a.done:\n");
         f.append("  ret i8* null\n");
         f.append("}\n\n");
         header.append(f);
+    }
+
+    /** One candidate constructor: arity test, per-argument conversion, allocate + call. */
+    private void emitNewInstanceCandidate(StringBuilder f, ClassInfo ci, FuncInfo ctor,
+                                          int candId, String nextCand) {
+        int argc = ctor.paramTypes.size();
+        String candLabel = "ni.a.cand." + candId;
+        String failLabel = "ni.a.fail." + candId;
+        String callLabel = "ni.a.call." + candId;
+        String argcOk = "%ni.a.argcok." + candId;
+        f.append(candLabel).append(":\n");
+        f.append("  ").append(argcOk).append(" = icmp eq i32 %argc, ").append(argc).append("\n");
+        if (argc == 0) {
+            f.append("  br i1 ").append(argcOk).append(", label %").append(callLabel)
+             .append(", label %").append(failLabel).append("\n");
+        } else {
+            f.append("  br i1 ").append(argcOk).append(", label %ni.a.args.")
+             .append(candId).append(".0, label %").append(failLabel).append("\n");
+        }
+
+        List<String> converted = new ArrayList<>();
+        for (int i = 0; i < argc; i++) {
+            String label = "ni.a.args." + candId + "." + i;
+            f.append(label).append(":\n");
+            String argPtr = "%ni.a.argp." + candId + "." + i;
+            String arg = "%ni.a.arg." + candId + "." + i;
+            f.append("  ").append(argPtr).append(" = getelementptr i8*, i8** %argv, i32 ")
+             .append(i).append("\n");
+            f.append("  ").append(arg).append(" = load i8*, i8** ").append(argPtr).append("\n");
+            String expected = ctor.paramTypes.get(i);
+            String next = (i + 1 < argc) ? "ni.a.args." + candId + "." + (i + 1) : callLabel;
+            if (isFieldPrimType(expected)) {
+                converted.add(emitNewInstanceUnbox(f, arg, expected, candId, i, next, failLabel));
+            } else if (isObjectParam(expected)) {
+                converted.add(arg);
+                f.append("  br label %").append(next).append("\n");
+            } else if ("String".equals(expected)) {
+                // Strings have no typeId; reject pointers that do look like class instances.
+                emitNewInstanceReferenceCheck(f, arg, candId, i, next, failLabel, null, true);
+                converted.add(arg);
+            } else if (isArrayParam(expected)) {
+                emitNewInstanceReferenceCheck(f, arg, candId, i, next, failLabel, null, false);
+                converted.add(arg);
+            } else {
+                ClassInfo expectedCi = classes.get(expected);
+                if (expectedCi == null) {
+                    expectedCi = classes.get(importAliases.getOrDefault(expected, expected));
+                }
+                emitNewInstanceReferenceCheck(f, arg, candId, i, next, failLabel, expectedCi, false);
+                converted.add(arg);
+            }
+        }
+
+        f.append(callLabel).append(":\n");
+        String szp = "%ni.a.szp." + candId;
+        f.append("  ").append(szp).append(" = getelementptr ").append(ci.llvmName)
+         .append(", ").append(ci.llvmName).append("* null, i32 1\n");
+        String sz = "%ni.a.sz." + candId;
+        f.append("  ").append(sz).append(" = ptrtoint ").append(ci.llvmName).append("* ")
+         .append(szp).append(" to i64\n");
+        String raw = "%ni.a.raw." + candId;
+        f.append("  ").append(raw).append(" = call i8* @").append(allocFn())
+         .append("(i64 ").append(sz).append(")\n");
+        String obj = "%ni.a.obj." + candId;
+        f.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to ")
+         .append(ci.llvmName).append("*\n");
+
+        StringBuilder call = new StringBuilder();
+        call.append(ci.llvmName).append("* ").append(obj);
+        for (int i = 0; i < argc; i++) {
+            String expected = ctor.paramTypes.get(i);
+            String llvmT = toLLVMType(expected);
+            String value = converted.get(i);
+            if (isFieldPrimType(expected)) {
+                call.append(", ").append(llvmT).append(" ").append(value);
+            } else {
+                if (!"i8*".equals(llvmT)) {
+                    String cast = "%ni.a.cast." + candId + "." + i;
+                    f.append("  ").append(cast).append(" = bitcast i8* ").append(value)
+                     .append(" to ").append(llvmT).append("\n");
+                    value = cast;
+                }
+                call.append(", ").append(llvmT).append(" ").append(value);
+            }
+        }
+        String ctorSym = ctor.llvmName != null ? ctor.llvmName : ctor.name;
+        f.append("  call void @").append(ctorSym).append("(").append(call).append(")\n");
+        f.append("  ret i8* ").append(raw).append("\n");
+        f.append(failLabel).append(":\n");
+        f.append("  br label %").append(nextCand).append("\n");
+    }
+
+    /** Unbox one primitive Object argument (must be a Boxed wrapper) for the expected type. */
+    private String emitNewInstanceUnbox(StringBuilder f, String arg, String expected,
+                                        int candId, int argIndex, String next, String fail) {
+        String prefix = candId + "." + argIndex;
+        String isnull = "%ni.a.null." + prefix;
+        f.append("  ").append(isnull).append(" = icmp eq i8* ").append(arg).append(", null\n");
+        String nonnull = "ni.a.nn." + prefix;
+        f.append("  br i1 ").append(isnull).append(", label %").append(fail)
+         .append(", label %").append(nonnull).append("\n");
+        f.append(nonnull).append(":\n");
+        String tidp = "%ni.a.tidp." + prefix;
+        f.append("  ").append(tidp).append(" = bitcast i8* ").append(arg).append(" to i32*\n");
+        String tid = "%ni.a.tid." + prefix;
+        f.append("  ").append(tid).append(" = load i32, i32* ").append(tidp).append("\n");
+        ClassInfo bx = classes.get("Boxed");
+        String isbox = "%ni.a.isbox." + prefix;
+        if (bx == null || bx.typeId < 0) {
+            f.append("  ").append(isbox).append(" = icmp eq i32 0, 1\n");
+        } else {
+            f.append("  ").append(isbox).append(" = icmp eq i32 ").append(tid)
+             .append(", ").append(bx.typeId).append("\n");
+        }
+        String boxed = "ni.a.boxed." + prefix;
+        f.append("  br i1 ").append(isbox).append(", label %").append(boxed)
+         .append(", label %").append(fail).append("\n");
+        f.append(boxed).append(":\n");
+        String rawp = "%ni.a.rawp." + prefix;
+        f.append("  ").append(rawp).append(" = getelementptr i8, i8* ").append(arg).append(", i64 8\n");
+        String raw64p = "%ni.a.raw64p." + prefix;
+        f.append("  ").append(raw64p).append(" = bitcast i8* ").append(rawp).append(" to i64*\n");
+        String raw = "%ni.a.raw." + prefix;
+        f.append("  ").append(raw).append(" = load i64, i64* ").append(raw64p).append("\n");
+        String value;
+        switch (expected) {
+            case "byte": {
+                value = "%ni.a.v." + prefix;
+                f.append("  ").append(value).append(" = trunc i64 ").append(raw).append(" to i8\n");
+                break;
+            }
+            case "int": {
+                value = "%ni.a.v." + prefix;
+                f.append("  ").append(value).append(" = trunc i64 ").append(raw).append(" to i32\n");
+                break;
+            }
+            case "long": {
+                value = raw;
+                break;
+            }
+            case "bool": {
+                value = "%ni.a.v." + prefix;
+                f.append("  ").append(value).append(" = icmp ne i64 ").append(raw).append(", 0\n");
+                break;
+            }
+            case "float": {
+                String bits = "%ni.a.bits." + prefix;
+                f.append("  ").append(bits).append(" = trunc i64 ").append(raw).append(" to i32\n");
+                value = "%ni.a.v." + prefix;
+                f.append("  ").append(value).append(" = bitcast i32 ").append(bits).append(" to float\n");
+                break;
+            }
+            case "double": {
+                value = "%ni.a.v." + prefix;
+                f.append("  ").append(value).append(" = bitcast i64 ").append(raw).append(" to double\n");
+                break;
+            }
+            default:
+                throw new RuntimeException("internal: unsupported primitive constructor parameter: " + expected);
+        }
+        f.append("  br label %").append(next).append("\n");
+        return value;
+    }
+
+    /**
+     * Null/reference check for one argument. expected == null means String/array; strings
+     * additionally reject pointers whose first word is a known class typeId, because Cang
+     * strings have no runtime tag of their own. Arrays have no tag either, so they accept
+     * any non-null pointer. Otherwise the runtime typeId must be expected or a subclass.
+     */
+    private void emitNewInstanceReferenceCheck(StringBuilder f, String arg, int candId,
+                                               int argIndex, String next, String fail,
+                                               ClassInfo expected, boolean rejectClassLike) {
+        String prefix = candId + "." + argIndex;
+        String isnull = "%ni.a.null." + prefix;
+        f.append("  ").append(isnull).append(" = icmp eq i8* ").append(arg).append(", null\n");
+        String nullok = "ni.a.nullok." + prefix;
+        String nonnull = "ni.a.nn." + prefix;
+        f.append("  br i1 ").append(isnull).append(", label %").append(nullok)
+         .append(", label %").append(nonnull).append("\n");
+        f.append(nullok).append(":\n");
+        f.append("  br label %").append(next).append("\n");
+        f.append(nonnull).append(":\n");
+        String tidp = "%ni.a.tidp." + prefix;
+        f.append("  ").append(tidp).append(" = bitcast i8* ").append(arg).append(" to i32*\n");
+        String tid = "%ni.a.tid." + prefix;
+        f.append("  ").append(tid).append(" = load i32, i32* ").append(tidp).append("\n");
+        if (expected != null) {
+            String match = emitNewInstanceClassMatch(f, tid, expected, prefix);
+            f.append("  br i1 ").append(match).append(", label %").append(next)
+             .append(", label %").append(fail).append("\n");
+        } else if (rejectClassLike) {
+            String classLike = emitNewInstanceAnyClassMatch(f, tid, prefix);
+            String notclass = "%ni.a.notclass." + prefix;
+            f.append("  ").append(notclass).append(" = icmp eq i1 ").append(classLike).append(", 0\n");
+            f.append("  br i1 ").append(notclass).append(", label %").append(next)
+             .append(", label %").append(fail).append("\n");
+        } else {
+            // Arrays have no runtime type tag. Their first word is the length, which may
+            // legitimately equal a class/Boxed typeId, so no check is safe here.
+            f.append("  br label %").append(next).append("\n");
+        }
+    }
+
+    /** OR together all non-Object class typeIds (used to reject class pointers as String). */
+    private String emitNewInstanceAnyClassMatch(StringBuilder f, String tid, String prefix) {
+        String result = null;
+        java.util.Set<Integer> seen = new java.util.LinkedHashSet<>();
+        for (ClassInfo actual : classes.values()) {
+            if (actual.typeId <= 0 || !seen.add(actual.typeId)) continue;
+            String cmp = "%ni.a.acmp." + prefix + "." + actual.typeId;
+            f.append("  ").append(cmp).append(" = icmp eq i32 ").append(tid)
+             .append(", ").append(actual.typeId).append("\n");
+            if (result == null) {
+                result = cmp;
+            } else {
+                String or = "%ni.a.aor." + prefix + "." + actual.typeId;
+                f.append("  ").append(or).append(" = or i1 ").append(result)
+                 .append(", ").append(cmp).append("\n");
+                result = or;
+            }
+        }
+        if (result == null) {
+            result = "%ni.a.afalse." + prefix;
+            f.append("  ").append(result).append(" = icmp eq i32 0, 1\n");
+        }
+        return result;
+    }
+
+    /** OR together the typeIds assignable to expected; constant false when none. */
+    private String emitNewInstanceClassMatch(StringBuilder f, String tid, ClassInfo expected,
+                                             String prefix) {
+        String result = null;
+        java.util.Set<Integer> seen = new java.util.LinkedHashSet<>();
+        for (ClassInfo actual : classes.values()) {
+            if (!seen.add(actual.typeId)) continue;
+            if (!isAssignableTo(actual, expected)) continue;
+            String cmp = "%ni.a.tcmp." + prefix + "." + actual.typeId;
+            f.append("  ").append(cmp).append(" = icmp eq i32 ").append(tid)
+             .append(", ").append(actual.typeId).append("\n");
+            if (result == null) {
+                result = cmp;
+            } else {
+                String or = "%ni.a.tor." + prefix + "." + actual.typeId;
+                f.append("  ").append(or).append(" = or i1 ").append(result)
+                 .append(", ").append(cmp).append("\n");
+                result = or;
+            }
+        }
+        if (result == null) {
+            result = "%ni.a.tfalse." + prefix;
+            f.append("  ").append(result).append(" = icmp eq i32 0, 1\n");
+        }
+        return result;
     }
 
     /** Apple.class: load the singleton Class* for the resolved class (or String/primitive). */
@@ -10668,15 +10982,16 @@ public class LLVMGen {
     }
 
     /**
-     * Class.newInstance(): read the receiver's _typeId, call @cang.newinstance, then
-     * null-check the result (typeId -1 / abstract / no public zero-arg ctor → null from
-     * the helper) and raise a catchable runtime Error carrying the class name. The
-     * constructed pointer is handed back as %cang_lang_Object* so Object intrinsics
-     * (getClassName/...) keep dispatching through the runtime typeId.
+     * Class.newInstance(): read the receiver's _typeId and dispatch through
+     * @cang.newinstance (no args) or @cang.newinstance.args (one Object / Object[]).
+     * A null result means no public constructor matched; it is reported as a catchable
+     * runtime Error carrying the class name. The constructed pointer is handed back as
+     * %cang_lang_Object* so Object intrinsics keep using the runtime typeId.
      */
     private LLVMValue generateClassNewInstance(ClassInfo classCi, LLVMValue recv, MethodCallExpr node) {
-        if (!node.args.isEmpty()) {
-            throw new RuntimeException("Class.newInstance accepts no arguments (at line " + node.line + ")");
+        if (node.args.size() > 1) {
+            throw new RuntimeException("Class.newInstance expects zero, one Object, or one Object[] argument (at line "
+                + node.line + ")");
         }
         int id = labelCount++;
         String nx = "ni." + id;
@@ -10693,19 +11008,86 @@ public class LLVMGen {
         String tid = "%ni.tid." + tmpCount++;
         body.append("  ").append(tid).append(" = load i32, i32* ").append(tidPtr).append("\n");
 
-        emitNewInstanceHelper();
-        String raw = "%ni.raw." + tmpCount++;
-        body.append("  ").append(raw).append(" = call i8* @cang.newinstance(i32 ").append(tid).append(")\n");
-        emitPostCallUnwindCheck();
+        boolean hasCtorArgs = !node.args.isEmpty();
+        if (!hasCtorArgs) {
+            emitNewInstanceHelper();
+            String raw = "%ni.raw." + tmpCount++;
+            body.append("  ").append(raw).append(" = call i8* @cang.newinstance(i32 ")
+                 .append(tid).append(")\n");
+            emitPostCallUnwindCheck();
+            return finishClassNewInstance(classCi, recv, node, raw, false);
+        }
 
+        emitNewInstanceArgsHelper();
+        AST argNode = node.args.get(0);
+        LLVMValue arrayVal = null;
+        LLVMValue oneVal = null;
+        if (isNewInstanceArrayArg(argNode)) {
+            arrayVal = generateNewInstanceArrayArg(argNode, node.line);
+        } else {
+            oneVal = generateExpr(argNode);
+            if (oneVal.semanticType != null && "Array<Object>".equals(oneVal.semanticType)) {
+                arrayVal = oneVal;
+                oneVal = null;
+            }
+        }
+
+        String raw;
+        if (arrayVal != null) {
+            String isNull = "%ni.anull." + tmpCount++;
+            body.append("  ").append(isNull).append(" = icmp eq i8* ").append(arrayVal.value).append(", null\n");
+            String nullErr = nx + ".argnull";
+            String argsOk = nx + ".argok";
+            body.append("  br i1 ").append(isNull).append(", label %").append(nullErr)
+                 .append(", label %").append(argsOk).append("\n");
+            body.append(nullErr).append(":\n");
+            emitRuntimeError("Class.newInstance: arguments array is null", node.line, argsOk);
+            body.append(argsOk).append(":\n");
+            String len64 = "%ni.len64." + tmpCount++;
+            body.append("  ").append(len64).append(" = load i64, i64* ").append(arrayVal.value).append("\n");
+            String len32 = "%ni.len." + tmpCount++;
+            body.append("  ").append(len32).append(" = trunc i64 ").append(len64).append(" to i32\n");
+            String data = "%ni.argdata." + tmpCount++;
+            body.append("  ").append(data).append(" = getelementptr i8, i8* ")
+                 .append(arrayVal.value).append(", i64 8\n");
+            String argv = "%ni.argv." + tmpCount++;
+            body.append("  ").append(argv).append(" = bitcast i8* ").append(data).append(" to i8**\n");
+            raw = "%ni.raw." + tmpCount++;
+            body.append("  ").append(raw).append(" = call i8* @cang.newinstance.args(i32 ")
+                 .append(tid).append(", i32 ").append(len32).append(", i8** ").append(argv).append(")\n");
+        } else {
+            if (!oneVal.type.endsWith("*")) {
+                throw new RuntimeException("Class.newInstance(Object) expects an Object/reference argument; "
+                    + "primitives must be boxed first (at line " + node.line + ")");
+            }
+            String argI8 = oneVal.value;
+            if (!"i8*".equals(oneVal.type)) {
+                argI8 = "%ni.argcast." + tmpCount++;
+                body.append("  ").append(argI8).append(" = bitcast ").append(oneVal.type).append(" ")
+                     .append(oneVal.value).append(" to i8*\n");
+            }
+            String slot = "%ni.argslot." + tmpCount++;
+            body.append("  ").append(slot).append(" = alloca i8*\n");
+            body.append("  store i8* ").append(argI8).append(", i8** ").append(slot).append("\n");
+            raw = "%ni.raw." + tmpCount++;
+            body.append("  ").append(raw).append(" = call i8* @cang.newinstance.args(i32 ")
+                 .append(tid).append(", i32 1, i8** ").append(slot).append(")\n");
+        }
+        emitPostCallUnwindCheck();
+        return finishClassNewInstance(classCi, recv, node, raw, true);
+    }
+
+    /** Shared null-check / catchable-error tail for Class.newInstance(). */
+    private LLVMValue finishClassNewInstance(ClassInfo classCi, LLVMValue recv, MethodCallExpr node,
+                                             String raw, boolean argsForm) {
+        int id = labelCount++;
+        String nx = "ni." + id;
         String isNull = "%ni.isnull." + tmpCount++;
         body.append("  ").append(isNull).append(" = icmp eq i8* ").append(raw).append(", null\n");
         String errL = nx + ".fail", okL = nx + ".ok";
         body.append("  br i1 ").append(isNull).append(", label %").append(errL)
              .append(", label %").append(okL).append("\n");
         body.append(errL).append(":\n");
-        // Message: "Class.newInstance: <name> cannot be instantiated" — name from the Class
-        // object's _name field (allocation-free pointer into a compile-time constant).
         Integer nameIdx = classCi.fieldIndices.get("_name");
         String namePtr = "%ni.namep." + tmpCount++;
         body.append("  ").append(namePtr).append(" = getelementptr ").append(classCi.llvmName)
@@ -10713,19 +11095,48 @@ public class LLVMGen {
              .append(", i32 0, i32 ").append(nameIdx).append("\n");
         String nameV = "%ni.name." + tmpCount++;
         body.append("  ").append(nameV).append(" = load i8*, i8** ").append(namePtr).append("\n");
-        emitRuntimeErrorDynamic(buildClassNewInstanceMsg(new LLVMValue(nameV, "i8*")), node.line, okL);
+        String format = argsForm
+            ? "Class.newInstance: %s has no matching constructor for the given arguments"
+            : "Class.newInstance: %s cannot be instantiated";
+        emitRuntimeErrorDynamic(buildClassNewInstanceMsg(new LLVMValue(nameV, "i8*"), format),
+            node.line, okL);
         body.append(okL).append(":\n");
         String obj = "%ni.obj." + tmpCount++;
         body.append("  ").append(obj).append(" = bitcast i8* ").append(raw).append(" to %cang_lang_Object*\n");
         return new LLVMValue(obj, "%cang_lang_Object*", "Object");
     }
 
-    /** "Class.newInstance: <name> cannot be instantiated" with the runtime class name. */
-    private LLVMValue buildClassNewInstanceMsg(LLVMValue nameV) {
+    /**
+     * True for an Object[] expression (the multi-argument form). Other array types are
+     * single Object arguments, matching the declared overload: String[] is not Object[].
+     * Array literals are always the multi-argument form.
+     */
+    private boolean isNewInstanceArrayArg(AST arg) {
+        if (arg instanceof ArrayLit) return true;
+        return "Object".equals(elemCangOf(arg));
+    }
+
+    /** Evaluate an Object[] argument; an array literal is generated with Object elements. */
+    private LLVMValue generateNewInstanceArrayArg(AST arg, int line) {
+        LLVMValue arr;
+        if (arg instanceof ArrayLit) {
+            arr = generateArrayLit((ArrayLit) arg, toLLVMType("Object"), "Object");
+        } else {
+            arr = generateExpr(arg);
+        }
+        if (!"i8*".equals(arr.type)) {
+            throw new RuntimeException("Class.newInstance argument array must be Object[] (at line "
+                + line + ")");
+        }
+        return arr;
+    }
+
+    /** sprintf-style Class.newInstance failure message with the runtime class name. */
+    private LLVMValue buildClassNewInstanceMsg(LLVMValue nameV, String format) {
         if (!header.toString().contains("declare i32 @sprintf(")) {
             header.append("declare i32 @sprintf(i8*, i8*, ...)\n");
         }
-        LLVMValue fmtV = makeStringConstant("Class.newInstance: %s cannot be instantiated");
+        LLVMValue fmtV = makeStringConstant(format);
         String flen = "%nim.flen." + tmpCount++;
         body.append("  ").append(flen).append(" = call i64 @strlen(i8* ").append(fmtV.value).append(")\n");
         String nlen = "%nim.nlen." + tmpCount++;

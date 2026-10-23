@@ -94,7 +94,9 @@ class Main
 | `getSuperclass()` | `Class` | 父类；`Object`、基本类型、`void` 返回 `null` |
 | `isAssignableFrom(Class other)` | `bool` | 本类是否等于 `other` 或是其父类/祖先 |
 | `toString()` | `String` | `"class " + 全名` |
-| `newInstance()` | `Object` | 反射构造：按本类公开零参构造创建实例；失败抛可捕获运行时错误 |
+| `newInstance()` | `Object` | 反射构造：调用公开零参构造；失败抛可捕获运行时错误 |
+| `newInstance(Object arg)` | `Object` | 反射构造：调用单参构造；基本类型参数需先用 `Field.getObject` 装箱 |
+| `newInstance(Object[] args)` | `Object` | 反射构造：按 `args.length` 调用 N 参构造；空数组等价于零参构造 |
 
 ## String 与基本类型
 
@@ -114,7 +116,15 @@ Stdout.println(int.class.getSuperclass() == null)       # true
 
 ## 反射构造（newInstance）
 
-`newInstance()` 按本类的**公开零参构造**创建实例并返回 `Object`。返回值用转型取回具体类型：
+`newInstance` 有三个重载，均返回 `Object`，返回值可用转型取回具体类型：
+
+```cang
+newInstance()                 # 调用零参构造
+newInstance(Object arg)       # 调用单参构造
+newInstance(Object[] args)    # 按数组长度调用 N 参构造
+```
+
+### 零参与单参
 
 ```cang
 # Point.cang
@@ -124,38 +134,134 @@ class Point
 ```
 
 ```cang
-# Main.cang
+# User.cang
+class User
+    String name = ""
+
+    init(String name) {
+        this.name = name
+    }
+```
+
+```cang
 import Point
+import User
 
 class Main
     static func void main(String[] args) {
         Object obj = Point.class.newInstance()
         var f = new Field(obj)
-        Stdout.println(f.getInt("x"))    # 7
-        Stdout.println(f.getString("tag")) # pt
+        Stdout.println(f.getInt("x"))        # 7
+        Stdout.println(f.getString("tag"))   # pt
+
+        Object user = User.class.newInstance("Ada")
+        var uf = new Field(user)
+        Stdout.println(uf.getString("name")) # Ada
 
         # 配合转型使用（需类型匹配）
         Point p = Point!$(obj)
-        Stdout.println(p.x)              # 7
+        Stdout.println(p.x)                  # 7
     }
 }
 ```
 
-要求与失败行为：
+### 多参：Object[] 的长度就是构造函数参数个数
 
-- 类必须非 `abstract`、非私有构造（`class _Foo` / 私有 `_init()`）；
-- 必须存在公开零参构造：显式 `init()`，或无显式 `init` 时的隐式零参构造（字段只有默认值的常见形态）；
-- 只有带参构造（如仅 `init(int x)`）→ 运行时错误；
+```cang
+# Pair.cang
+class Pair
+    String left = ""
+    String right = ""
+
+    init(String left, String right) {
+        this.left = left
+        this.right = right
+    }
+```
+
+```cang
+import Pair
+
+class Main
+    static func void main(String[] args) {
+        Object left = "L"
+        Object right = "R"
+        Object[] args = [left, right]
+        Object pair = Pair.class.newInstance(args)
+
+        var f = new Field(pair)
+        Stdout.println(f.getString("left"))   # L
+        Stdout.println(f.getString("right"))  # R
+    }
+}
+```
+
+- `Object[]` 的长度为 0 时调用零参构造；
+- 参数个数必须**精确匹配**，不会使用构造函数默认参数值；
+- `args` 本身为 `null` → 运行时错误；
+- 数组元素为 `null` 时，引用类型参数接受 `null`；基本类型参数匹配失败；
+- 也支持直接写数组字面量：`Pair.class.newInstance([left, right])`；
+- 只有 `Object[]` 会按多参列表解释；`String[]`、`int[]` 等其他数组类型作为**单个 Object 实参**传给单参构造（例如 `init(String[] names)`）。数组字面量按多参列表处理。
+
+### 基本类型参数：需要 Boxed
+
+Cang 的 `Object` 不能接收基本类型，`newInstance(1)` 不是合法调用。基本类型必须先装箱；目前公开的装箱入口是 [Field.getObject](Field.md)：
+
+```cang
+# Source.cang
+class Source
+    int value = 42
+
+# Counter.cang
+class Counter
+    int value = 0
+
+    init(int value) {
+        this.value = value
+    }
+```
+
+```cang
+import Source
+import Counter
+
+class Main
+    static func void main(String[] args) {
+        Object source = new Source()
+        Object boxed = new Field(source).getObject("value")  # Boxed
+        Object counter = Counter.class.newInstance(boxed)
+
+        var f = new Field(counter)
+        Stdout.println(f.getInt("value")) # 42
+    }
+}
+```
+
+多参基本类型同理：把每个 Boxed 放进 `Object[]`，数组长度与构造参数个数一致。Boxed 只保存原始位，不记录来源类型；`newInstance` 按目标构造参数的类型解释这些位，因此调用方应保证传入的 Boxed 与参数类型一致。
+
+### 选择构造函数与失败行为
+
+- 只考虑公开构造函数；`abstract` 类、私有类构造、私有 `_init()`、`native` 构造函数不参与；
+- 支持从 `Object` 解码的参数类型：基本类型（Boxed）、`String`、`Object`、数组、类引用；其他参数类型（如函数值）的构造函数会被跳过；
+- 先按参数个数筛选；参数个数相同的多个构造函数按“参数类型具体程度”排序，基本类型需传入 Boxed，类参数按运行时 `typeId` 检查是否为该类或其子类；
+- `String` 和数组没有运行时类型标签，若同一参数个数存在仅靠它们区分的重载，匹配是尽力而为的；无法确定时建议只保留一个同参数个数的构造函数；
+- 只有带参构造的类调用 `newInstance()`、参数个数不匹配、基本类型参数不是 Boxed、类参数类型不匹配 → 运行时错误；
 - `String.class` / `int.class` 等特殊类字面量 → 运行时错误；
-- 失败抛出可被 `try/catch` 捕获的 `Error`，消息形如
-  `Class.newInstance: Point cannot be instantiated`；
+- 失败抛出可被 `try/catch` 捕获的 `Error`：
+  - 零参调用：`Class.newInstance: Point cannot be instantiated`
+  - 带参调用：`Class.newInstance: Point has no matching constructor for the given arguments`
+  - 参数数组为 `null`：`Class.newInstance: arguments array is null`
 - 构造函数体中抛出的异常正常传播。
 
-与 [Field.list()](Field.md) 组合可实现"反射构造 + 字段枚举"的序列化雏形。
+与 [Field.list()](Field.md) 组合可实现“反射构造 + 字段枚举”的序列化雏形。
 
 ## 限制
 
 - 不支持数组类字面量（`String[].class`）；
+- 不支持 Java 风格可变参数；多参构造使用单个 `Object[]` 传入；
+- `Object[]` 的元素必须是 `Object`：`Object[] args = ["a"]` 编译失败，需要先 `Object a = "a"`；基本类型需使用 Boxed；
+- 目前没有公开的“装箱”API，基本类型只能通过 [Field.getObject](Field.md) 等已有 Boxed 来源获得；
+- `String`/数组没有运行时类型标签，重载构造函数的选择存在尽力而为的边界（见上文）；
 - `Class` 本身不提供字段/方法枚举；按字段名读取实例字段请用 [Field](Field.md)，方法枚举仍不支持；
 - 不提供 `Object.getClass()`；当前入口是 `类名.class`；
 - 泛型类没有独立的运行时类对象，类字面量面向具体类名；

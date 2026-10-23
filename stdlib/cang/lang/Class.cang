@@ -48,9 +48,21 @@ class Class
         return "class " + n
     }
 
-    # 反射构造：按本类的公开零参构造函数创建实例并返回 Object。
-    # 要求类非 abstract、非私有构造、且存在零参 init()（或隐式零参构造）。
-    # String.class / int.class 等特殊类字面量、以及只有带参构造的类 → 运行时错误。
+    # 反射构造：按本类的公开构造函数创建实例并返回 Object。
+    # 要求类非 abstract、非私有构造，且存在参数个数与实参匹配的 init（或隐式零参构造）。
+    # 无参版本调用零参构造；Object 版本调用单参构造；Object[] 版本按数组长度调用多参构造，
+    # 空数组等价于零参构造。参数个数必须精确匹配，不使用默认参数值。
+    # String.class / int.class 等特殊类字面量、以及无匹配构造的类 → 运行时错误。
+    # Object 参数可放 String、类实例、数组或 Field.getObject 得到的 Boxed 基本类型；
+    # 基本类型参数必须用 Boxed 传入，newInstance(1) 不是合法调用。
+    # 构造函数参数支持基本类型、String、Object、数组和类引用；其他类型会被跳过。
     # 构造函数体抛出的异常正常传播（可被调用方 try/catch 捕获）。
     # 返回值用转型取回具体类型：var p = Point!$(Point.class.newInstance())
     native func Object newInstance()
+
+    # 单参构造：arg 为构造函数唯一的 Object/引用参数；基本类型参数需先装箱。
+    native func Object newInstance(Object arg)
+
+    # 多参构造：args.length 决定构造函数参数个数，数组元素按位置对应构造参数。
+    # 空 Object[] 调用零参构造；数组本身为 null → 运行时错误。
+    native func Object newInstance(Object[] args)
