@@ -39,3 +39,21 @@ native func String getType(String name)
 #   for (String n : names) { Stdout.println(n + " = " + f.getType(n)) }
 # 目标对象为 null → 运行时错误（同其他访问器）。
 native func String[] list()
+
+# ---------- 按名写字段（setter）----------
+# 类型安全：要求字段实际类型与 setter 匹配，不符 → 运行时错误；
+# 字段不存在 / 目标为 null → 运行时错误。返回 void。
+# setObject 用于引用字段（String/类实例/数组）；基本类型请用对应的 setInt/setLong/...
+
+native func void setInt(String name, int value)
+native func void setLong(String name, long value)
+native func void setByte(String name, byte value)
+native func void setBool(String name, bool value)
+native func void setFloat(String name, float value)
+native func void setDouble(String name, double value)
+
+# String 字段写入
+native func void setString(String name, String value)
+
+# 引用字段写入（String / 类实例 / 数组；值可为 null）。基本类型字段请用对应的基本类型 setter。
+native func void setObject(String name, Object value)

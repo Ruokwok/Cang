@@ -10261,9 +10261,10 @@ public class LLVMGen {
 
     /** Methods on the builtin Field class (stdlib/cang/lang/Field.cang) generated intrinsically. */
     private static final java.util.Set<String> FIELD_ACCESSOR_METHODS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "getObject", "getString", "getInt", "getLong", "getByte", "getBool", "getFloat", "getDouble", "getType", "list"));
+        "getObject", "getString", "getInt", "getLong", "getByte", "getBool", "getFloat", "getDouble", "getType", "list",
+        "setObject", "setString", "setInt", "setLong", "setByte", "setBool", "setFloat", "setDouble"));
 
-    /** Accessor method -> expected primitive field type (getObject/getType are absent). */
+    /** Accessor/setter method -> expected primitive field type (getObject/getType/setObject/setString are absent). */
     private static final Map<String, String> FIELD_PRIM_METHODS = new java.util.LinkedHashMap<>();
     static {
         FIELD_PRIM_METHODS.put("getInt", "int");
@@ -10272,6 +10273,12 @@ public class LLVMGen {
         FIELD_PRIM_METHODS.put("getBool", "bool");
         FIELD_PRIM_METHODS.put("getFloat", "float");
         FIELD_PRIM_METHODS.put("getDouble", "double");
+        FIELD_PRIM_METHODS.put("setInt", "int");
+        FIELD_PRIM_METHODS.put("setLong", "long");
+        FIELD_PRIM_METHODS.put("setByte", "byte");
+        FIELD_PRIM_METHODS.put("setBool", "bool");
+        FIELD_PRIM_METHODS.put("setFloat", "float");
+        FIELD_PRIM_METHODS.put("setDouble", "double");
     }
     /** Primitive field display names, matching stdlib Field accessor declaration order. */
     private static final String[] FIELD_PRIMS = {"int", "long", "byte", "bool", "float", "double"};
@@ -10315,7 +10322,8 @@ public class LLVMGen {
      */
     private LLVMValue generateFieldAccessor(ClassInfo fieldCi, LLVMValue recv, MethodCallExpr node) {
         String m = node.method;
-        String expectedPrim = FIELD_PRIM_METHODS.get(m); // null for getObject/getType
+        String expectedPrim = FIELD_PRIM_METHODS.get(m); // null for getObject/getType/setObject/setString
+        boolean isSetter = m.startsWith("set");
         // Field.list(): no field-name argument — enumerate every field of the target via
         // the shared metadata table. Returns the standard String[] array ABI.
         if (m.equals("list")) {
@@ -10324,12 +10332,17 @@ public class LLVMGen {
             }
             return generateFieldList(fieldCi, recv, node);
         }
-        if (node.args.size() != 1) {
-            throw new RuntimeException("Field." + m + " expects exactly one field-name argument (at line " + node.line + ")");
+        int expectArgs = isSetter ? 2 : 1;
+        if (node.args.size() != expectArgs) {
+            throw new RuntimeException("Field." + m + " expects " + expectArgs + " argument(s) (at line " + node.line + ")");
         }
         LLVMValue nameV = generateExpr(node.args.get(0));
         if (!"i8*".equals(nameV.type)) {
             throw new RuntimeException("Field." + m + " field name must be a String (at line " + node.line + ")");
+        }
+        LLVMValue valV = null; // setter: the value to store (arg 1)
+        if (isSetter) {
+            valV = generateExpr(node.args.get(1));
         }
 
         int id = labelCount++;
@@ -10395,6 +10408,94 @@ public class LLVMGen {
         // getType: hand back the metadata display-name pointer directly.
         if (m.equals("getType")) {
             return new LLVMValue(ftype, "i8*", "String");
+        }
+
+        // ---- setters: type-check the display name, then store the value at the field slot ----
+        if (isSetter) {
+            // Type check helpers shared by all setters.
+            String emitTypeCheck = null; // placeholder to keep structure flat below
+            String expected = null;      // display name to require ("int"/"String"/...)
+            String mismatchMsg = null;
+            if (expectedPrim != null) {
+                expected = expectedPrim;
+                mismatchMsg = "field \"%s\" is not " + expectedPrim;
+            } else if (m.equals("setString")) {
+                expected = "String";
+                mismatchMsg = "field \"%s\" is not String";
+            } // setObject: any non-primitive reference field (no display-name check beyond "exists")
+
+            if (expected != null) {
+                LLVMValue expC = makeStringConstant(expected);
+                String sln1 = "%fa.sln1." + tmpCount++;
+                body.append("  ").append(sln1).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
+                String sln2 = "%fa.sln2." + tmpCount++;
+                body.append("  ").append(sln2).append(" = call i64 @strlen(i8* ").append(expC.value).append(")\n");
+                String seld = "%fa.seld." + tmpCount++;
+                body.append("  ").append(seld).append(" = icmp eq i64 ").append(sln1).append(", ").append(sln2).append("\n");
+                String smem2 = "%fa.smem2." + tmpCount++;
+                body.append("  ").append(smem2).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
+                     .append(expC.value).append(", i64 ").append(sln1).append(")\n");
+                String smok2 = "%fa.smok2." + tmpCount++;
+                body.append("  ").append(smok2).append(" = icmp eq i32 ").append(smem2).append(", 0\n");
+                String ssame = "%fa.ssame." + tmpCount++;
+                body.append("  ").append(ssame).append(" = and i1 ").append(seld).append(", ").append(smok2).append("\n");
+                String sBad = "%fa.sbad." + tmpCount++;
+                body.append("  ").append(sBad).append(" = icmp eq i1 ").append(ssame).append(", 0\n");
+                String serrY = nx + ".typemismatch", sokY = nx + ".typeok";
+                body.append("  br i1 ").append(sBad).append(", label %").append(serrY).append(", label %").append(sokY).append("\n");
+                body.append(serrY).append(":\n");
+                emitRuntimeErrorDynamic(buildFieldErrorMsg(m, mismatchMsg, nameV), node.line, sokY);
+                body.append(sokY).append(":\n");
+            } else if (m.equals("setObject")) {
+                // setObject: reject primitive fields — basic types must use setInt/setLong/...
+                // Compare ftype's display name against each of the six primitive names.
+                String flen = "%fa.flen." + tmpCount++;
+                body.append("  ").append(flen).append(" = call i64 @strlen(i8* ").append(ftype).append(")\n");
+                String isPrim = "%fa.isprim." + tmpCount++;
+                body.append("  ").append(isPrim).append(" = icmp eq i32 0, 1\n"); // constant false
+                for (String prim : FIELD_PRIMS) {
+                    LLVMValue pc = makeStringConstant(prim);
+                    String plen = "%fa.plen." + tmpCount++;
+                    body.append("  ").append(plen).append(" = call i64 @strlen(i8* ").append(pc.value).append(")\n");
+                    String peq = "%fa.peq." + tmpCount++;
+                    body.append("  ").append(peq).append(" = icmp eq i64 ").append(flen).append(", ").append(plen).append("\n");
+                    String pmem = "%fa.pmem." + tmpCount++;
+                    body.append("  ").append(pmem).append(" = call i32 @memcmp(i8* ").append(ftype).append(", i8* ")
+                         .append(pc.value).append(", i64 ").append(flen).append(")\n");
+                    String pok = "%fa.pok." + tmpCount++;
+                    body.append("  ").append(pok).append(" = icmp eq i32 ").append(pmem).append(", 0\n");
+                    String pm = "%fa.pm." + tmpCount++;
+                    body.append("  ").append(pm).append(" = and i1 ").append(peq).append(", ").append(pok).append("\n");
+                    String pn = "%fa.pn." + tmpCount++;
+                    body.append("  ").append(pn).append(" = or i1 ").append(isPrim).append(", ").append(pm).append("\n");
+                    isPrim = pn;
+                }
+                String primBad = nx + ".primfield", primOk = nx + ".refok";
+                body.append("  br i1 ").append(isPrim).append(", label %").append(primBad)
+                     .append(", label %").append(primOk).append("\n");
+                body.append(primBad).append(":\n");
+                emitRuntimeErrorDynamic(buildFieldErrorMsg(m,
+                    "field \"%s\" is a primitive; use the matching setInt/setLong/... instead", nameV),
+                    node.line, primOk);
+                body.append(primOk).append(":\n");
+            }
+
+            // Store: bitcast the byte pointer to the value's LLVM type and store.
+            if (expectedPrim != null) {
+                String llvmT = toLLVMType(expectedPrim);
+                String castV = castValue(valV, llvmT);
+                String fp = "%fa.fp." + tmpCount++;
+                body.append("  ").append(fp).append(" = bitcast i8* ").append(bp).append(" to ").append(llvmT).append("*\n");
+                body.append("  store ").append(llvmT).append(" ").append(castV).append(", ").append(llvmT).append("* ").append(fp).append("\n");
+            } else {
+                // setString / setObject: the value is a pointer (i8* / %X*); store as i8*.
+                String ptrV = valV.type.equals("i8*") ? valV.value
+                    : castValue(valV, "i8*");
+                String fp = "%fa.fp." + tmpCount++;
+                body.append("  ").append(fp).append(" = bitcast i8* ").append(bp).append(" to i8**\n");
+                body.append("  store i8* ").append(ptrV).append(", i8** ").append(fp).append("\n");
+            }
+            return new LLVMValue("void", "void");
         }
 
         // getString: the display type must be "String".
